@@ -55,6 +55,24 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
 	bool rethrow = !write || !trip(fault);
 	if (rethrow) {
+		/* Mirror the Windows path: say what was asked for and whether any block
+		 * owns the address before the process dies with nothing to debug. */
+		mb_block *owner = NULL;
+		for (int i = 0; i < g_nblocks; i++)
+			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
+		mb_diag_banner("unhandled fault");
+		mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
+		        (void *)fault, write ? "write" : "read/exec",
+		        (void *)uc->uc_mcontext.gregs[REG_RIP],
+		        owner ? "inside a registered block" : "OUTSIDE every registered block");
+		if (owner) {
+			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
+			mb_diag(" (page %zu status=%u dirty=%u invisible=%u)",
+			        pi, owner->pages[pi].status, owner->pages[pi].dirty, owner->pages[pi].invisible);
+		}
+		mb_diag(" [%d block(s) registered]\n", g_nblocks);
+	}
+	if (rethrow) {
 		if (g_old_sa.sa_flags & SA_SIGINFO)
 			g_old_sa.sa_sigaction(sig, info, ucontext);
 		else if (g_old_sa.sa_handler == SIG_DFL || g_old_sa.sa_handler == SIG_IGN) {
@@ -65,7 +83,28 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	}
 }
 
+/* SA_ONSTACK only helps if an alternate signal stack exists. The .NET runtime
+ * installs one per thread (which is why the BizHawk reference never needed
+ * this), but a plain C host has none - and without it, a faulting PUSH onto a
+ * clean (read-only-mapped) tracked page is fatal: the kernel cannot deliver
+ * the signal onto the very stack that faulted. Guest green-thread stacks are
+ * ordinary tracked pages, so this case is real. One altstack per host thread
+ * that runs guest code; installed for the current thread here, and
+ * mb_tripguard_ensure_altstack() lets other entry points opt in. */
+void mb_tripguard_ensure_altstack(void) {
+	stack_t ss_old;
+	if (sigaltstack(NULL, &ss_old) == 0 && !(ss_old.ss_flags & SS_DISABLE) && ss_old.ss_sp)
+		return;  /* this thread already has one */
+	stack_t ss;
+	memset(&ss, 0, sizeof(ss));
+	ss.ss_size = 64 * 1024;
+	ss.ss_sp = malloc(ss.ss_size);
+	ss.ss_flags = 0;
+	if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) { perror("miniBox sigaltstack"); abort(); }
+}
+
 static void initialize(void) {
+	mb_tripguard_ensure_altstack();
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_sigaction = handler;

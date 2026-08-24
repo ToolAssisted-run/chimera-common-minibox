@@ -133,6 +133,9 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
 
 /* ---- tripguard.c ---- */
 void mb_tripguard_register(mb_block *b);
+#ifndef _WIN32
+void mb_tripguard_ensure_altstack(void);  /* per-thread; see tripguard.c */
+#endif
 void mb_tripguard_unregister(mb_block *b);
 
 /* ---- context.c: host<->guest transitions (interop.bin at 0x35f00000000) ---- */

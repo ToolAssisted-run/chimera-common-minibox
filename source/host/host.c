@@ -245,6 +245,11 @@ void mb_host_destroy(mb_host *h) {
 }
 
 void mb_host_activate(mb_host *h) {
+#ifndef _WIN32
+	/* guest code will run on THIS thread; make signal delivery on a faulting
+	 * tracked stack page possible (see tripguard.c) */
+	mb_tripguard_ensure_altstack();
+#endif
 	if (h->active) return;
 	mb_prepare_thread();
 	h->context.host_ptr = (uintptr_t)h;
