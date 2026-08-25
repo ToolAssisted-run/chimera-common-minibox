@@ -71,15 +71,31 @@ static int trace_syscalls(void) {
 	return on;
 }
 
+static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                          uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp);
+
+/* Tracing wrapper: the arguments go out BEFORE the syscall runs (a crash
+ * inside it still shows what was asked), the result right after - a call
+ * that fails where it succeeds elsewhere is exactly what a trace diff is
+ * for, and the result column is where that shows. */
 static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                          uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
+	if (!trace_syscalls()) return dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
+	fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx)", (unsigned long long)nr,
+	        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+	fflush(stderr);
+	uintptr_t res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
+	intptr_t s = (intptr_t)res;
+	if (s < 0 && s > -4096) fprintf(stderr, " -> ERR %lld\n", (long long)s);
+	else fprintf(stderr, " -> %llx\n", (unsigned long long)res);
+	fflush(stderr);
+	return res;
+}
+
+static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
 	mb_host *h = (mb_host *)hp;
 	(void)a6;
-	if (trace_syscalls()) {
-		fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx)\n", (unsigned long long)nr,
-		        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
-		fflush(stderr);
-	}
 	switch (nr) {
 		case NR_mmap: {
 			bool bad; mb_prot prot = arg_to_prot(a3, &bad); if (bad) return serr(EINVAL);
