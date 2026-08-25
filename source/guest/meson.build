@@ -34,7 +34,7 @@ waterbox_guest_cflags = [
   '-fvisibility=hidden', '-I' + waterbox_emulibc_dir,
   '-I' + waterbox_guestkit_inc, '-I' + waterbox_jsmn_dir,
   '-Wall', '-mcmodel=large',
-  '-mstack-protector-guard=global', '-fno-pic', '-fno-pie', '-fcf-protection=none',
+  '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none',
   '-O2', '-DNDEBUG',
 ]
 waterbox_guest_ldflags = [

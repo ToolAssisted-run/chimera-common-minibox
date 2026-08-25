@@ -36,7 +36,7 @@ if build_guest_toolchain
   musl_src         = meson.current_source_dir() / 'extern' / 'musl'
   # The frozen musl CFLAGS (from extern/musl/wbox_configure.sh).
   musl_cflags = '-Werror -fvisibility=hidden -mcmodel=large ' + \
-                '-mstack-protector-guard=global -fno-pic -fno-pie -fcf-protection=none'
+                '-mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none'
 
   # Phase 1: configure musl out-of-tree. Writes config.mak + a Makefile symlink
   # into the build root (the custom_target cwd).
@@ -89,7 +89,7 @@ if build_guest_toolchain
     gcc_srcdir = cpp_dir / 'src' / 'gcc-' + gcc_version
     musl_specs = waterbox_sysroot / 'lib' / 'musl-gcc.specs'
     # Same frozen guest flags the .wbx itself is compiled with.
-    wbx_flags = '-mcmodel=large -mstack-protector-guard=global -fno-pic -fno-pie -fcf-protection=none -O2'
+    wbx_flags = '-mcmodel=large -mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -O2'
 
     waterbox_libstdcxx = custom_target('libstdcxx',
       input: waterbox_musl_gcc,           # needs the guest musl headers/libs first
