@@ -1,7 +1,13 @@
 #define _GNU_SOURCE
 /* Virtual filesystem: a flat list of named in-memory files (no directories).
  * Faithful C port of BizHawk waterboxhost src/fs/{mod.rs,regular_file.rs,empty_read.rs,
- * sys_out.rs}. Preloaded /dev/stdin (empty), /dev/stdout, /dev/stderr. */
+ * sys_out.rs}. Preloaded /dev/stdin (empty), /dev/stdout, /dev/stderr.
+ *
+ * Opens are HANDLES with their own positions: a read-only mount may be open
+ * any number of times at once (a multi-disc drive legitimately holds every
+ * disc open), while a WRITABLE mount stays single-open - concurrent write
+ * positions would be a determinism riddle nothing needs solved. File
+ * descriptors are the lowest free number, so allocation is deterministic. */
 #include "minibox_internal.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -29,50 +35,75 @@ typedef struct {
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
-#define BAD_FD (-1)
 
 typedef enum { F_EMPTY, F_SYSOUT, F_REGULAR } file_kind;
 typedef struct {
 	char *name;
-	int fd;
 	file_kind kind;
 	FILE *sysout;      /* F_SYSOUT */
 	uint8_t *data;     /* F_REGULAR */
-	size_t len, cap, pos;
+	size_t len, cap;
 	bool writable;     /* F_REGULAR: has no hash */
 } mounted_file;
 
-struct mb_fs { mounted_file *files; size_t n, cap; };
+typedef struct {
+	int fd;
+	size_t file;       /* index into fs->files */
+	size_t pos;
+} open_handle;
+
+struct mb_fs {
+	mounted_file *files; size_t n, cap;
+	open_handle *hs; size_t hn, hcap;
+};
 
 static mounted_file *add(mb_fs *fs) {
 	if (fs->n == fs->cap) { fs->cap = fs->cap ? fs->cap * 2 : 8; fs->files = realloc(fs->files, fs->cap * sizeof(mounted_file)); }
 	mounted_file *f = &fs->files[fs->n++];
 	memset(f, 0, sizeof(*f));
-	f->fd = BAD_FD;
 	return f;
+}
+
+static open_handle *handle_by_fd(mb_fs *fs, int fd) {
+	for (size_t i = 0; i < fs->hn; i++) if (fs->hs[i].fd == fd) return &fs->hs[i];
+	return NULL;
+}
+
+static bool file_is_open(mb_fs *fs, size_t file) {
+	for (size_t i = 0; i < fs->hn; i++) if (fs->hs[i].file == file) return true;
+	return false;
+}
+
+/* lowest free descriptor - deterministic for a deterministic call sequence */
+static open_handle *handle_add(mb_fs *fs, size_t file) {
+	int fd = 0;
+	while (handle_by_fd(fs, fd)) fd++;
+	if (fs->hn == fs->hcap) { fs->hcap = fs->hcap ? fs->hcap * 2 : 8; fs->hs = realloc(fs->hs, fs->hcap * sizeof(open_handle)); }
+	open_handle *h = &fs->hs[fs->hn++];
+	h->fd = fd; h->file = file; h->pos = 0;
+	return h;
 }
 
 mb_fs *mb_fs_new(void) {
 	mb_fs *fs = calloc(1, sizeof(mb_fs));
 	mounted_file *f;
-	f = add(fs); f->name = strdup("/dev/stdin");  f->fd = 0; f->kind = F_EMPTY;
-	f = add(fs); f->name = strdup("/dev/stdout"); f->fd = 1; f->kind = F_SYSOUT; f->sysout = stdout;
-	f = add(fs); f->name = strdup("/dev/stderr"); f->fd = 2; f->kind = F_SYSOUT; f->sysout = stderr;
+	f = add(fs); f->name = strdup("/dev/stdin");  f->kind = F_EMPTY;
+	f = add(fs); f->name = strdup("/dev/stdout"); f->kind = F_SYSOUT; f->sysout = stdout;
+	f = add(fs); f->name = strdup("/dev/stderr"); f->kind = F_SYSOUT; f->sysout = stderr;
+	handle_add(fs, 0); /* fd 0 */
+	handle_add(fs, 1); /* fd 1 */
+	handle_add(fs, 2); /* fd 2 */
 	return fs;
 }
 
 void mb_fs_free(mb_fs *fs) {
 	if (!fs) return;
 	for (size_t i = 0; i < fs->n; i++) { free(fs->files[i].name); free(fs->files[i].data); }
-	free(fs->files); free(fs);
+	free(fs->files); free(fs->hs); free(fs);
 }
 
 static mounted_file *by_name(mb_fs *fs, const char *name) {
 	for (size_t i = 0; i < fs->n; i++) if (strcmp(fs->files[i].name, name) == 0) return &fs->files[i];
-	return NULL;
-}
-static mounted_file *by_fd(mb_fs *fs, int fd) {
-	for (size_t i = 0; i < fs->n; i++) if (fs->files[i].fd == fd) return &fs->files[i];
 	return NULL;
 }
 
@@ -90,11 +121,13 @@ int mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *out_l
 		if (strcmp(fs->files[i].name, name) == 0) {
 			mounted_file *f = &fs->files[i];
 			if (f->kind != F_REGULAR) return -EINVAL;   /* permanent (stdio) */
-			if (f->fd != BAD_FD) return -EBUSY;          /* still open */
+			if (file_is_open(fs, i)) return -EBUSY;      /* still open */
 			if (out_data) { *out_data = f->data; *out_len = f->len; } else free(f->data);
 			free(f->name);
 			memmove(&fs->files[i], &fs->files[i+1], (fs->n - i - 1) * sizeof(mounted_file));
 			fs->n--;
+			/* handles index into the files array; later entries just moved */
+			for (size_t j = 0; j < fs->hn; j++) if (fs->hs[j].file > i) fs->hs[j].file--;
 			return 0;
 		}
 	}
@@ -102,11 +135,12 @@ int mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *out_l
 }
 
 mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags) {
-	int fd = 0;
-	while (by_fd(fs, fd)) fd++;
 	mounted_file *f = by_name(fs, name);
 	if (!f) return -ENOENT;
-	if (f->fd != BAD_FD) return -EACCES;
+	size_t idx = (size_t)(f - fs->files);
+	/* writable files stay single-open; read-only mounts may be opened many
+	 * times, each open with its own position */
+	if (f->kind == F_REGULAR && f->writable && file_is_open(fs, idx)) return -EACCES;
 	bool can_read = f->kind != F_SYSOUT;
 	bool can_write = (f->kind == F_SYSOUT) || (f->kind == F_REGULAR && f->writable);
 	switch (flags & O_ACCMODE) {
@@ -115,53 +149,55 @@ mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags) {
 		case O_RDWR:   if (!can_read || !can_write) return -EACCES; break;
 		default: return -EINVAL;
 	}
-	f->fd = fd;
-	return fd;
+	return handle_add(fs, idx)->fd;
 }
 
 mb_sword mb_fs_close(mb_fs *fs, int fd) {
-	mounted_file *f = by_fd(fs, fd);
-	if (!f) return -EBADF;
-	f->pos = 0;
-	f->fd = BAD_FD;
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -EBADF;
+	*h = fs->hs[--fs->hn]; /* order does not matter; fds identify handles */
 	return 0;
 }
 
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
-	mounted_file *f = by_fd(fs, fd);
-	if (!f) return -ENOENT;
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -ENOENT;
+	mounted_file *f = &fs->files[h->file];
 	if (f->kind == F_EMPTY) return 0;
 	if (f->kind == F_SYSOUT) return -EBADF;
-	size_t avail = f->len - f->pos, take = n < avail ? n : avail;
-	memcpy(buf, f->data + f->pos, take); f->pos += take;
+	size_t avail = f->len - h->pos, take = n < avail ? n : avail;
+	memcpy(buf, f->data + h->pos, take); h->pos += take;
 	return (mb_sword)take;
 }
 
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
-	mounted_file *f = by_fd(fs, fd);
-	if (!f) return -ENOENT;
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -ENOENT;
+	mounted_file *f = &fs->files[h->file];
 	if (f->kind == F_SYSOUT) { fwrite(buf, 1, n, f->sysout); return (mb_sword)n; } /* host errors swallowed */
 	if (f->kind == F_EMPTY || !f->writable) return -EBADF;
-	size_t newpos = f->pos + n;
+	size_t newpos = h->pos + n;
 	if (newpos > f->cap) { f->cap = newpos; f->data = realloc(f->data, f->cap); }
-	memcpy(f->data + f->pos, buf, n);
-	f->pos = newpos;
+	memcpy(f->data + h->pos, buf, n);
+	h->pos = newpos;
 	if (newpos > f->len) f->len = newpos;
 	return (mb_sword)n;
 }
 
 mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
-	mounted_file *f = by_fd(fs, fd);
-	if (!f || f->kind != F_REGULAR) return -EINVAL;
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -EINVAL;
+	mounted_file *f = &fs->files[h->file];
+	if (f->kind != F_REGULAR) return -EINVAL;
 	mb_sword newpos;
 	switch (whence) {
 		case SEEK_SET: newpos = offset; break;
-		case SEEK_CUR: newpos = (mb_sword)f->pos + offset; break;
+		case SEEK_CUR: newpos = (mb_sword)h->pos + offset; break;
 		case SEEK_END: newpos = (mb_sword)f->len + offset; break;
 		default: return -EINVAL;
 	}
 	if (newpos < 0 || newpos > (mb_sword)f->len) return -EINVAL;
-	f->pos = (size_t)newpos;
+	h->pos = (size_t)newpos;
 	return newpos;
 }
 
@@ -191,16 +227,18 @@ mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *ks) {
 	mounted_file *f = by_name(fs, name); if (!f) return -ENOENT; return stat_file(f, (kstat *)ks);
 }
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *ks) {
-	mounted_file *f = by_fd(fs, fd); if (!f) return -ENOENT; return stat_file(f, (kstat *)ks);
+	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return stat_file(&fs->files[h->file], (kstat *)ks);
 }
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size) {
 	mounted_file *f = by_name(fs, name);
 	if (!f) return -ENOENT;
 	if (f->kind != F_REGULAR || !f->writable || size < 0) return -EBADF;
 	f->data = realloc(f->data, size ? size : 1); f->len = f->cap = (size_t)size;
-	if (f->pos > f->len) f->pos = f->len;
+	for (size_t j = 0; j < fs->hn; j++) {
+		if (&fs->files[fs->hs[j].file] == f && fs->hs[j].pos > f->len) fs->hs[j].pos = f->len;
+	}
 	return 0;
 }
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size) {
-	mounted_file *f = by_fd(fs, fd); if (!f) return -ENOENT; return mb_fs_truncate_name(fs, f->name, size);
+	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return mb_fs_truncate_name(fs, fs->files[h->file].name, size);
 }

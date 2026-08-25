@@ -68,11 +68,27 @@ static void test_fd_semantics(void) {
 	mb_sword fb = mb_fs_open(fs, "b", O_RDONLY);
 	CHECK_EQ(fa, 3);
 	CHECK_EQ(fb, 4);
-	/* double-open the same file -> EACCES */
-	CHECK_EQ(mb_fs_open(fs, "a", O_RDONLY), -EACCES);
+	/* a read-only mount opens as many times as asked, each open with its
+	 * own position (a multi-disc drive holds every disc open) */
+	mb_sword fa2 = mb_fs_open(fs, "a", O_RDONLY);
+	CHECK_EQ(fa2, 5);
+	uint8_t c1 = 0, c2 = 0;
+	CHECK_EQ(mb_fs_read(fs, (int)fa, &c1, 1), 1);
+	CHECK_EQ(c1, 'x');
+	CHECK_EQ(mb_fs_read(fs, (int)fa, &c1, 1), 0);  /* first handle at EOF */
+	CHECK_EQ(mb_fs_read(fs, (int)fa2, &c2, 1), 1); /* second still at 0 */
+	CHECK_EQ(c2, 'x');
+	CHECK_EQ(mb_fs_close(fs, fa2), 0);
 	/* close a, its fd frees and is reused */
 	CHECK_EQ(mb_fs_close(fs, fa), 0);
 	CHECK_EQ(mb_fs_open(fs, "a", O_RDONLY), 3);
+	/* a WRITABLE mount stays single-open */
+	mb_fs_mount(fs, "w", NULL, 0, true);
+	mb_sword fw = mb_fs_open(fs, "w", O_RDWR);
+	CHECK(fw >= 0);
+	CHECK_EQ(mb_fs_open(fs, "w", O_RDWR), -EACCES);
+	CHECK_EQ(mb_fs_open(fs, "w", O_RDONLY), -EACCES);
+	mb_fs_close(fs, fw);
 	/* open missing -> ENOENT */
 	CHECK_EQ(mb_fs_open(fs, "nope", O_RDONLY), -ENOENT);
 	mb_fs_free(fs);
