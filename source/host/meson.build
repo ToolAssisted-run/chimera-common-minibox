@@ -1,5 +1,5 @@
 # The miniBox host runtime (C port). Builds libminiboxhost and exposes a meson
-# dependency so consumers (miniHawk, core packages) can use it as a subproject:
+# dependency so consumers (Chimera, core packages) can use it as a subproject:
 #
 #   minibox = subproject('miniBox')
 #   minibox_host_dep = minibox.get_variable('minibox_host_dep')

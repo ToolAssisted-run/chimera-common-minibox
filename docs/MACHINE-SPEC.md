@@ -6,7 +6,7 @@ any future one) must
 implement exactly this observable machine; any two implementations of spec
 version N must be bit-identical for the same (guest image, mounted files, input
 sequence). Movies record the machine-spec version; it is the third element of
-miniHawk's reproduction contract (movie + core package + machine-spec version).
+Chimera's reproduction contract (movie + core package + machine-spec version).
 
 "Observable" means: anything the guest can read, compute from, or have its
 savestate depend on. Host-internal representation (how pages are tracked, how
@@ -158,7 +158,7 @@ Savestate/load are illegal before seal.
 
 ## 6. Savestate format
 
-Savestates are used for rewind/rerecord WITHIN a session; miniHawk movies embed
+Savestates are used for rewind/rerecord WITHIN a session; Chimera movies embed
 inputs, not savestates, so a state never needs to move between host
 implementations or across a spec version. Accordingly:
 

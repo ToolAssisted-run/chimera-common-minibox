@@ -56,7 +56,7 @@ void mb_diag_banner(const char *what) {
  * the host was the last part of it that could not say where it came from.
  *
  * The values arrive as compile-time defines because two build systems compile these
- * sources (miniBox's own, and miniHawk's, which lists them itself), and a define is
+ * sources (miniBox's own, and Chimera's, which lists them itself), and a define is
  * the one thing both can supply without sharing a generated file. Everything here is
  * a function of the inputs - no timestamps, no hostname, no paths - so that two
  * builds of one commit stay byte-identical.

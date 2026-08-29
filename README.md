@@ -1,9 +1,9 @@
 # miniBox
 
-[![CI](https://github.com/SergioMartin86/miniBox/actions/workflows/ci.yml/badge.svg)](https://github.com/SergioMartin86/miniBox/actions/workflows/ci.yml)
+[![CI](https://github.com/ToolAssisted-run/chimera-common-minibox/actions/workflows/ci.yml/badge.svg)](https://github.com/ToolAssisted-run/chimera-common-minibox/actions/workflows/ci.yml)
 
-The waterbox for miniHawk: a determinism sandbox in which ALL miniHawk cores
-run (miniHawk is waterbox-only by design - see the miniHawk repository's
+The waterbox for Chimera: a determinism sandbox in which ALL Chimera cores
+run (Chimera is waterbox-only by design - see the Chimera repository's
 docs/design-principles.md, "THE WATERBOX-ONLY REDESIGN", and
 docs/waterbox-analysis.md for the full architecture analysis).
 
@@ -91,6 +91,6 @@ frontend's OS-dependent artifacts. Core authors use `source/guest/` (with the
    unit tests and runs them both under wine and on a real Windows runner (214
    checks). C++ guests are supported via -Dguest_cpp (libstdc++ retargeted to
    the guest); cothread support for C++ cores is still outstanding.
-2. Guest ABI v1 + conformance tests, runnable entirely without miniHawk.
+2. Guest ABI v1 + conformance tests, runnable entirely without Chimera.
 3. Machine specification document - the frozen contract both implementations
    are held to.

@@ -1,6 +1,6 @@
 /* waterbox_settings.h - miniBox guest kit: read the host's settings channel.
  *
- * The waterbox host (miniHawk) mounts a file named "settings" holding this core's
+ * The waterbox host (Chimera) mounts a file named "settings" holding this core's
  * effective settings - the package's waterbox.config defaults overlaid with the
  * user's sync settings - as a flat JSON object of scalar values, e.g.
  *     {"initFillByte": 171, "region": "ntsc", "turbo": true}

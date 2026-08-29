@@ -1,4 +1,4 @@
-# miniBox - a determinism sandbox (the waterbox for miniHawk).
+# miniBox - a determinism sandbox (the waterbox for Chimera).
 #
 # This top-level project builds the host runtime and wires the tests. The guest
 # toolchain (musl + emulibc) and guest cores are built through the waterbox-guest
