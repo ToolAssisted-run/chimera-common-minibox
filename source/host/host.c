@@ -309,6 +309,9 @@ int mb_host_seal(mb_host *h, char *errbuf, size_t errlen) {
 int mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_t len, bool writable) {
 	return mb_fs_mount(h->fs, name, data, len, writable);
 }
+int mb_host_mount_path(mb_host *h, const char *name, const char *path) {
+	return mb_fs_mount_path(h->fs, name, path);
+}
 int mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *outlen) {
 	return mb_fs_unmount(h->fs, name, out, outlen);
 }

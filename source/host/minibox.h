@@ -56,6 +56,14 @@ void wbx_get_proc_addr_raw(mb_host *obj, const char *name, mb_return *ret);
 void wbx_get_callback_addr(mb_host *obj, mb_external_callback callback, uintptr_t slot, mb_return *ret);
 void wbx_seal(mb_host *obj, mb_return *ret);
 void wbx_mount_file(mb_host *obj, const char *name, mb_read_callback cb, uintptr_t userdata, bool writable, mb_return *ret);
+/* Mounts a file on the host's disk, read-only, WITHOUT reading it: the guest's
+ * reads go to the disk as it makes them. For anything large - a disc image is
+ * gigabytes - this is the difference between a copy the machine never needed
+ * and no copy at all. The bytes a guest sees are the same as wbx_mount_file's,
+ * so nothing about the machine changes; a read-only file has nothing to save,
+ * so a savestate does not change either. The file must not change while it is
+ * mounted: its length is taken once, at mount. */
+void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, mb_return *ret);
 void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);

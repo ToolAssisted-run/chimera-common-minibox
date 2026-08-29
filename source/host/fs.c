@@ -7,12 +7,22 @@
  * any number of times at once (a multi-disc drive legitimately holds every
  * disc open), while a WRITABLE mount stays single-open - concurrent write
  * positions would be a determinism riddle nothing needs solved. File
- * descriptors are the lowest free number, so allocation is deterministic. */
+ * descriptors are the lowest free number, so allocation is deterministic.
+ *
+ * A read-only mount may also be a file ON THE HOST'S DISK rather than a copy
+ * in memory (F_HOST, mb_fs_mount_path). That is not an optimisation: a PS2
+ * disc is over four gigabytes and a copy of it is four gigabytes the machine
+ * did not need, on top of however many the caller made getting it here. The
+ * bytes a guest reads are the same either way, so nothing about the machine
+ * changes - and a read-only file has nothing to save, so a savestate does not
+ * change either. Writable mounts stay in memory: they are memory cards and
+ * save files, they are small, and their contents belong to the machine. */
 #include "minibox_internal.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* KStat: exact layout from BizHawk waterboxhost src/syscall_defs.rs (Linux x86-64). */
 typedef struct {
@@ -36,11 +46,12 @@ typedef struct {
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-typedef enum { F_EMPTY, F_SYSOUT, F_REGULAR } file_kind;
+typedef enum { F_EMPTY, F_SYSOUT, F_REGULAR, F_HOST } file_kind;
 typedef struct {
 	char *name;
 	file_kind kind;
 	FILE *sysout;      /* F_SYSOUT */
+	FILE *host;        /* F_HOST: the file on the host's disk, read on demand */
 	uint8_t *data;     /* F_REGULAR */
 	size_t len, cap;
 	bool writable;     /* F_REGULAR: has no hash */
@@ -55,6 +66,11 @@ typedef struct {
 struct mb_fs {
 	mounted_file *files; size_t n, cap;
 	open_handle *hs; size_t hn, hcap;
+	/* staging for F_HOST reads: the kernel writes here, the CPU copies from
+	 * here into the guest. See mb_fs_read for why that indirection is required
+	 * rather than merely tidy. One buffer for the whole filesystem, because
+	 * there is one thread and a read finishes before the next begins. */
+	uint8_t bounce[64 * 1024];
 };
 
 static mounted_file *add(mb_fs *fs) {
@@ -98,7 +114,11 @@ mb_fs *mb_fs_new(void) {
 
 void mb_fs_free(mb_fs *fs) {
 	if (!fs) return;
-	for (size_t i = 0; i < fs->n; i++) { free(fs->files[i].name); free(fs->files[i].data); }
+	for (size_t i = 0; i < fs->n; i++) {
+		free(fs->files[i].name);
+		free(fs->files[i].data);
+		if (fs->files[i].kind == F_HOST && fs->files[i].host) fclose(fs->files[i].host);
+	}
 	free(fs->files); free(fs->hs); free(fs);
 }
 
@@ -116,13 +136,35 @@ int mb_fs_mount(mb_fs *fs, const char *name, const uint8_t *data, size_t len, bo
 	return 0;
 }
 
+/* Mounts a host file read-only, without reading it. The length is taken once,
+ * here, and is what the guest is told and held to: a file that changes under a
+ * running machine is the caller's mistake, and letting the size drift would
+ * turn it into a nondeterminism nobody could see. */
+int mb_fs_mount_path(mb_fs *fs, const char *name, const char *path) {
+	if (by_name(fs, name)) return -EEXIST;
+	FILE *fp = fopen(path, "rb");
+	if (!fp) return -ENOENT;
+	if (fseeko(fp, 0, SEEK_END) != 0) { fclose(fp); return -EIO; }
+	off_t end = ftello(fp);
+	if (end < 0) { fclose(fp); return -EIO; }
+	mounted_file *f = add(fs);
+	f->name = strdup(name); f->kind = F_HOST; f->writable = false;
+	f->host = fp; f->len = f->cap = (size_t)end; f->data = NULL;
+	return 0;
+}
+
 int mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *out_len) {
 	for (size_t i = 0; i < fs->n; i++) {
 		if (strcmp(fs->files[i].name, name) == 0) {
 			mounted_file *f = &fs->files[i];
-			if (f->kind != F_REGULAR) return -EINVAL;   /* permanent (stdio) */
+			if (f->kind != F_REGULAR && f->kind != F_HOST) return -EINVAL;   /* permanent (stdio) */
 			if (file_is_open(fs, i)) return -EBUSY;      /* still open */
-			if (out_data) { *out_data = f->data; *out_len = f->len; } else free(f->data);
+			if (f->kind == F_HOST) {
+				/* nothing to hand back: the bytes never left the disk */
+				if (out_data) { *out_data = NULL; *out_len = 0; }
+				fclose(f->host);
+			}
+			else if (out_data) { *out_data = f->data; *out_len = f->len; } else free(f->data);
 			free(f->name);
 			memmove(&fs->files[i], &fs->files[i+1], (fs->n - i - 1) * sizeof(mounted_file));
 			fs->n--;
@@ -166,6 +208,38 @@ mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	if (f->kind == F_EMPTY) return 0;
 	if (f->kind == F_SYSOUT) return -EBADF;
 	size_t avail = f->len - h->pos, take = n < avail ? n : avail;
+	if (f->kind == F_HOST) {
+		/* The handle's position is the guest's; the host file's own position is
+		 * shared between every handle on it, so it is set from ours each time
+		 * rather than trusted.
+		 *
+		 * THE BOUNCE BUFFER IS NOT AN OPTIMISATION. `buf` is GUEST memory, and
+		 * guest pages are mapped read-only until something writes to them - the
+		 * write fault is how this host knows a page became dirty and belongs in
+		 * a savestate. A CPU store faults and is caught; a KERNEL write to the
+		 * same address does not, it just returns EFAULT. So a read big enough
+		 * for stdio to hand the guest's pointer straight to read(2) comes back
+		 * short, the guest gets fewer bytes than it asked for, and the machine
+		 * quietly diverges. (It did: PCSX2's EE RAM differed from its native
+		 * reference in 5778 bytes.) Reading into host memory and copying with
+		 * the CPU keeps every guest write a guest write. */
+		if (take == 0) return 0;
+		if (fseeko(f->host, (off_t)h->pos, SEEK_SET) != 0) return -EIO;
+		size_t done = 0;
+		while (done < take) {
+			size_t want = take - done;
+			if (want > sizeof fs->bounce) want = sizeof fs->bounce;
+			size_t got = fread(fs->bounce, 1, want, f->host);
+			if (got == 0) {
+				if (ferror(f->host)) { clearerr(f->host); return done ? (mb_sword)done : -EIO; }
+				break;   /* end of file, which the length said could not happen */
+			}
+			memcpy(buf + done, fs->bounce, got);
+			done += got;
+		}
+		h->pos += done;
+		return (mb_sword)done;
+	}
 	memcpy(buf, f->data + h->pos, take); h->pos += take;
 	return (mb_sword)take;
 }
@@ -188,7 +262,7 @@ mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -EINVAL;
 	mounted_file *f = &fs->files[h->file];
-	if (f->kind != F_REGULAR) return -EINVAL;
+	if (f->kind != F_REGULAR && f->kind != F_HOST) return -EINVAL;
 	mb_sword newpos;
 	switch (whence) {
 		case SEEK_SET: newpos = offset; break;
@@ -219,7 +293,7 @@ static void fill_stat(kstat *s, bool can_read, bool can_write, bool can_seek, in
 static mb_sword stat_file(mounted_file *f, kstat *s) {
 	if (f->kind == F_SYSOUT) fill_stat(s, false, true, false, 0);
 	else if (f->kind == F_EMPTY) fill_stat(s, true, false, false, 0);
-	else fill_stat(s, true, f->writable, true, (int64_t)f->len);
+	else fill_stat(s, true, f->writable, true, (int64_t)f->len);   /* F_HOST: writable is false */
 	return 0;
 }
 

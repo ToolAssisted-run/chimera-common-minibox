@@ -2,6 +2,9 @@
 #include "minibox_internal.h"
 #include "test_util.h"
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -121,6 +124,101 @@ static void test_stdout_write(void) {
 	mb_fs_free(fs);
 }
 
+/* A file on the host's disk reads exactly as the same bytes mounted from
+ * memory would, through every path a guest has: read, seek, stat, and reading
+ * twice at once. If those ever diverge, a project would draw a different
+ * machine depending on how its disc happened to be mounted. */
+static void test_host_file(void) {
+	static const char text[] = "0123456789abcdefghij";
+	const size_t len = sizeof(text) - 1;
+
+	char path[] = "/tmp/mb-fs-hostXXXXXX";
+	int tmpfd = mkstemp(path);
+	CHECK(tmpfd >= 0);
+	CHECK_EQ((size_t)write(tmpfd, text, len), len);
+	close(tmpfd);
+
+	mb_fs *fs = mb_fs_new();
+	CHECK_EQ(mb_fs_mount_path(fs, "disc", path), 0);
+	CHECK_EQ(mb_fs_mount(fs, "copy", (const uint8_t *)text, len, false), 0);
+
+	/* the same bytes, read the same way */
+	mb_sword a = mb_fs_open(fs, "disc", O_RDONLY);
+	mb_sword b = mb_fs_open(fs, "copy", O_RDONLY);
+	CHECK(a >= 0 && b >= 0);
+	uint8_t ba[8], bb[8];
+	CHECK_EQ(mb_fs_read(fs, (int)a, ba, 8), 8);
+	CHECK_EQ(mb_fs_read(fs, (int)b, bb, 8), 8);
+	CHECK_EQ(memcmp(ba, bb, 8), 0);
+
+	/* seeking, and a read that runs into the end */
+	CHECK_EQ(mb_fs_seek(fs, (int)a, 16, SEEK_SET), 16);
+	CHECK_EQ(mb_fs_read(fs, (int)a, ba, 8), 4);
+	CHECK_EQ(memcmp(ba, "ghij", 4), 0);
+	CHECK_EQ(mb_fs_read(fs, (int)a, ba, 8), 0);          /* EOF */
+	CHECK_EQ(mb_fs_seek(fs, (int)a, -4, SEEK_END), 16);
+	CHECK_EQ(mb_fs_seek(fs, (int)a, 999, SEEK_SET), -EINVAL);
+
+	/* two handles on one host file keep their own positions - a multi-disc
+	 * drive holds every disc open, and the host file has only one */
+	mb_sword c = mb_fs_open(fs, "disc", O_RDONLY);
+	CHECK(c >= 0);
+	CHECK_EQ(mb_fs_seek(fs, (int)c, 2, SEEK_SET), 2);
+	CHECK_EQ(mb_fs_read(fs, (int)c, bb, 4), 4);
+	CHECK_EQ(memcmp(bb, "2345", 4), 0);
+	CHECK_EQ(mb_fs_seek(fs, (int)a, 0, SEEK_CUR), 16);   /* the other did not move */
+
+	/* A read big enough that stdio would hand the destination straight to
+	 * read(2). That destination is guest memory in a real host, where a kernel
+	 * write does not trip the dirty-page fault and comes back short instead -
+	 * so the read has to bounce through host memory, in pieces, and still
+	 * return every byte asked for. This is the shape of the bug that made
+	 * PCSX2's EE RAM differ from its native reference by 5778 bytes. */
+	{
+		char bigpath[] = "/tmp/mb-fs-bigXXXXXX";
+		int bfd = mkstemp(bigpath);
+		CHECK(bfd >= 0);
+		const size_t big = 512 * 1024;          /* well over any stdio buffer */
+		uint8_t *pattern = malloc(big);
+		for (size_t i = 0; i < big; i++) pattern[i] = (uint8_t)(i * 7 + (i >> 8));
+		CHECK_EQ((size_t)write(bfd, pattern, big), big);
+		close(bfd);
+
+		mb_fs *bfs = mb_fs_new();
+		CHECK_EQ(mb_fs_mount_path(bfs, "big", bigpath), 0);
+		mb_sword h = mb_fs_open(bfs, "big", O_RDONLY);
+		CHECK(h >= 0);
+		uint8_t *got = calloc(big, 1);
+		CHECK_EQ(mb_fs_read(bfs, (int)h, got, big), (mb_sword)big);
+		CHECK_EQ(memcmp(got, pattern, big), 0);
+		CHECK_EQ(mb_fs_read(bfs, (int)h, got, 1), 0);   /* and it stopped at the end */
+		free(got); free(pattern);
+		mb_fs_free(bfs);
+		unlink(bigpath);
+	}
+
+	/* it is read-only, whatever a guest asks */
+	CHECK_EQ(mb_fs_write(fs, (int)a, (const uint8_t *)"x", 1), -EBADF);
+	CHECK_EQ(mb_fs_truncate_name(fs, "disc", 4), -EBADF);
+
+	/* and it says how big it is */
+	uint8_t ks[256];
+	CHECK_EQ(mb_fs_stat_name(fs, "disc", ks), 0);
+	int64_t size; memcpy(&size, ks + 48, sizeof size);   /* kstat.st_size */
+	CHECK_EQ(size, (int64_t)len);
+
+	CHECK_EQ(mb_fs_unmount(fs, "disc", NULL, NULL), -EBUSY);
+	mb_fs_close(fs, (int)a);
+	mb_fs_close(fs, (int)c);
+	CHECK_EQ(mb_fs_unmount(fs, "disc", NULL, NULL), 0);
+
+	/* a file that is not there is refused rather than mounted empty */
+	CHECK_EQ(mb_fs_mount_path(fs, "ghost", "/tmp/mb-fs-does-not-exist"), -ENOENT);
+
+	mb_fs_free(fs);
+	unlink(path);
+}
+
 static void run_all(void) {
 	RUN(test_ro_read);
 	RUN(test_seek);
@@ -128,5 +226,6 @@ static void run_all(void) {
 	RUN(test_fd_semantics);
 	RUN(test_mount_errors);
 	RUN(test_stdout_write);
+	RUN(test_host_file);
 }
 TEST_MAIN()

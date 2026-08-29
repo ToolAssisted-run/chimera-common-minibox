@@ -191,6 +191,8 @@ typedef struct mb_fs mb_fs;
 mb_fs *mb_fs_new(void);
 void   mb_fs_free(mb_fs *fs);
 int    mb_fs_mount(mb_fs *fs, const char *name, const uint8_t *data, size_t len, bool writable);
+/* read-only, read on demand from the host's disk; nothing is copied */
+int    mb_fs_mount_path(mb_fs *fs, const char *name, const char *path);
 int    mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *out_len); /* caller frees */
 /* syscall-shaped ops: return value or -errno */
 mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags);

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* host.c */
 mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_name,
@@ -19,6 +20,7 @@ uintptr_t mb_host_callin_addr(mb_host *h, uintptr_t ptr);
 int       mb_host_callback_addr(mb_host *h, mb_external_callback cb, uintptr_t slot, uintptr_t *out);
 int       mb_host_seal(mb_host *h, char *errbuf, size_t errlen);
 int       mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_t len, bool writable);
+int       mb_host_mount_path(mb_host *h, const char *name, const char *path);
 int       mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *outlen);
 size_t    mb_host_page_len(mb_host *h);
 uint8_t   mb_host_page_info(mb_host *h, size_t i);
@@ -91,6 +93,13 @@ void wbx_mount_file(mb_host *obj, const char *name, mb_read_callback cb, uintptr
 	int rc = mb_host_mount(obj, name, data, len, writable);
 	free(data);
 	if (rc != 0) { err(ret, "mount failed (already mounted?)"); return; }
+	ok(ret, 0);
+}
+
+void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, mb_return *ret) {
+	int rc = mb_host_mount_path(obj, name, host_path);
+	if (rc == -EEXIST) { err(ret, "mount failed (already mounted?)"); return; }
+	if (rc != 0) { err(ret, "cannot open the file to mount"); return; }
 	ok(ret, 0);
 }
 
