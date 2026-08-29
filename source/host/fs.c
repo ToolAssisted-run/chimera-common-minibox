@@ -73,6 +73,20 @@ struct mb_fs {
 	uint8_t bounce[64 * 1024];
 };
 
+/* 64-bit seek and tell, spelled for each host.
+ *
+ * mingw's off_t is FOUR BYTES: fseeko there silently cannot reach past 2GB,
+ * which is the exact size this whole mechanism exists to handle, on the exact
+ * platform where nothing in the Linux gates would notice. _fseeki64 is the
+ * one that works, and MSVC's runtime is what a mingw build links anyway. */
+#if defined(_WIN32)
+static int seek64(FILE *f, int64_t off, int whence) { return _fseeki64(f, off, whence); }
+static int64_t tell64(FILE *f) { return _ftelli64(f); }
+#else
+static int seek64(FILE *f, int64_t off, int whence) { return fseeko(f, (off_t)off, whence); }
+static int64_t tell64(FILE *f) { return (int64_t)ftello(f); }
+#endif
+
 static mounted_file *add(mb_fs *fs) {
 	if (fs->n == fs->cap) { fs->cap = fs->cap ? fs->cap * 2 : 8; fs->files = realloc(fs->files, fs->cap * sizeof(mounted_file)); }
 	mounted_file *f = &fs->files[fs->n++];
@@ -144,8 +158,8 @@ int mb_fs_mount_path(mb_fs *fs, const char *name, const char *path) {
 	if (by_name(fs, name)) return -EEXIST;
 	FILE *fp = fopen(path, "rb");
 	if (!fp) return -ENOENT;
-	if (fseeko(fp, 0, SEEK_END) != 0) { fclose(fp); return -EIO; }
-	off_t end = ftello(fp);
+	if (seek64(fp, 0, SEEK_END) != 0) { fclose(fp); return -EIO; }
+	int64_t end = tell64(fp);
 	if (end < 0) { fclose(fp); return -EIO; }
 	mounted_file *f = add(fs);
 	f->name = strdup(name); f->kind = F_HOST; f->writable = false;
@@ -224,7 +238,7 @@ mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 		 * reference in 5778 bytes.) Reading into host memory and copying with
 		 * the CPU keeps every guest write a guest write. */
 		if (take == 0) return 0;
-		if (fseeko(f->host, (off_t)h->pos, SEEK_SET) != 0) return -EIO;
+		if (seek64(f->host, (int64_t)h->pos, SEEK_SET) != 0) return -EIO;
 		size_t done = 0;
 		while (done < take) {
 			size_t want = take - done;
