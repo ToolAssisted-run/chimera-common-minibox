@@ -29,7 +29,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_wbx_clone=2000
 };
 
@@ -171,6 +171,16 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*) */
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
 			return r < 0 ? serr((int)-r) : sok(r);
+		}
+		case NR_sched_getaffinity: {
+			/* one CPU, honestly: pools and hardware_concurrency stay deterministic.
+			 * musl's sysconf(_SC_NPROCESSORS_*) issues this syscall directly, so a
+			 * libc-level shadow cannot answer it. Returns the kernel's cpumask
+			 * size in bytes, like Linux. */
+			if (a3 == 0 || a2 < 8) return serr(EINVAL);
+			memset((void *)a3, 0, a2);
+			*(uint8_t *)a3 = 1;
+			return sok(8);
 		}
 		case NR_exit: return mb_threads_exit(h->threads, &h->context);
 		case NR_futex: {
