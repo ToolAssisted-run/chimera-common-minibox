@@ -29,7 +29,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_wbx_clone=2000
 };
 
@@ -152,6 +152,18 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return sok(total);
 		}
 		case NR_open:  { mb_sword r = mb_fs_open(h->fs, (const char *)a1, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_pread64: {
+			/* read at an offset, position untouched. Guest threads cannot
+			 * interleave inside one host syscall, so save/seek/read/restore
+			 * is atomic as far as any guest can observe. */
+			mb_sword pos = mb_fs_seek(h->fs, (int)a1, 0, 1 /* SEEK_CUR */);
+			if (pos < 0) return serr((int)-pos);
+			mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a4, 0 /* SEEK_SET */);
+			if (r < 0) return serr((int)-r);
+			mb_sword n = mb_fs_read(h->fs, (int)a1, (void *)a2, a3);
+			mb_fs_seek(h->fs, (int)a1, pos, 0);
+			return n < 0 ? serr((int)-n) : sok(n);
+		}
 		case NR_openat: {
 			/* only the openat that IS open: std::filesystem and newer libcs
 			 * reach the flat namespace through AT_FDCWD; a real dirfd has no
