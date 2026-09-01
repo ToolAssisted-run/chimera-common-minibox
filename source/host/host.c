@@ -104,7 +104,8 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			if (flags & 0xf00) return serr(EOPNOTSUPP);
 			if (flags & MAP_STACK) { if (prot == MB_PROT_RW) prot = MB_PROT_RWSTACK; else return serr(EINVAL); }
 			bool no_replace = (flags & MAP_FIXED_NOREPLACE) != 0;
-			mb_range r = { a1, a2 };
+			/* the kernel rounds an unaligned length up to a page; so do we */
+			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
 			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
 			return res < 0 ? serr((int)-res) : sok(res);
 		}
