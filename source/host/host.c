@@ -29,7 +29,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_wbx_clone=2000
 };
 
@@ -152,6 +152,19 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return sok(total);
 		}
 		case NR_open:  { mb_sword r = mb_fs_open(h->fs, (const char *)a1, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_openat: {
+			/* only the openat that IS open: std::filesystem and newer libcs
+			 * reach the flat namespace through AT_FDCWD; a real dirfd has no
+			 * meaning here. */
+			if ((int)a1 != -100) return serr(EBADF);
+			mb_sword r = mb_fs_open(h->fs, (const char *)a2, (int)a3);
+			return r < 0 ? serr((int)-r) : sok(r);
+		}
+		case NR_newfstatat: {
+			if ((int)a1 != -100) return serr(EBADF);
+			mb_sword r = mb_fs_stat_name(h->fs, (const char *)a2, (void *)a3);
+			return r < 0 ? serr((int)-r) : sok(0);
+		}
 		case NR_close: { mb_sword r = mb_fs_close(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_lseek: { mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a2, (int)a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_truncate:  { mb_sword r = mb_fs_truncate_name(h->fs, (const char *)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
