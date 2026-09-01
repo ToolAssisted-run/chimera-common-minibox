@@ -29,7 +29,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_wbx_clone=2000
 };
 
@@ -152,6 +152,17 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return sok(total);
 		}
 		case NR_open:  { mb_sword r = mb_fs_open(h->fs, (const char *)a1, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_sysinfo: {
+			/* fixed, plausible, deterministic: 1GB total, half free, no swap.
+			 * (struct sysinfo is 112 bytes of longs; fill what matters.) */
+			uint64_t *si = (uint64_t *)a1;
+			memset(si, 0, 112);
+			si[0] = 0;                    /* uptime */
+			si[4] = 1024ull << 20;        /* totalram */
+			si[5] = 512ull << 20;         /* freeram */
+			((uint32_t *)a1)[100 / 4] = 1; /* mem_unit at offset 100 */
+			return sok(0);
+		}
 		case NR_prctl:
 			/* PR_SET_NAME: a label, not a behavior - accepted and ignored */
 			return (int)a1 == 15 ? sok(0) : serr(EINVAL);
