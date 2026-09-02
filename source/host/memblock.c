@@ -78,8 +78,8 @@ mb_block *mb_block_new(mb_range addr) {
 		fprintf(stderr, "miniBox: addresses and sizes must be aligned\n");
 		return NULL;
 	}
-	if (addr.start >> 32 != (mb_range_end(addr) - 1) >> 32) {
-		fprintf(stderr, "miniBox: MemoryBlock must fit into a single 4G region\n");
+	if (addr.start & 0xffffffffu) {
+		fprintf(stderr, "miniBox: MemoryBlock must start on a 4G boundary\n");
 		return NULL;
 	}
 	mb_block *b = (mb_block *)calloc(1, sizeof(mb_block));

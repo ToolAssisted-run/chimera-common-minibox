@@ -19,9 +19,10 @@ any implementation.
 
 ## 1. Address space
 
-All guests share one 64-bit layout. The guest image and every heap live in a
-single aligned 4 GiB region (`start >> 32 == (end-1) >> 32`); construction fails
-otherwise. Page size is 0x1000 (4096); all region bases and sizes are page
+All guests share one 64-bit layout. The guest image and every heap live in one
+contiguous block that starts on a 4 GiB boundary (`start & 0xffffffff == 0`)
+and may span any number of 4 GiB regions (v2; v1 required the block to fit in
+a single region). Construction fails otherwise. Page size is 0x1000 (4096); all region bases and sizes are page
 aligned. `align_down(p) = p & ~0xfff`; `align_up(p) = ((p-1) | 0xfff) + 1`.
 
 Two fixed absolute regions exist regardless of the guest:
@@ -310,7 +311,7 @@ save/load require no writable files mounted and the identical readonly file set.
 
 ## Versioning
 
-This is v1. Any change to an observable behavior above is a new machine-spec
+This is v2 (v1 + the multi-region block of section 1). Any change to an observable behavior above is a new machine-spec
 version. Implementations declare which versions they implement; a movie recorded
 under version N requires a host implementing version N. Non-observable host
 internals (page tracking strategy, snapshot storage, threading scheduler data

@@ -275,8 +275,11 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	ADD(plain, tpl->plain_size); ADD(mmap_arena, tpl->mmap_size);
 	#undef ADD
 	mb_range all = mb_layout_all(L);
-	if (all.start >> 32 != (mb_range_end(all) - 1) >> 32) {
-		snprintf(errbuf, errlen, "HostMemoryLayout must fit into a single 4GiB region");
+	/* Spec v2: the block may span any number of 4 GiB regions (a PS3 core keeps
+	 * a flat 4 GiB guest view plus an 8 GiB dispatch table); only the start
+	 * stays 4 GiB aligned. */
+	if (all.start & 0xffffffffu) {
+		snprintf(errbuf, errlen, "HostMemoryLayout must start on a 4GiB boundary");
 		free(h->image); free(h); return NULL;
 	}
 
