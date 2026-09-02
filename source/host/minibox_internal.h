@@ -141,6 +141,9 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
 
 /* ---- tripguard.c ---- */
 void mb_tripguard_register(mb_block *b);
+/* GuestFaultHandler(addr, is_write) -> nonzero when handled; see tripguard.c */
+typedef int (*mb_guest_fault_fn)(uint64_t addr, uint64_t is_write);
+void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn);
 #ifndef _WIN32
 void mb_tripguard_ensure_altstack(void);  /* per-thread; see tripguard.c */
 #endif

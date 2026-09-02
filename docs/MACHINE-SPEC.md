@@ -317,3 +317,19 @@ under version N requires a host implementing version N. Non-observable host
 internals (page tracking strategy, snapshot storage, threading scheduler data
 structures) may change freely without a version bump as long as every byte in
 sections 1-9 is preserved.
+
+## Guest fault forwarding (spec v2.1)
+
+A guest may protect pages of its own block (mprotect to read-only or
+no-access) and rely on the first access to tell it so: an emulator's texture
+cache watches guest memory that way. If the guest exports
+
+    int GuestFaultHandler(uint64_t addr, uint64_t is_write)   (guest ABI)
+
+the host resolves it at activation and calls it, on the faulting thread, for a
+fault at an address inside the block whose page the guest protected below what
+it could have (no-access, or read-only on a write). A nonzero return means the
+guest changed the protection and the access is retried; zero, or no export, is
+an unhandled fault as before. Faults on tracked clean pages (dirty-page
+tracking) and on free pages are never the guest's. The handler runs whatever
+the guest puts in it, so the host's alternate signal stack is 1 MiB.

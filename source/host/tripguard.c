@@ -22,6 +22,40 @@ static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
 	return guest - b->addr.start + b->mirror.start;
 }
 
+/* The guest's own fault handler, when it exports one (GuestFaultHandler,
+ * resolved at activation). A guest may protect pages of its own block and
+ * expect the first access to tell it so - an emulator's texture cache watches
+ * guest memory exactly that way - and this is how it hears: called on the
+ * faulting thread with the address and whether the access was a write; a
+ * nonzero return means the guest changed the protection and the access is
+ * retried. Faults on pages the guest never protected are not its business. */
+static mb_guest_fault_fn g_guest_fault;
+
+void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn) { g_guest_fault = fn; }
+
+static mb_block *owner_of(uintptr_t addr) {
+	for (int i = 0; i < g_nblocks; i++)
+		if (mb_range_contains(g_blocks[i]->addr, addr)) return g_blocks[i];
+	return NULL;
+}
+
+/* A fault on a page the guest protected below what it could have: read-only
+ * or no-access by the guest's own mprotect. Not a tracked clean page (that is
+ * trip's), not a free page (nobody's). */
+static bool guest_protected(uintptr_t addr, bool write) {
+	mb_block *b = owner_of(addr);
+	if (!b) return false;
+	uint8_t s = b->pages[(addr - b->addr.start) >> MB_PAGESHIFT].status;
+	if (s == MB_ST_NONE) return true;
+	if (write && (s == MB_ST_R || s == MB_ST_RX)) return true;
+	return false;
+}
+
+static bool ask_guest(uintptr_t addr, bool write) {
+	if (!g_guest_fault || !guest_protected(addr, write)) return false;
+	return g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
+}
+
 /* Shared: handle a write fault at addr. Returns true if handled. */
 static bool trip(uintptr_t addr) {
 	mb_block *b = NULL;
@@ -32,10 +66,8 @@ static bool trip(uintptr_t addr) {
 	size_t pi = (addr - b->addr.start) >> MB_PAGESHIFT;
 	mb_page *p = &b->pages[pi];
 	uint8_t s = p->status;
-	if (!(s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK)) {
-		__builtin_trap();
-		return false;
-	}
+	if (!(s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK))
+		return false;  /* not a tracked clean page: the guest's, or nobody's */
 	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
 	p->dirty = true;
 	mb_range r = { page_start, MB_PAGESIZE };
@@ -53,7 +85,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
-	bool rethrow = !write || !trip(fault);
+	bool rethrow = !(write && trip(fault)) && !ask_guest(fault, write);
 	if (rethrow) {
 		/* Mirror the Windows path: say what was asked for and whether any block
 		 * owns the address before the process dies with nothing to debug. */
@@ -97,7 +129,7 @@ void mb_tripguard_ensure_altstack(void) {
 		return;  /* this thread already has one */
 	stack_t ss;
 	memset(&ss, 0, sizeof(ss));
-	ss.ss_size = 64 * 1024;
+	ss.ss_size = 1024 * 1024;  /* a guest fault handler may run real code here */
 	ss.ss_sp = malloc(ss.ss_size);
 	ss.ss_flags = 0;
 	if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) { perror("miniBox sigaltstack"); abort(); }
@@ -132,6 +164,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	bool write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
 	uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
 	if (write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
+	if (ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
 
 	/* About to become an unhandled access violation, i.e. an instant process
 	 * death with nothing to debug. Say what was asked for and whether any block
