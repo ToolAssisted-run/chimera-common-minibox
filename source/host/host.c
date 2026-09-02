@@ -320,13 +320,15 @@ void mb_host_activate(mb_host *h) {
 	/* guest code will run on THIS thread; make signal delivery on a faulting
 	 * tracked stack page possible (see tripguard.c) */
 	mb_tripguard_ensure_altstack();
-	/* a guest that exports GuestFaultHandler wants to hear about faults on
-	 * pages it protected itself (see tripguard.c). The RAW address: it is
-	 * called on the faulting guest thread, which is already inside the
+#endif
+	/* A guest that exports GuestFaultHandler wants to hear about faults on
+	 * pages it protected itself (see tripguard.c) - on BOTH platforms: the
+	 * Windows handler is the vectored one, and a guest whose handler is not
+	 * registered there dies on its first watched write. The RAW address: it
+	 * is called on the faulting guest thread, which is already inside the
 	 * guest, so the host-to-guest adapter (a host thread entering) would
 	 * find no entry context to save. The guest ABI is spelled in the type. */
 	mb_tripguard_set_guest_fault_handler((mb_guest_fault_fn)mb_host_proc_addr_raw(h, "GuestFaultHandler"));
-#endif
 	if (h->active) return;
 	mb_prepare_thread();
 	h->context.host_ptr = (uintptr_t)h;
