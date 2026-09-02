@@ -53,7 +53,11 @@ typedef struct { uintptr_t sbrk_size, sealed_size, invis_size, plain_size, mmap_
 typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX, MB_PROT_RWSTACK } mb_prot;
 
 /* ---- PAL (pal_linux.c / pal_win.c): thin wrappers over the OS. Ranges aligned. ---- */
-typedef struct { uintptr_t h; } mb_handle;    /* memfd (Linux) or file mapping HANDLE (Windows) */
+typedef struct {
+	uintptr_t h;   /* memfd (Linux) or file mapping HANDLE (Windows) */
+	bool lazy;     /* Windows, blocks over 4 GiB: the section is reserved, not
+	                  committed; memblock commits page runs before first use */
+} mb_handle;
 int      mb_pal_open_handle(uintptr_t size, mb_handle *out);   /* 0 ok */
 void     mb_pal_close_handle(mb_handle h);
 /* map_handle: start==0 -> OS chooses; else fixed. Returns actual range, no access. */
@@ -62,6 +66,9 @@ void     mb_pal_unmap_handle(mb_range addr);
 int      mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out);
 void     mb_pal_unmap_anon(mb_range addr);
 int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
+/* Lazy blocks (handle.lazy): back a range of a reserved section with the given
+ * protection. On Linux nothing is ever lazy and this is mprotect. */
+int      mb_pal_commit(mb_range addr, mb_prot prot);           /* 0 ok */
 /* Windows only (no-op elsewhere): query one region's guard-page dirtiness for
  * RWStack tracking. Returns the region size in *out_size and whether it's dirty
  * (guard bit cleared). Returns 0 on success. */
@@ -85,6 +92,7 @@ typedef struct {
 	bool invisible;
 	mb_snap_kind snap_kind;
 	uint8_t *snap_data;  /* MB_PAGESIZE bytes when snap_kind==DATA, else NULL */
+	bool uncommitted;    /* lazy blocks only: neither view is backed yet (reads as zero) */
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */

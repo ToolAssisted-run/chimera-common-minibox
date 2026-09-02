@@ -20,10 +20,19 @@ static uint32_t prot_to_native(mb_prot prot) {
 }
 
 int mb_pal_open_handle(uintptr_t size, mb_handle *out) {
-	HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE,
+	/* A pagefile-backed section charges its whole size to the commit limit at
+	 * creation, and a block spanning many 4 GiB regions (the PS3 core declares
+	 * 20 GiB) fits no ordinary pagefile. Such blocks are reserved (SEC_RESERVE)
+	 * and backed run by run as the guest maps pages (memblock's
+	 * ensure_committed, through mb_pal_commit); blocks up to 4 GiB keep the
+	 * eager path every shipped core has run on. */
+	bool lazy = size > ((uintptr_t)4 << 30);
+	HANDLE m = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+	                              PAGE_EXECUTE_READWRITE | (lazy ? SEC_RESERVE : 0),
 	                              (DWORD)(size >> 32), (DWORD)size, NULL);
 	if (m == NULL) return -1;
 	out->h = (uintptr_t)m;
+	out->lazy = lazy;
 	return 0;
 }
 
@@ -73,6 +82,17 @@ void mb_pal_unmap_anon(mb_range addr) { VirtualFree((void *)addr.start, 0, MEM_R
 int mb_pal_protect(mb_range addr, mb_prot prot) {
 	DWORD old;
 	return VirtualProtect((void *)addr.start, addr.size, prot_to_native(prot), &old) ? 0 : -1;
+}
+
+/* Reserved section pages become real (zero-filled) here; each view of a
+ * SEC_RESERVE section is committed on its own, so memblock calls this for the
+ * guest view and the mirror separately. */
+int mb_pal_commit(mb_range addr, mb_prot prot) {
+	if (VirtualAlloc((void *)addr.start, addr.size, MEM_COMMIT, prot_to_native(prot)) != NULL) return 0;
+	fprintf(stderr, "miniBox: VirtualAlloc(MEM_COMMIT %p, %llu) failed, error %lu\n",
+	        (void *)addr.start, (unsigned long long)addr.size, (unsigned long)GetLastError());
+	fflush(stderr);
+	return -1;
 }
 
 /* Query a region for RWStack dirtiness: the guard bit is cleared once the page

@@ -31,6 +31,7 @@ int mb_pal_open_handle(uintptr_t size, mb_handle *out) {
 	if (fd == -1) return -1;
 	if (ftruncate(fd, (off_t)size) != 0) { close(fd); return -1; }
 	out->h = (uintptr_t)fd;
+	out->lazy = false;
 	return 0;
 }
 
@@ -61,6 +62,10 @@ int mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out) {
 void mb_pal_unmap_anon(mb_range addr) { munmap((void *)addr.start, addr.size); }
 
 int mb_pal_protect(mb_range addr, mb_prot prot) {
+	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
+}
+
+int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
 

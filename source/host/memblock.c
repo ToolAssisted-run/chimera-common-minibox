@@ -64,6 +64,11 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 }
 
 void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
+	/* a page nothing has backed yet holds zeros and cannot be read */
+	if (p->uncommitted) {
+		if (p->snap_kind == MB_SNAP_NONE) p->snap_kind = MB_SNAP_ZERO;
+		return;
+	}
 	if (p->snap_kind == MB_SNAP_NONE) {
 		p->snap_data = (uint8_t *)malloc(MB_PAGESIZE);
 		memcpy(p->snap_data, (const void *)maddr, MB_PAGESIZE);
@@ -96,8 +101,33 @@ mb_block *mb_block_new(mb_range addr) {
 	if (mb_pal_map_handle(b->handle, m_in, &b->mirror) != 0) {
 		mb_pal_close_handle(b->handle); free(b->pages); free(b); return NULL;
 	}
-	mb_pal_protect(b->mirror, MB_PROT_RW);
+	if (b->handle.lazy)
+		for (size_t i = 0; i < b->npages; i++) b->pages[i].uncommitted = true;
+	else
+		mb_pal_protect(b->mirror, MB_PROT_RW);
 	return b;
+}
+
+/* Lazy blocks: back every still-unbacked page of the run in both views
+ * before anything touches it (the guest through its protection, the host
+ * through the mirror). Committed pages stay committed for the block's life;
+ * the guest view gets no access here, refresh_range sets its protection. */
+static void ensure_committed(mb_block *b, size_t pstart, size_t pcount) {
+	if (!b->handle.lazy) return;
+	size_t i = pstart;
+	while (i < pstart + pcount) {
+		if (!b->pages[i].uncommitted) { i++; continue; }
+		size_t j = i + 1;
+		while (j < pstart + pcount && b->pages[j].uncommitted) j++;
+		mb_range m = { mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), (j - i) << MB_PAGESHIFT };
+		mb_pal_commit(m, MB_PROT_RW);
+		if (b->swapped_in) {
+			mb_range g = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
+			mb_pal_commit(g, MB_PROT_NONE);
+		}
+		for (size_t k = i; k < j; k++) b->pages[k].uncommitted = false;
+		i = j;
+	}
 }
 
 static void refresh_all(mb_block *b);
@@ -113,6 +143,19 @@ void mb_block_activate(mb_block *b) {
 		}
 		mb_tripguard_register(b);
 		b->swapped_in = true;
+		/* pages the host already backed through the mirror (copy_from_external
+		 * before activation) need their guest-view backing now */
+		if (b->handle.lazy) {
+			size_t i = 0;
+			while (i < b->npages) {
+				if (b->pages[i].uncommitted) { i++; continue; }
+				size_t j = i + 1;
+				while (j < b->npages && !b->pages[j].uncommitted) j++;
+				mb_range g = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
+				mb_pal_commit(g, MB_PROT_NONE);
+				i = j;
+			}
+		}
 		refresh_all(b);
 	}
 	b->active = true;
@@ -149,6 +192,7 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 		size_t j = i + 1;
 		while (j < pstart + pcount && mb_page_native_prot(&b->pages[j]) == prot) j++;
 		mb_range r = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
+		if (prot != MB_PROT_NONE) ensure_committed(b, i, j - i);
 		mb_pal_protect(r, prot);
 		i = j;
 	}
@@ -265,7 +309,7 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 	for (size_t i = ps; i < ps + pcount; i++) {
 		uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
 		mb_page_maybe_snapshot(&b->pages[i], maddr);
-		memset((void *)maddr, 0, MB_PAGESIZE);
+		if (!b->pages[i].uncommitted) memset((void *)maddr, 0, MB_PAGESIZE);
 		/* undirty pages whose sealed baseline was already zero */
 		b->pages[i].dirty = !b->pages[i].invisible && b->pages[i].snap_kind != MB_SNAP_ZERO;
 	}
@@ -328,6 +372,7 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 	size_t pcount, ps = validate(b, e, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
 	for (size_t i = ps; i < ps + pcount; i++) b->pages[i].dirty = true;
+	ensure_committed(b, ps, pcount);
 	memcpy((void *)mirror_addr(b, start), src, len);
 	return 0;
 }
@@ -419,6 +464,7 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	for (size_t i = 0; i < b->npages; i++) {
 		if (!b->pages[i].invisible && b->pages[i].dirty) {
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+			ensure_committed(b, i, 1);
 			if (wr(w, ud, (const void *)maddr, MB_PAGESIZE)) return -EIO;
 		}
 	}
@@ -454,6 +500,7 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		if (!p->invisible) {
 			bool old_d = p->dirty, new_d = dirtii[i] != 0;
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+			if (old_d || new_d) ensure_committed(b, i, 1);
 			if (!old_d && new_d) {
 				mb_page_maybe_snapshot(p, maddr);
 				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { free(statii); free(dirtii); return -EIO; }
