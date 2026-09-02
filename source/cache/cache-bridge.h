@@ -25,6 +25,12 @@ enum {
 	                       With cap == 0 only the size is answered; with cap >= size
 	                       the bytes are copied to dst. */
 	CACHE_OP_STORE = 2, /* args: CacheStoreArgs; returns 1 when kept, 0 when refused */
+	/* How far along the work that fills this cache is: a = done, b = total, in
+	 * whatever units the core counts (modules, files). A guest is otherwise
+	 * mute until it yields, and work that fills a cache does not yield often;
+	 * this is its way to say so at the moment it happens. The host prints or
+	 * shows it; the return is ignored. */
+	CACHE_OP_PROGRESS = 3,
 };
 
 struct CacheFetchArgs {
