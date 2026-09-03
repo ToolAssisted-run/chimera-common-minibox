@@ -21,6 +21,7 @@ struct mb_host {
 	mb_context context;
 	mb_thunks *thunks;
 	mb_threads *threads;
+	uint64_t getrandom_state; /* deterministic entropy stream, per host */
 };
 
 /* ---- syscall numbers (x86-64) ---- */
@@ -30,7 +31,7 @@ enum {
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
-	NR_clock_gettime=228, NR_set_tid_address=218, NR_wbx_clone=2000
+	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_wbx_clone=2000
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -199,6 +200,27 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_clock_gettime: {
 			int64_t *ts = (int64_t *)a2;  /* {tv_sec, tv_nsec} */
 			ts[0] = 1495889068; ts[1] = 0; return sok(0);
+		}
+		case NR_getrandom: {
+			/* Determinism is the whole contract, so randomness cannot be real:
+			 * fill the buffer from a fixed-seed splitmix64. std seeds every
+			 * HashMap's RandomState through this call, so a guest that uses a
+			 * hash map (every Rust guest does) needs it, and needs it the same
+			 * every run. The stream is per-host and resets with the host, like
+			 * clock_gettime's constant time; it is not part of the machine
+			 * state because a seed drawn once at startup never re-reads. */
+			uint8_t *buf = (uint8_t *)a1;
+			uint64_t n = a2;
+			for (uint64_t i = 0; i < n; i += 8) {
+				h->getrandom_state += 0x9E3779B97F4A7C15ull;
+				uint64_t z = h->getrandom_state;
+				z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+				z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+				z = z ^ (z >> 31);
+				uint64_t take = n - i < 8 ? n - i : 8;
+				memcpy(buf + i, &z, take);
+			}
+			return sok((mb_sword)n);
 		}
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
