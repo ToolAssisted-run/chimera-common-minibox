@@ -24,6 +24,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /* Opcodes below 100 are the bridge talking about itself; 100 and up are the
  * generated GL entry points, numbered by the master list (see README.md). */
@@ -51,3 +52,27 @@ struct GlClearTestArgs {
 /* The callback's shape, as the sandbox defines it. */
 typedef uint64_t (*chimera_gl_bridge_fn)(uint64_t op, uint64_t a, uint64_t b,
                                          uint64_t c, uint64_t d, uint64_t e);
+
+/* The two entry points the generated guest half provides.
+ *
+ * Declared with C linkage because the half that CALLS them is not always C++:
+ * a Rust guest reaches its renderer's loader through the C ABI, and a core
+ * written in C would too. The generated file includes this header, so the
+ * definitions take this linkage.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Point the generated wrappers at the host's callback. Returns false when the
+ * host's opcode list is shorter than the one this core was built against. */
+bool chimera_gl_install(chimera_gl_bridge_fn bridge);
+
+/* What a loader asks for: the wrapper for an entry point, or null when this
+ * core does not carry one - which is what a driver answers for a call it does
+ * not have. */
+void *chimera_gl_lookup(const char *name);
+
+#ifdef __cplusplus
+}
+#endif
