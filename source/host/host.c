@@ -31,7 +31,8 @@ enum {
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
-	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72, NR_wbx_clone=2000
+	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
+	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -259,6 +260,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));
 		case NR_gettid: return sok(mb_threads_get_tid(h->threads));
 		case NR_getpid: case NR_getppid: return sok(1);
+		/* One fixed identity. Mesa asks (its option parsing takes the
+		 * secure_getenv path, which compares euid with uid), and a core that
+		 * answered with the host's real ids would let the machine's behaviour
+		 * depend on who ran it. euid == uid, so nothing is treated as
+		 * privileged and no path is taken for one user and not another. */
+		case NR_getuid: case NR_geteuid: return sok(1000);
+		case NR_getgid: case NR_getegid: return sok(1000);
 		case NR_sched_yield: case NR_nanosleep: case NR_clock_nanosleep:
 			return mb_threads_yield(h->threads, &h->context);
 		case NR_wbx_clone: {
