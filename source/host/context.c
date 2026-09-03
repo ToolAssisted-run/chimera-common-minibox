@@ -131,6 +131,10 @@ struct mb_thunks {
 	uintptr_t entries[MB_PAGESIZE / THUNK_SIZE];
 	uintptr_t ptrs[MB_PAGESIZE / THUNK_SIZE];
 	size_t count;
+	/* callbacks pointing the other way (guest -> host) get their own wrappers */
+	uintptr_t ext_entries[MB_PAGESIZE / THUNK_SIZE];
+	uintptr_t ext_ptrs[MB_PAGESIZE / THUNK_SIZE];
+	size_t ext_count;
 };
 
 mb_thunks *mb_thunks_new(void) {
@@ -153,7 +157,7 @@ static void emit64(uint8_t **p, uintptr_t v) { memcpy(*p, &v, 8); *p += 8; }
 uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	for (size_t i = 0; i < t->count; i++)
 		if (t->entries[i] == guest_entry) return t->ptrs[i];
-	if ((t->count + 1) * THUNK_SIZE > t->mem.size) return 0; /* no room */
+	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0; /* no room */
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
@@ -194,4 +198,56 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	t->ptrs[t->count] = addr;
 	t->count++;
 	return addr;
+}
+
+
+/* The mirror image of mb_thunks_get, for the other direction.
+ *
+ * A guest calling out to the host arrives through the interop blob, which
+ * switches stacks but knows nothing about %fs - so the host's callback would
+ * run with the GUEST's thread pointer still loaded. With a C guest that is
+ * invisible (it uses %gs); with a Rust one, every host function that touches a
+ * thread local - errno, a driver's context, anything in glibc - reads and
+ * writes the guest's TLS block instead of its own. It survives only as long as
+ * the callback does nothing real, which stops being true the moment the host
+ * end drives a GPU.
+ *
+ * So the callback the guest is handed is not the host's function but this
+ * wrapper: put the host's %fs back (the entry thunk parked it in ctx->host_fs
+ * on the way in), call, and restore the guest's on the way out. It has to be
+ * instructions rather than C for the same reason the syscall dispatcher does:
+ * anything that runs before the swap runs on the wrong TLS.
+ */
+uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
+#ifdef MB_HAVE_FSBASE
+	if (!c->fs_swap) return cb;
+	for (size_t i = 0; i < t->ext_count; i++)
+		if (t->ext_entries[i] == cb) return t->ext_ptrs[i];
+	/* Entry thunks grow from the bottom of the page and these from the top,
+	 * so a thunk taken out later cannot land on a wrapper handed out earlier
+	 * (which is what happens if both count from the same end). */
+	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0;
+	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
+	uint8_t *p = (uint8_t *)addr;
+	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
+	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xc0); /* rdfsbase rax (guest) */
+	emit8(&p, 0x50);                                                   /* push rax */
+	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x82);
+	emit32(&p, (uint32_t)offsetof(mb_context, host_fs));               /* mov rax, [r10+host_fs] */
+	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, cb);                  /* mov rax, cb */
+	emit8(&p, 0xff); emit8(&p, 0xd0);                                  /* call rax */
+	emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0xc3);                 /* mov r11, rax */
+	emit8(&p, 0x58);                                                   /* pop rax (guest fs) */
+	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
+	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
+	emit8(&p, 0xc3);                                                   /* ret */
+	t->ext_entries[t->ext_count] = cb;
+	t->ext_ptrs[t->ext_count] = addr;
+	t->ext_count++;
+	return addr;
+#else
+	(void)t; (void)c;
+	return cb;
+#endif
 }

@@ -221,6 +221,9 @@ typedef struct mb_thunks mb_thunks;
 mb_thunks *mb_thunks_new(void);
 void       mb_thunks_free(mb_thunks *t);
 uintptr_t  mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c);
+/* A host callback the guest may call, wrapped so the host's %fs is back in
+ * place before any host code runs. Returns cb unchanged when no swap is on. */
+uintptr_t  mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c);
 
 /* ---- elf.c ---- */
 typedef struct mb_elf mb_elf;

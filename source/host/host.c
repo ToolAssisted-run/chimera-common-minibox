@@ -421,7 +421,12 @@ uintptr_t mb_host_callin_addr(mb_host *h, uintptr_t ptr) { return mb_thunks_get(
 
 int mb_host_callback_addr(mb_host *h, mb_external_callback cb, uintptr_t slot, uintptr_t *out) {
 	if (slot >= MB_CALLBACK_SLOTS) return -1;
-	h->context.extcall_slots[slot] = cb;
+	/* Wrapped, so the host's %fs is restored before the callback's first
+	 * instruction: the interop switches stacks but not thread pointers, and a
+	 * Rust guest leaves its own %fs loaded. See mb_thunks_get_extcall. */
+	uintptr_t wrapped = mb_thunks_get_extcall(h->thunks, (uintptr_t)cb, &h->context);
+	if (wrapped == 0) return -1;
+	h->context.extcall_slots[slot] = (mb_external_callback)wrapped;
 	*out = mb_get_callback_ptr(slot);
 	return 0;
 }
