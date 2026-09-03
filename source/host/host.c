@@ -31,7 +31,7 @@ enum {
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
-	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_wbx_clone=2000
+	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72, NR_wbx_clone=2000
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -243,6 +243,17 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			}
 			return sok((mb_sword)n);
 		}
+		case NR_fcntl: {
+			/* Only the descriptor-flag commands, and only nominally: there is no
+			 * exec in a sandbox, so close-on-exec means nothing, and the VFS has
+			 * no non-blocking mode to set. Rust's File::open sets FD_CLOEXEC on
+			 * every handle it opens, which is how this first came up. */
+			switch ((int)a2) {
+				case 1: /* F_GETFD */ case 3: /* F_GETFL */ return sok(0);
+				case 2: /* F_SETFD */ case 4: /* F_SETFL */ return sok(0);
+				default: return serr(EINVAL);
+			}
+		}
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));
@@ -349,7 +360,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * it its own %fs; every C/C++ guest on the waterbox musl uses %gs and is
 	 * left exactly as it was. */
 #ifdef MB_HAVE_FSBASE
-	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok();
+	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok() && !getenv("MB_NO_FS_SWAP");
 #endif
 
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
