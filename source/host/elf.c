@@ -36,6 +36,7 @@ typedef struct {
 } Elf64_Sym;
 
 #define PT_LOAD 1
+#define PT_TLS  7
 #define PF_X 1
 #define PF_W 2
 #define PF_R 4
@@ -51,6 +52,12 @@ struct mb_elf {
 	export_info  *exports;  size_t nexports;
 	uintptr_t entry;
 	uint8_t hash[32];
+	/* Does this guest carry ELF thread-local storage (PT_TLS)? Only a guest
+	 * built by a toolchain that emits %fs-relative TLS does - Rust does, and
+	 * every C/C++ guest built against the waterbox musl does NOT, because that
+	 * musl reaches its thread pointer through %gs instead. It decides whether
+	 * the host swaps %fs around guest execution at all. */
+	bool has_tls;
 };
 
 static bool section_ro_after_seal(const char *n) {
@@ -139,9 +146,10 @@ int mb_elf_load(const uint8_t *image, size_t image_len, const char *module_name,
 	}
 	mb_block_mark_invisible(b, layout->invis);
 
-	/* load PT_LOAD segments */
+	/* load PT_LOAD segments (and note PT_TLS on the way past: see has_tls) */
 	for (int i = 0; i < eh->e_phnum; i++) {
 		const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff + (size_t)i * eh->e_phentsize);
+		if (ph->p_type == PT_TLS && ph->p_memsz != 0) e->has_tls = true;
 		if (ph->p_type != PT_LOAD || ph->p_vaddr == 0) continue;
 		mb_range addr = { ph->p_vaddr, ph->p_memsz };
 		mb_range pa = mb_range_align_expand(addr);
@@ -189,6 +197,7 @@ void mb_elf_free(mb_elf *e) {
 }
 
 uintptr_t mb_elf_entry(const mb_elf *e) { return e->entry; }
+bool mb_elf_has_tls(const mb_elf *e) { return e->has_tls; }
 
 uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name) {
 	for (size_t i = 0; i < e->nexports; i++)

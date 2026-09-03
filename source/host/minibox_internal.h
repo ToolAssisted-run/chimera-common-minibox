@@ -175,7 +175,41 @@ typedef struct {
 	mb_syscall_cb dispatch_syscall;
 	uintptr_t host_ptr;
 	mb_external_callback extcall_slots[MB_CALLBACK_SLOTS];
+	/* The host thread's real %fs (glibc TLS base), stored by the guest-entry
+	 * paths so the syscall dispatcher can restore it. A Rust guest uses
+	 * %fs-direct TLS, so %fs holds the GUEST thread pointer (thread_area) while
+	 * guest code runs and must be swapped back to host_fs for host C at the
+	 * syscall boundary. Trailing field: the interop blob only knows the fields
+	 * above it, so appending here changes no interop offset. */
+	uintptr_t host_fs;
+	/* Swap %fs around guest execution? Only for a guest that carries PT_TLS,
+	 * i.e. one whose toolchain emits %fs-relative TLS (Rust). C/C++ guests on
+	 * the waterbox musl reach their thread pointer through %gs and must be left
+	 * strictly alone - swapping for them would buy nothing and would put host
+	 * callbacks on the guest's %fs (see docs: the extcall path is NOT covered).
+	 * Read by the syscall dispatcher as a plain load, before any call. */
+	bool fs_swap;
 } mb_context;
+
+/* Single-instruction %fs swaps (FSGSBASE). The guest and host share the CPU
+ * thread; a Rust guest needs %fs = its thread pointer (mb_context.thread_area)
+ * while host C needs %fs = mb_context.host_fs. x86-64 Linux only, and only
+ * where the kernel exposes FSGSBASE to userspace - the instructions raise
+ * SIGILL otherwise, which would break every C/C++ guest too, so everything is
+ * gated on the one-time probe. */
+#if !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
+#define MB_HAVE_FSBASE 1
+/* The "memory" clobber is load-bearing, not decoration: without it the compiler
+ * may sink or hoist the swap across the calls it is meant to bracket, and host
+ * glibc running for even one call against the guest's TLS corrupts guest memory
+ * (it shows up much later as the guest's own malloc returning a bad pointer). */
+static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("rdfsbase %0" : "=r"(v) :: "memory"); return v; }
+static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("wrfsbase %0" :: "r"(v) : "memory"); }
+bool mb_fsbase_ok(void);
+/* Plain global, not a call: the dispatcher must decide whether to swap BEFORE
+ * it may safely call anything (it is entered on the guest's %fs). */
+extern bool mb_fs_swap;
+#endif
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
 void      mb_prepare_thread(void);              /* install gs base once per host thread */
@@ -195,6 +229,7 @@ int       mb_elf_load(const uint8_t *image, size_t image_len, const char *module
                       const mb_layout *layout, mb_block *b, mb_elf **out);
 void      mb_elf_free(mb_elf *e);
 uintptr_t mb_elf_entry(const mb_elf *e);
+bool      mb_elf_has_tls(const mb_elf *e); /* guest carries PT_TLS -> needs %fs swapping */
 uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name); /* 0 if absent */
 void      mb_elf_seal(mb_elf *e, mb_block *b);   /* mprotect RO sections */
 const uint8_t *mb_elf_hash(const mb_elf *e);     /* 32 bytes */

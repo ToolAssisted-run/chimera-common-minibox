@@ -81,15 +81,36 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
  * for, and the result column is where that shows. */
 static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
-	if (!trace_syscalls()) return dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
-	fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx)", (unsigned long long)nr,
-	        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
-	fflush(stderr);
-	uintptr_t res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
-	intptr_t s = (intptr_t)res;
-	if (s < 0 && s > -4096) fprintf(stderr, " -> ERR %lld\n", (long long)s);
-	else fprintf(stderr, " -> %llx\n", (unsigned long long)res);
-	fflush(stderr);
+#ifdef MB_HAVE_FSBASE
+	/* The guest trapped in here with %fs = its own thread pointer (a Rust guest
+	 * uses %fs-direct TLS), but everything below is host C and glibc - malloc
+	 * and fprintf read the host's TLS through %fs. Put the host's back for the
+	 * body, and the guest's back before returning to guest code. thread_area is
+	 * 0 only during early _start, when the guest is still on %gs and keeping
+	 * host %fs is the right answer. */
+	mb_host *hfs = (mb_host *)hp;
+	const bool swap_fs = hfs->context.fs_swap; /* plain load: NO call may precede the swap */
+	if (swap_fs) mb_wrfsbase(hfs->context.host_fs);
+#endif
+	uintptr_t res;
+	if (!trace_syscalls()) {
+		res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
+	} else {
+		fprintf(stderr, "[syscall] %llu (%llx, %llx, %llx)", (unsigned long long)nr,
+		        (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+		fflush(stderr);
+		res = dispatch_inner(a1, a2, a3, a4, a5, a6, nr, hp);
+		intptr_t s = (intptr_t)res;
+		if (s < 0 && s > -4096) fprintf(stderr, " -> ERR %lld\n", (long long)s);
+		else fprintf(stderr, " -> %llx\n", (unsigned long long)res);
+		fflush(stderr);
+	}
+#ifdef MB_HAVE_FSBASE
+	if (swap_fs) {
+		mb_wrfsbase(hfs->context.thread_area ? hfs->context.thread_area
+		                                     : hfs->context.host_fs);
+	}
+#endif
 	return res;
 }
 
@@ -322,6 +343,14 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		mb_block_deactivate(h->block); mb_block_free(h->block); mb_fs_free(h->fs);
 		mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h); return NULL;
 	}
+
+	/* Decided before the guest runs a single instruction: a guest carrying
+	 * PT_TLS uses %fs-relative thread locals (Rust) and needs the host to hand
+	 * it its own %fs; every C/C++ guest on the waterbox musl uses %gs and is
+	 * left exactly as it was. */
+#ifdef MB_HAVE_FSBASE
+	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok();
+#endif
 
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
 	mb_block_deactivate(h->block); h->active = false;
