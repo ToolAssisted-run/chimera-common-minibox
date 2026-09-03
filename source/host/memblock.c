@@ -63,6 +63,62 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 	return status_prot(p->status);  /* Windows RWStack-clean falls through -> RW|GUARD */
 }
 
+/* Snapshot storage, allocated WITHOUT malloc.
+ *
+ * A page's baseline copy is taken inside the SIGSEGV handler, and malloc is not
+ * async-signal-safe: the fault can land in the middle of the host's own
+ * allocation - a graphics driver allocates constantly - and the handler then
+ * re-enters the allocator on a lock it already holds. It survives while few
+ * pages are taken, and stops surviving the moment a core is sealed, because
+ * sealing marks every dirty page clean again and thousands of faults arrive at
+ * once. (Nine thousand snapshots in, this died with no diagnosis possible: a
+ * fault inside the handler is delivered with SIGSEGV blocked, so the process is
+ * killed outright and nothing gets to say why.)
+ *
+ * So the snapshots come from pages this file maps itself, in chunks, and are
+ * handed out through a small free list. mmap and munmap are plain syscalls and
+ * safe to call from a handler; the spin lock covers the driver threads that can
+ * fault at the same time as the guest. */
+#define SNAP_CHUNK_PAGES 512
+static uint8_t **g_snap_free;      /* stack of free page-sized slots */
+static size_t g_snap_free_count, g_snap_free_cap;
+static volatile int g_snap_lock;
+
+static void snap_lock(void) { while (__atomic_test_and_set(&g_snap_lock, __ATOMIC_ACQUIRE)) { } }
+static void snap_unlock(void) { __atomic_clear(&g_snap_lock, __ATOMIC_RELEASE); }
+
+static uint8_t *snap_alloc(void) {
+	snap_lock();
+	if (g_snap_free_count == 0) {
+		mb_range in = { 0, SNAP_CHUNK_PAGES * MB_PAGESIZE }, got;
+		if (mb_pal_map_anon(in, MB_PROT_RW, &got) != 0) { snap_unlock(); return NULL; }
+		if (g_snap_free_cap < g_snap_free_count + SNAP_CHUNK_PAGES) {
+			/* the index itself may grow, and here we are outside the handler's
+			 * hot path often enough that a mapping is the honest way to do it */
+			size_t want = (g_snap_free_cap ? g_snap_free_cap * 2 : 1024);
+			while (want < g_snap_free_count + SNAP_CHUNK_PAGES) want *= 2;
+			mb_range iin = { 0, want * sizeof(uint8_t *) }, igot;
+			if (mb_pal_map_anon(iin, MB_PROT_RW, &igot) != 0) { snap_unlock(); return NULL; }
+			uint8_t **ni = (uint8_t **)igot.start;
+			for (size_t i = 0; i < g_snap_free_count; i++) ni[i] = g_snap_free[i];
+			if (g_snap_free) { mb_range old = { (uintptr_t)g_snap_free, g_snap_free_cap * sizeof(uint8_t *) }; mb_pal_unmap_anon(old); }
+			g_snap_free = ni; g_snap_free_cap = want;
+		}
+		for (size_t i = 0; i < SNAP_CHUNK_PAGES; i++)
+			g_snap_free[g_snap_free_count++] = (uint8_t *)(got.start + i * MB_PAGESIZE);
+	}
+	uint8_t *r = g_snap_free[--g_snap_free_count];
+	snap_unlock();
+	return r;
+}
+
+static void snap_release(uint8_t *p) {
+	if (!p) return;
+	snap_lock();
+	if (g_snap_free_count < g_snap_free_cap) g_snap_free[g_snap_free_count++] = p;
+	snap_unlock();
+}
+
 void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 	/* a page nothing has backed yet holds zeros and cannot be read */
 	if (p->uncommitted) {
@@ -70,7 +126,8 @@ void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 		return;
 	}
 	if (p->snap_kind == MB_SNAP_NONE) {
-		p->snap_data = (uint8_t *)malloc(MB_PAGESIZE);
+		p->snap_data = snap_alloc();
+		if (!p->snap_data) return;   /* out of room: leave it clean rather than crash */
 		memcpy(p->snap_data, (const void *)maddr, MB_PAGESIZE);
 		p->snap_kind = MB_SNAP_DATA;
 	}
@@ -177,7 +234,7 @@ void mb_block_free(mb_block *b) {
 	}
 	mb_pal_unmap_anon(b->mirror);
 	mb_pal_close_handle(b->handle);
-	for (size_t i = 0; i < b->npages; i++) free(b->pages[i].snap_data);
+	for (size_t i = 0; i < b->npages; i++) snap_release(b->pages[i].snap_data);
 	free(b->pages);
 	free(b);
 }
@@ -441,7 +498,7 @@ int mb_block_seal(mb_block *b) {
 	for (size_t i = 0; i < b->npages; i++) {
 		if (b->pages[i].dirty && !b->pages[i].invisible) {
 			b->pages[i].dirty = false;
-			free(b->pages[i].snap_data);
+			snap_release(b->pages[i].snap_data);
 			b->pages[i].snap_data = NULL;
 			b->pages[i].snap_kind = MB_SNAP_NONE; /* live memory is the baseline */
 #ifdef _WIN32
