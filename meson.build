@@ -57,9 +57,17 @@ if build_guest_toolchain
 
   # Phase 2: build + install musl (reads config.mak from the same build root).
   # The wrapper lands at <build>/musl-gcc; headers/libs under guest-sysroot/.
+  # depend_files on the vendored musl sources so an edit (e.g. a syscall-glue
+  # fix in arch/waterbox) forces the sysroot to rebuild. Without this, make's
+  # own outputs are invisible to ninja and a fixed header silently ships as a
+  # stale libc.a (cost a day chasing "Rust file IO is broken" - it was not).
+  musl_dep_files = run_command('sh', '-c',
+    'find ' + musl_src / 'arch/waterbox' + ' ' + musl_src / 'src' + ' -name "*.h" -o -name "*.c" -o -name "*.s" 2>/dev/null',
+    check: false).stdout().strip().split('\n')
   waterbox_musl_gcc = custom_target('musl-gcc',
     input: musl_config,
     output: 'musl-gcc',
+    depend_files: musl_dep_files,
     command: [find_program('make'), '-j', 'install'],
     console: true,
   )
