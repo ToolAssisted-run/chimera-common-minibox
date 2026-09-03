@@ -262,10 +262,33 @@ int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replac
 }
 
 
+/* A big request is served from the TOP of the arena, a small one from the
+ * bottom. Best fit alone is not enough over a long run: a machine that
+ * compiles code takes a few hundred megabytes, gives them back, and takes
+ * them again a hundred times, between thousands of small allocations. The
+ * small ones eventually land inside a returned big hole, and from then on no
+ * big request fits although gigabytes are free. Keeping the two ends apart
+ * costs nothing and keeps the large holes whole.
+ *
+ * "Big" is a size no ordinary allocation reaches; the arena has room for many
+ * of them either way. */
+#define MB_BIG_REQUEST_PAGES (4096) /* 16 MiB */
+
 /* best-fit free run inside an arena; returns start page index or SIZE_MAX */
 static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_count, size_t npages) {
+	size_t end = arena_start + arena_count;
+	if (npages >= MB_BIG_REQUEST_PAGES) {
+		/* the highest run that fits, so the low end stays free for the rest */
+		size_t i = end, run_end = end;
+		while (i > arena_start) {
+			i--;
+			if (b->pages[i].status != MB_ST_FREE) { run_end = i; continue; }
+			if (run_end - i >= npages) return run_end - npages;
+		}
+		return (size_t)-1;
+	}
 	size_t best = (size_t)-1, best_len = (size_t)-1;
-	size_t i = arena_start, end = arena_start + arena_count;
+	size_t i = arena_start;
 	while (i < end) {
 		if (b->pages[i].status == MB_ST_FREE) {
 			size_t j = i;
@@ -285,7 +308,40 @@ mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena,
 		size_t acount, as = validate(b, arena, &acount);
 		if (as == (size_t)-1) return -EINVAL;
 		size_t ps = find_free_pages(b, as, acount, addr.size >> MB_PAGESHIFT);
-		if (ps == (size_t)-1) return -ENOMEM;
+		if (ps == (size_t)-1) {
+			/* A refusal here is a machine dying for want of address space, and
+			 * "out of memory" alone never says whether the arena is full or
+			 * merely in pieces. Say which. */
+			size_t freeP = 0, run = 0, best = 0;
+			for (size_t i = as; i < as + acount; i++) {
+				if (b->pages[i].status == MB_ST_FREE) { freeP++; run++; if (run > best) best = run; }
+				else run = 0;
+			}
+			mb_diag_banner("arena exhausted");
+			mb_diag("[mmap] %zu MiB wanted; arena %zu MiB, %zu MiB free, largest run %zu MiB\n",
+			        (size_t)(addr.size >> 20), (size_t)((acount << MB_PAGESHIFT) >> 20),
+			        (size_t)((freeP << MB_PAGESHIFT) >> 20), (size_t)((best << MB_PAGESHIFT) >> 20));
+			/* and what is holding it: the largest occupied runs, which is
+			 * usually one or two structures a core reserved and never gave back */
+			for (int shown = 0; shown < 6; shown++) {
+				size_t bs = 0, bl = 0, i = as;
+				static size_t reported[6]; /* skip the ones already named */
+				while (i < as + acount) {
+					if (b->pages[i].status == MB_ST_FREE) { i++; continue; }
+					size_t j = i;
+					while (j < as + acount && b->pages[j].status != MB_ST_FREE) j++;
+					bool seen = false;
+					for (int k = 0; k < shown; k++) if (reported[k] == i) seen = true;
+					if (!seen && j - i > bl) { bl = j - i; bs = i; }
+					i = j;
+				}
+				if (bl == 0) break;
+				reported[shown] = bs;
+				mb_diag("[mmap]   %zu MiB at +%zu MiB\n", (size_t)((bl << MB_PAGESHIFT) >> 20),
+				        (size_t)(((bs - as) << MB_PAGESHIFT) >> 20));
+			}
+			return -ENOMEM;
+		}
 		set_protections(b, ps, addr.size >> MB_PAGESHIFT, prot_status(prot));
 		return (mb_sword)(b->addr.start + (ps << MB_PAGESHIFT));
 	} else {
