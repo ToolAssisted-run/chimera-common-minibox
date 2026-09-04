@@ -215,11 +215,19 @@ bool mb_fsbase_ok(void);
 /* Plain global, not a call: the dispatcher must decide whether to swap BEFORE
  * it may safely call anything (it is entered on the guest's %fs). */
 extern bool mb_fs_swap;
-/* The host's %fs for as long as a guest is running, as a PLAIN global.
- * The fault handler needs it before it may touch anything at all, and a
- * thread-local could only be reached through the very register that is
- * wrong. Written on the way in to the guest, by both entry paths. */
+/* The two %fs values that bracket a guest call, as PLAIN globals: the fault
+ * handler needs them before it may touch anything at all, and a thread-local
+ * could only be reached through the very register that is wrong.
+ *
+ * BOTH are needed, and the guest one is what makes this safe. A fault can
+ * arrive on any thread in the process - a frontend has many, and .NET raises
+ * exceptions as a matter of course - and a handler that swapped whenever a
+ * guest call was merely in progress would corrupt the %fs of every OTHER
+ * thread that faulted meanwhile. So the handler swaps only when the faulting
+ * thread is running on the GUEST's thread pointer, which no other thread ever
+ * is. Both are cleared when the guest call returns. */
 extern uintptr_t mb_host_fs_while_guest;
+extern uintptr_t mb_guest_fs_while_guest;
 #endif
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);

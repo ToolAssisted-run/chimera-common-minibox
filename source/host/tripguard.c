@@ -103,9 +103,12 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 #ifdef MB_HAVE_FSBASE
 	uintptr_t guest_fs = 0;
 	bool swapped = false;
-	if (mb_fs_swap && mb_host_fs_while_guest) {
+	/* Only when THIS thread is running on the guest's own thread pointer. A
+	 * fault on any other thread - and a frontend has many - must be left
+	 * exactly as it arrived. */
+	if (mb_fs_swap && mb_guest_fs_while_guest) {
 		guest_fs = mb_rdfsbase();
-		if (guest_fs != mb_host_fs_while_guest) {
+		if (guest_fs == mb_guest_fs_while_guest && mb_host_fs_while_guest) {
 			mb_wrfsbase(mb_host_fs_while_guest);
 			swapped = true;
 		}
@@ -197,9 +200,11 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
 	uintptr_t guest_fs = 0;
 	bool swapped = false;
-	if (mb_fs_swap && mb_host_fs_while_guest) {
+	/* Same rule as the Linux handler: only the thread actually on the guest's
+	 * thread pointer. .NET raises exceptions constantly on other threads. */
+	if (mb_fs_swap && mb_guest_fs_while_guest) {
 		guest_fs = mb_rdfsbase();
-		if (guest_fs != mb_host_fs_while_guest) {
+		if (guest_fs == mb_guest_fs_while_guest && mb_host_fs_while_guest) {
 			mb_wrfsbase(mb_host_fs_while_guest);
 			swapped = true;
 		}
