@@ -67,11 +67,42 @@ void mb_prepare_thread(void) {
 #endif
 }
 
+#ifdef MB_HAVE_FSBASE
+/* A thread pointer for the guest's first instructions.
+ *
+ * The guest only gets its own %fs once musl has built its TLS block and called
+ * __set_thread_area - but musl's own startup reaches for a thread local before
+ * that, and so does anything the compiler inlined ahead of it. Until then %fs
+ * is whatever the host left there, and what the host leaves there differs:
+ * on Linux it is glibc's TCB, so the reads land on real memory and the guest
+ * gets away with nonsense; on Windows nothing uses %fs and its base is 0, so
+ * the first thread-local read dereferences -8 and the guest is dead before it
+ * can install the pointer that would have saved it.
+ *
+ * So it starts with one: a zeroed host page, pointed at from the middle so
+ * that the negative offsets a TLS block uses stay inside it. Nothing durable
+ * lives here - musl overwrites thread_area with the real block within the
+ * first call - and it is never read again afterwards. */
+static uintptr_t mb_early_thread_pointer(void) {
+	static uintptr_t p = 0;
+	if (p == 0) {
+		mb_range want = { 0, MB_PAGESIZE * 2 }, got;
+		if (mb_pal_map_anon(want, MB_PROT_RW, &got) == 0)
+			p = got.start + MB_PAGESIZE;
+	}
+	return p;
+}
+#endif
+
 void mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch) {
 	memset(c, 0, sizeof(*c));
 	c->guest_rsp = guest_rsp;
 	c->guest_rsp_alt = guest_rsp_alt;
 	c->dispatch_syscall = dispatch;
+#ifdef MB_HAVE_FSBASE
+	/* Replaced by the guest's own the moment musl installs it. */
+	c->thread_area = mb_early_thread_pointer();
+#endif
 }
 
 typedef uintptr_t (MB_SYSV *call_guest_simple_fn)(uintptr_t entry, mb_context *c);
