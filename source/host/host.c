@@ -369,6 +369,17 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * left exactly as it was. */
 #ifdef MB_HAVE_FSBASE
 	h->context.fs_swap = mb_elf_has_tls(h->elf) && mb_fsbase_ok() && !getenv("MB_NO_FS_SWAP");
+	/* Said once, unprompted, because it decides whether a guest carrying its own
+	 * thread locals can work at all - and when it is wrong the failure is a
+	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
+	if (mb_elf_has_tls(h->elf)) {
+		fprintf(stderr, "miniBox: guest declares TLS; %%fs swap %s%s\n",
+		        h->context.fs_swap ? "ON" : "OFF",
+		        h->context.fs_swap ? ""
+		            : (getenv("MB_NO_FS_SWAP") ? " (MB_NO_FS_SWAP set)"
+		                                       : " (the OS does not offer fsbase to user mode)"));
+		fflush(stderr);
+	}
 #endif
 
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
