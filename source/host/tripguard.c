@@ -33,6 +33,54 @@ static mb_guest_fault_fn g_guest_fault;
 
 void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn) { g_guest_fault = fn; }
 
+#ifdef MB_HAVE_FSBASE
+/* Is the instruction we are about to resume the guest's own? That is a property
+ * of the faulting rip, not of any register - which matters, because the register
+ * we would otherwise ask (%fs) is the one under suspicion in here. The guest's
+ * code lives inside a registered block; host code never does.
+ *
+ * No stack protector: this runs from a fault handler, and that check reads
+ * %fs:0x28, which is exactly what is not yet safe. */
+__attribute__((no_stack_protector))
+static bool rip_in_guest(uintptr_t rip) {
+	for (int i = 0; i < g_nblocks; i++)
+		if (mb_range_contains(g_blocks[i]->addr, rip)) return true;
+	return false;
+}
+
+/* Testing hook, for hosts that do NOT drop the base: pretend one did, so the
+ * repair below is exercised on a machine where the bug cannot happen. */
+__attribute__((no_stack_protector))
+static bool drop_fs_for_test(void) {
+	static int cached = -1;
+	if (cached < 0) cached = getenv("MB_DROP_FS_ON_FAULT") ? 1 : 0;
+	return cached == 1;
+}
+
+/* Leaving a fault handler back into guest code: install the guest's thread
+ * pointer, whatever the register happens to hold now.
+ *
+ * The report has to be made from the HOST's %fs - fprintf reads its own thread
+ * locals through %fs on Linux - which is why it is sandwiched here rather than
+ * written where it reads more naturally. On Windows the host's is 0, and that
+ * is the correct value to hold while host code runs there. */
+__attribute__((no_stack_protector))
+static void mb_restore_guest_fs(void) {
+	if (drop_fs_for_test()) mb_wrfsbase(0);
+	if (mb_rdfsbase() != mb_guest_fs_while_guest) {
+		static bool reported = false;
+		if (!reported) {   /* once: this path runs thousands of times a second */
+			reported = true;
+			mb_wrfsbase(mb_host_fs_while_guest);
+			fprintf(stderr, "miniBox: the OS drops the guest %%fs across a fault; "
+			                "reinstalling it on the way out\n");
+			fflush(stderr);
+		}
+	}
+	mb_wrfsbase(mb_guest_fs_while_guest);
+}
+#endif
+
 static mb_block *owner_of(uintptr_t addr) {
 	for (int i = 0; i < g_nblocks; i++)
 		if (mb_range_contains(g_blocks[i]->addr, addr)) return g_blocks[i];
@@ -101,20 +149,21 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext);
 __attribute__((no_stack_protector))
 static void handler(int sig, siginfo_t *info, void *ucontext) {
 #ifdef MB_HAVE_FSBASE
-	uintptr_t guest_fs = 0;
-	bool swapped = false;
-	/* Only when THIS thread is running on the guest's own thread pointer. A
-	 * fault on any other thread - and a frontend has many - must be left
-	 * exactly as it arrived. */
-	if (mb_fs_swap && mb_guest_fs_while_guest) {
-		guest_fs = mb_rdfsbase();
-		if (guest_fs == mb_guest_fs_while_guest && mb_host_fs_while_guest) {
-			mb_wrfsbase(mb_host_fs_while_guest);
-			swapped = true;
-		}
-	}
+	/* Only a fault in guest code, which the rip says and %fs does not: a
+	 * frontend has many threads faulting for their own reasons, and one of
+	 * them must be left exactly as it arrived. Asking the rip rather than
+	 * rdfsbase also means this still works when %fs has already been lost -
+	 * see the Windows handler below, where that is the normal case. */
+	const bool guest_rip = mb_fs_swap && mb_guest_fs_while_guest
+	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
+	                                       ->uc_mcontext.gregs[REG_RIP]);
+	if (guest_rip && mb_host_fs_while_guest) mb_wrfsbase(mb_host_fs_while_guest);
 	handler_inner(sig, info, ucontext);
-	if (swapped) mb_wrfsbase(guest_fs);
+	/* Back to the guest's, from the value the entry thunk recorded rather than
+	 * from whatever was in the register on the way in. Same value on a host
+	 * that preserves the base across a signal, and the right one on a host
+	 * that does not. */
+	if (guest_rip) mb_restore_guest_fs();
 #else
 	handler_inner(sig, info, ucontext);
 #endif
@@ -191,26 +240,26 @@ static void initialize(void) {
 
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 
-/* Same reason as the Linux handler above: while a guest with its own thread
- * pointer runs, %fs is the guest's, and this is host code that reaches its own
- * thread locals through %fs. On Windows the host's %fs is nobody's, so running
- * on the guest's is not merely wrong but immediately fatal. */
+/* Windows loses the guest's %fs across a fault.
+ *
+ * An exception here is delivered by the kernel, and the user-mode FS base does
+ * not survive that round trip: the handler is entered, and the guest resumed,
+ * with %fs back at 0. Nothing notices until the guest's next thread-local read,
+ * which is why this took a real game to find - the small test movies are AVM1
+ * and never reach the thread locals AVM2 verification keeps.
+ *
+ * So on Windows there is nothing to swap on the way IN. The host's %fs there is
+ * 0, nobody's; host code reaches its thread locals through the TEB on %gs and
+ * does not care what %fs holds. All that is needed is to put the guest's back
+ * before resuming a guest instruction - which is a no-op on any OS that kept
+ * it, and the whole fix on this one. */
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
-	uintptr_t guest_fs = 0;
-	bool swapped = false;
-	/* Same rule as the Linux handler: only the thread actually on the guest's
-	 * thread pointer. .NET raises exceptions constantly on other threads. */
-	if (mb_fs_swap && mb_guest_fs_while_guest) {
-		guest_fs = mb_rdfsbase();
-		if (guest_fs == mb_guest_fs_while_guest && mb_host_fs_while_guest) {
-			mb_wrfsbase(mb_host_fs_while_guest);
-			swapped = true;
-		}
-	}
+	const bool guest_rip = mb_fs_swap && mb_guest_fs_while_guest
+	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
 	LONG r = veh_inner(ep);
-	if (swapped) mb_wrfsbase(guest_fs);
+	if (guest_rip && r == EXCEPTION_CONTINUE_EXECUTION) mb_restore_guest_fs();
 	return r;
 #else
 	return veh_inner(ep);
