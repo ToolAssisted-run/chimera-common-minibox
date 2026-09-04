@@ -125,6 +125,15 @@ Two hazards worth writing down, both of which cost real time:
   the guest. A `%fs` bug reproduced under wine is probably wine's. Test on real
   Windows or not at all.
 
+* **The base does not survive a Windows fault.** An exception is delivered by
+  the kernel, and the user-mode FS base does not come back with the thread: the
+  guest resumes with `%fs` at 0 and dies at its next thread-local read, far from
+  the fault that broke it. The handlers therefore decide "is this guest code"
+  from the faulting rip rather than from `rdfsbase()`, and reinstall the recorded
+  base on the way out - a write of the value already there on a host that kept
+  it. `MB_DROP_FS_ON_FAULT=1` simulates the loss on a host that does not have
+  the bug, which is the only way to exercise the repair off Windows.
+
 Reading a Windows fault report: the `[veh] unhandled fault: addr=... rip=...`
 line reports a GUEST address, so
 `objdump -d --start-address=<rip> --stop-address=<rip+16> core.wbx` on the
