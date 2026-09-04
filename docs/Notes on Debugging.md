@@ -82,3 +82,51 @@ Bring lots of tools, and lots of self loathing.
 * Same lazystate SIGSEGV problem (and same solutions) as Windows.
 * Can see some mono symbols, which is sometimes useful.
 * If you're looking for a pure core bug, this might be a better environment to test it on than Windows.  It depends.
+
+## Guest thread pointers, and the `%fs` switches
+
+Waterbox musl reaches its thread pointer through a patched `__set_thread_area`,
+which writes `ctx->thread_area` and needs no segment register. A guest compiled
+by LLVM does not: Rust emits local-exec TLS as plain `%fs:`-relative reads
+(Ruffle's guest has over a thousand of them), so the sandbox has to point `%fs`
+at the guest's thread area for the duration of guest code and put the host's
+back before any host code runs. That swap is what these switches control.
+
+Every run with such a guest prints one line naming what it decided:
+
+	miniBox: guest declares TLS; %fs swap ON
+
+The decision is gated on the guest ELF actually having a `PT_TLS` segment, and
+on FSGSBASE being usable from user mode (`AT_HWCAP2` on Linux,
+`PF_RDWRFSGSBASE_AVAILABLE` on Windows). Both halves appear in the reason.
+
+* `MB_NO_FS_SWAP=1` forces it off. Use it to prove a bug is or is not the swap.
+  Remember that `set` persists for the life of a Windows console; the startup
+  line says `OFF (MB_NO_FS_SWAP set)` precisely so a stale variable is visible
+  in a log rather than mistaken for a fresh failure.
+* `MB_FORCE_FS_SWAP=1` forces it on where the OS declines to advertise fsbase.
+  Testing only. It is how the swap path gets exercised on a machine that does
+  not offer FSGSBASE at all, but see the warning about wine below.
+
+Two hazards worth writing down, both of which cost real time:
+
+* **The guest needs a thread pointer before its first instruction.** musl
+  installs one early, but not early enough: `_start` and anything the loader
+  touches before it can already read a thread local, and a `%fs` base of 0 turns
+  that into a read of a small negative address. Linux hides this - `%fs` there
+  is glibc's TCB, a real address, so the guest reads harmless nonsense and
+  everything passes. On Windows nothing else uses `%fs` and the base is 0, so
+  the same guest faults at `addr=fffffffffffffff8` before it does anything.
+  `mb_context_init` therefore starts `thread_area` at a zeroed host page,
+  pointed at from the middle so a TLS block's negative offsets stay inside it.
+  musl replaces it within the first call.
+* **wine is a false lead for anything `%fs`.** wine runs on Linux glibc, which
+  does use `%fs`, so pointing `%fs` at the guest breaks wine itself rather than
+  the guest. A `%fs` bug reproduced under wine is probably wine's. Test on real
+  Windows or not at all.
+
+Reading a Windows fault report: the `[veh] unhandled fault: addr=... rip=...`
+line reports a GUEST address, so
+`objdump -d --start-address=<rip> --stop-address=<rip+16> core.wbx` on the
+packaged core names the exact instruction. That is usually faster than any
+debugger, and it works from a log the user mailed in.
