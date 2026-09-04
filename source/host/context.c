@@ -84,10 +84,23 @@ typedef uintptr_t (MB_SYSV *call_guest_simple_fn)(uintptr_t entry, mb_context *c
  * cannot involve a function call there; it is made once, here, in host context. */
 bool mb_fs_swap = false;
 
-/* Does this kernel let userspace use rdfsbase/wrfsbase? They raise SIGILL when
- * it does not. The kernel advertises it in AT_HWCAP2 (HWCAP2_FSGSBASE), which
- * is the documented way to ask - a SIGILL probe would be at the mercy of any
- * debugger that intercepts the signal first. */
+/* Does the OS let userspace use rdfsbase/wrfsbase? They fault when it does not,
+ * so this is asked once and never guessed. Each platform is asked the way it
+ * documents: Linux advertises it in AT_HWCAP2, Windows answers
+ * IsProcessorFeaturePresent. A fault probe would be at the mercy of whatever
+ * debugger happens to intercept the signal first. */
+#ifdef _WIN32
+#ifndef PF_RDWRFSGSBASE_AVAILABLE
+#define PF_RDWRFSGSBASE_AVAILABLE 22
+#endif
+bool mb_fsbase_ok(void) {
+	static int cached = -1;
+	if (cached >= 0) return cached != 0;
+	cached = IsProcessorFeaturePresent(PF_RDWRFSGSBASE_AVAILABLE) ? 1 : 0;
+	mb_fs_swap = cached != 0;
+	return cached != 0;
+}
+#else
 #ifndef HWCAP2_FSGSBASE
 #define HWCAP2_FSGSBASE (1u << 1)
 #endif
@@ -98,6 +111,7 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
+#endif
 #endif
 
 uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {

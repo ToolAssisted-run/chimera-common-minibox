@@ -193,11 +193,17 @@ typedef struct {
 
 /* Single-instruction %fs swaps (FSGSBASE). The guest and host share the CPU
  * thread; a Rust guest needs %fs = its thread pointer (mb_context.thread_area)
- * while host C needs %fs = mb_context.host_fs. x86-64 Linux only, and only
- * where the kernel exposes FSGSBASE to userspace - the instructions raise
- * SIGILL otherwise, which would break every C/C++ guest too, so everything is
- * gated on the one-time probe. */
-#if !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
+ * while host C needs %fs = mb_context.host_fs.
+ *
+ * x86-64, and only where the OS exposes FSGSBASE to userspace - the
+ * instructions fault otherwise, which would break every C/C++ guest too, so
+ * everything is gated on the one-time probe (mb_fsbase_ok).
+ *
+ * Windows is the easier of the two, not the harder: its own thread block is at
+ * %gs (the TEB), so %fs is nobody's there and the swap cannot tread on the
+ * host's toes. The probe is still required, because whether user mode may run
+ * rdfsbase at all is the OS's decision. */
+#if defined(__x86_64__) || defined(__amd64__)
 #define MB_HAVE_FSBASE 1
 /* The "memory" clobber is load-bearing, not decoration: without it the compiler
  * may sink or hoist the swap across the calls it is meant to bracket, and host
