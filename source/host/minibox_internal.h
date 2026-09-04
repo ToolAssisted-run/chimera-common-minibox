@@ -226,8 +226,21 @@ extern bool mb_fs_swap;
  * thread that faulted meanwhile. So the handler swaps only when the faulting
  * thread is running on the GUEST's thread pointer, which no other thread ever
  * is. Both are cleared when the guest call returns. */
-extern uintptr_t mb_host_fs_while_guest;
-extern uintptr_t mb_guest_fs_while_guest;
+/* The context of the guest currently entered, published by the guest-entry
+ * paths and never cleared. The fault handlers need two things from it - which
+ * thread pointer the guest is on, and which one the host is on - and both have
+ * to be read at the moment of the fault rather than remembered at entry:
+ * thread_area moves when the guest's own scheduler switches green threads, and
+ * a remembered copy is wrong for the rest of the call. Not clearing it on the
+ * way out is deliberate too: a nested guest call would otherwise clear the flag
+ * the OUTER call still needs. Nothing reads it without first establishing, from
+ * the faulting rip, that guest code is what we are returning to. */
+extern mb_context *mb_guest_ctx;
+
+/* The stand-in thread pointer the guest starts on, until musl installs its
+ * own. The one %fs mismatch that is not a symptom: musl swaps thread_area in
+ * userspace, so %fs still holds this at the next host boundary. */
+extern uintptr_t mb_early_tp;
 #endif
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);

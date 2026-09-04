@@ -65,19 +65,26 @@ static bool drop_fs_for_test(void) {
  * written where it reads more naturally. On Windows the host's is 0, and that
  * is the correct value to hold while host code runs there. */
 __attribute__((no_stack_protector))
-static void mb_restore_guest_fs(void) {
-	if (drop_fs_for_test()) mb_wrfsbase(0);
-	if (mb_rdfsbase() != mb_guest_fs_while_guest) {
+static void mb_restore_guest_fs(uintptr_t at_fault) {
+	if (drop_fs_for_test()) at_fault = 0;
+	/* What %fs held WHEN THE GUEST FAULTED, sampled by the caller before it
+	 * swapped anything - reading it here would only report the handler's own
+	 * swap back to the host.
+	 *
+	 * mb_early_tp is not a loss either: musl swaps thread_area in userspace,
+	 * so %fs legitimately still holds the stand-in pointer until the next
+	 * boundary, and installing the real one here is right, and silent. */
+	if (at_fault != mb_guest_ctx->thread_area && at_fault != mb_early_tp) {
 		static bool reported = false;
 		if (!reported) {   /* once: this path runs thousands of times a second */
 			reported = true;
-			mb_wrfsbase(mb_host_fs_while_guest);
+			mb_wrfsbase(mb_guest_ctx->host_fs);
 			fprintf(stderr, "miniBox: the OS drops the guest %%fs across a fault; "
 			                "reinstalling it on the way out\n");
 			fflush(stderr);
 		}
 	}
-	mb_wrfsbase(mb_guest_fs_while_guest);
+	mb_wrfsbase(mb_guest_ctx->thread_area);
 }
 #endif
 
@@ -154,16 +161,17 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * them must be left exactly as it arrived. Asking the rip rather than
 	 * rdfsbase also means this still works when %fs has already been lost -
 	 * see the Windows handler below, where that is the normal case. */
-	const bool guest_rip = mb_fs_swap && mb_guest_fs_while_guest
+	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
 	                                       ->uc_mcontext.gregs[REG_RIP]);
-	if (guest_rip && mb_host_fs_while_guest) mb_wrfsbase(mb_host_fs_while_guest);
+	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
+	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 	handler_inner(sig, info, ucontext);
 	/* Back to the guest's, from the value the entry thunk recorded rather than
 	 * from whatever was in the register on the way in. Same value on a host
 	 * that preserves the base across a signal, and the right one on a host
 	 * that does not. */
-	if (guest_rip) mb_restore_guest_fs();
+	if (guest_rip) mb_restore_guest_fs(fs_at_fault);
 #else
 	handler_inner(sig, info, ucontext);
 #endif
@@ -256,10 +264,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
-	const bool guest_rip = mb_fs_swap && mb_guest_fs_while_guest
+	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
+	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	LONG r = veh_inner(ep);
-	if (guest_rip && r == EXCEPTION_CONTINUE_EXECUTION) mb_restore_guest_fs();
+	if (guest_rip && r == EXCEPTION_CONTINUE_EXECUTION) mb_restore_guest_fs(fs_at_fault);
 	return r;
 #else
 	return veh_inner(ep);

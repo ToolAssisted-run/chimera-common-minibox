@@ -91,6 +91,12 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	 * host %fs is the right answer. */
 	mb_host *hfs = (mb_host *)hp;
 	const bool swap_fs = hfs->context.fs_swap; /* plain load: NO call may precede the swap */
+	/* Inline asm, not a call, so it is allowed to precede the swap: what %fs
+	 * held when the guest trapped in here. It should be the guest's thread
+	 * pointer; anything else means something between the last boundary and this
+	 * one took it away, and the audit below names the syscall we arrived on. */
+	const uintptr_t fs_on_entry = swap_fs ? mb_rdfsbase() : 0;
+	const uintptr_t ta_on_entry = hfs->context.thread_area;
 	if (swap_fs) mb_wrfsbase(hfs->context.host_fs);
 #endif
 	uintptr_t res;
@@ -107,10 +113,20 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 		fflush(stderr);
 	}
 #ifdef MB_HAVE_FSBASE
-	if (swap_fs) {
-		mb_wrfsbase(hfs->context.thread_area ? hfs->context.thread_area
-		                                     : hfs->context.host_fs);
+	/* Said once, from host %fs (fprintf needs it on Linux). The guest reaches
+	 * this boundary constantly, so a loss anywhere in guest code is named
+	 * within microseconds of happening rather than at the eventual crash. */
+	if (swap_fs && fs_on_entry != ta_on_entry && fs_on_entry != mb_early_tp) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			fprintf(stderr, "miniBox: guest %%fs was %p, expected %p, on arrival at "
+			                "syscall %llu - something outside a fault took it\n",
+			        (void *)fs_on_entry, (void *)ta_on_entry, (unsigned long long)nr);
+			fflush(stderr);
+		}
 	}
+	if (swap_fs) mb_wrfsbase(hfs->context.thread_area);
 #endif
 	return res;
 }

@@ -83,12 +83,13 @@ void mb_prepare_thread(void) {
  * that the negative offsets a TLS block uses stay inside it. Nothing durable
  * lives here - musl overwrites thread_area with the real block within the
  * first call - and it is never read again afterwards. */
+uintptr_t mb_early_tp = 0;   /* the audit knows to forgive this one */
 static uintptr_t mb_early_thread_pointer(void) {
-	static uintptr_t p = 0;
+	uintptr_t p = mb_early_tp;
 	if (p == 0) {
 		mb_range want = { 0, MB_PAGESIZE * 2 }, got;
 		if (mb_pal_map_anon(want, MB_PROT_RW, &got) == 0)
-			p = got.start + MB_PAGESIZE;
+			p = mb_early_tp = got.start + MB_PAGESIZE;
 	}
 	return p;
 }
@@ -114,8 +115,7 @@ typedef uintptr_t (MB_SYSV *call_guest_simple_fn)(uintptr_t entry, mb_context *c
  * only reads errno) would run against guest TLS and corrupt it. So the decision
  * cannot involve a function call there; it is made once, here, in host context. */
 bool mb_fs_swap = false;
-uintptr_t mb_host_fs_while_guest = 0;
-uintptr_t mb_guest_fs_while_guest = 0;
+mb_context *mb_guest_ctx = NULL;
 
 /* Does the OS let userspace use rdfsbase/wrfsbase? They fault when it does not,
  * so this is asked once and never guessed. Each platform is asked the way it
@@ -158,13 +158,10 @@ uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
 	 * leave %fs alone until it exists; the guest uses %gs until then. */
 	if (c->fs_swap) {
 		c->host_fs = mb_rdfsbase();
-		mb_host_fs_while_guest = c->host_fs;
-		mb_guest_fs_while_guest = c->thread_area;
+		mb_guest_ctx = c;
 		if (c->thread_area) mb_wrfsbase(c->thread_area);
 		uintptr_t r = f(entry, c);
 		mb_wrfsbase(c->host_fs);
-		mb_host_fs_while_guest = 0;
-		mb_guest_fs_while_guest = 0;
 		return r;
 	}
 #endif
@@ -229,12 +226,11 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xc0); /* rdfsbase rax */
 		emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0x82);
 		emit32(&p, (uint32_t)offsetof(mb_context, host_fs));             /* mov [r10+off], rax */
+		emit8(&p, 0x50);                                                 /* push rax (host %fs, for the way out) */
+		emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd0);               /* mov rax, r10 */
 		emit8(&p, 0x48); emit8(&p, 0xa3);
-		emit64(&p, (uintptr_t)&mb_host_fs_while_guest);                 /* mov [abs], rax: the fault handler reads this */
-		emit8(&p, 0x50);                                                 /* push rax */
+		emit64(&p, (uintptr_t)&mb_guest_ctx);                            /* mov [abs], rax: the fault handlers read the context through this */
 		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);               /* mov rax, [r10] (thread_area) */
-		emit8(&p, 0x48); emit8(&p, 0xa3);
-		emit64(&p, (uintptr_t)&mb_guest_fs_while_guest);                 /* mov [abs], rax: which %fs is the guest's */
 		emit8(&p, 0x48); emit8(&p, 0x85); emit8(&p, 0xc0);               /* test rax, rax */
 		emit8(&p, 0x74); emit8(&p, 0x05);                                /* jz +5 (skip wrfsbase) */
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
@@ -243,11 +239,6 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0xc3);               /* mov r11, rax (save retval) */
 		emit8(&p, 0x58);                                                 /* pop rax (host %fs) */
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
-		emit8(&p, 0x31); emit8(&p, 0xc0);                                /* xor eax, eax */
-		emit8(&p, 0x48); emit8(&p, 0xa3);
-		emit64(&p, (uintptr_t)&mb_host_fs_while_guest);                  /* the guest call is over: */
-		emit8(&p, 0x48); emit8(&p, 0xa3);
-		emit64(&p, (uintptr_t)&mb_guest_fs_while_guest);                 /* no thread is on the guest's %fs */
 		emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);               /* mov rax, r11 (retval) */
 		emit8(&p, 0xc3);                                                 /* ret */
 	} else
@@ -298,16 +289,22 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0;
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
+	/* The guest's %fs is read back from the context on the way out rather than
+	 * saved from the register on the way in: the context is the live answer,
+	 * and a host that lost the base while the callback ran (Windows drops it
+	 * across a fault, and a GL callback takes plenty) would otherwise have the
+	 * loss faithfully restored. Stack: entry rsp%16==8, push -> 0, call -> the
+	 * callee sees 8. r10 is caller-saved, hence the push rather than a reload. */
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
-	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xc0); /* rdfsbase rax (guest) */
-	emit8(&p, 0x50);                                                   /* push rax */
+	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
 	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x82);
 	emit32(&p, (uint32_t)offsetof(mb_context, host_fs));               /* mov rax, [r10+host_fs] */
 	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, cb);                  /* mov rax, cb */
 	emit8(&p, 0xff); emit8(&p, 0xd0);                                  /* call rax */
 	emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0xc3);                 /* mov r11, rax */
-	emit8(&p, 0x58);                                                   /* pop rax (guest fs) */
+	emit8(&p, 0x41); emit8(&p, 0x5a);                                  /* pop r10 */
+	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);                 /* mov rax, [r10] (thread_area, live) */
 	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
 	emit8(&p, 0xc3);                                                   /* ret */
