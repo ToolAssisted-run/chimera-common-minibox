@@ -83,6 +83,7 @@ typedef uintptr_t (MB_SYSV *call_guest_simple_fn)(uintptr_t entry, mb_context *c
  * only reads errno) would run against guest TLS and corrupt it. So the decision
  * cannot involve a function call there; it is made once, here, in host context. */
 bool mb_fs_swap = false;
+uintptr_t mb_host_fs_while_guest = 0;
 
 /* Does the OS let userspace use rdfsbase/wrfsbase? They fault when it does not,
  * so this is asked once and never guessed. Each platform is asked the way it
@@ -97,6 +98,7 @@ bool mb_fsbase_ok(void) {
 	static int cached = -1;
 	if (cached >= 0) return cached != 0;
 	cached = IsProcessorFeaturePresent(PF_RDWRFSGSBASE_AVAILABLE) ? 1 : 0;
+	if (!cached && getenv("MB_FORCE_FS_SWAP")) cached = 1;  /* testing only */
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
@@ -108,6 +110,7 @@ bool mb_fsbase_ok(void) {
 	static int cached = -1;
 	if (cached >= 0) return cached != 0;
 	cached = (getauxval(AT_HWCAP2) & HWCAP2_FSGSBASE) != 0;
+	if (!cached && getenv("MB_FORCE_FS_SWAP")) cached = 1;  /* testing only */
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
@@ -123,6 +126,7 @@ uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
 	 * leave %fs alone until it exists; the guest uses %gs until then. */
 	if (c->fs_swap) {
 		c->host_fs = mb_rdfsbase();
+		mb_host_fs_while_guest = c->host_fs;
 		if (c->thread_area) mb_wrfsbase(c->thread_area);
 		uintptr_t r = f(entry, c);
 		mb_wrfsbase(c->host_fs);
@@ -190,6 +194,8 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xc0); /* rdfsbase rax */
 		emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0x82);
 		emit32(&p, (uint32_t)offsetof(mb_context, host_fs));             /* mov [r10+off], rax */
+		emit8(&p, 0x48); emit8(&p, 0xa3);
+		emit64(&p, (uintptr_t)&mb_host_fs_while_guest);                 /* mov [abs], rax: the fault handler reads this */
 		emit8(&p, 0x50);                                                 /* push rax */
 		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);               /* mov rax, [r10] (thread_area) */
 		emit8(&p, 0x48); emit8(&p, 0x85); emit8(&p, 0xc0);               /* test rax, rax */

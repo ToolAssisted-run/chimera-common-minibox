@@ -81,7 +81,43 @@ static bool trip(uintptr_t addr) {
 #include <ucontext.h>
 static struct sigaction g_old_sa;
 
+static void handler_inner(int sig, siginfo_t *info, void *ucontext);
+
+/* The host's %fs must be back before this touches anything.
+ *
+ * While a guest with its own thread pointer runs, %fs is the GUEST's - that is
+ * the whole point of the swap - and a fault can arrive at any instruction. The
+ * handler is host C: it reads errno, it calls into libc, and every one of those
+ * goes through %fs. Running it on the guest's thread pointer means the host
+ * reads and writes the guest's TLS block instead of its own.
+ *
+ * On Linux that survived by accident, because the guest's block happens to sit
+ * where glibc keeps spare static TLS. On Windows the host's %fs is nobody's and
+ * the same code dies on the guest's first faulting write - which, since sealing
+ * marks every page clean, is immediately.
+ *
+ * No stack protector on this frame: that check itself reads %fs:0x28, which is
+ * precisely what is not yet safe here. */
+__attribute__((no_stack_protector))
 static void handler(int sig, siginfo_t *info, void *ucontext) {
+#ifdef MB_HAVE_FSBASE
+	uintptr_t guest_fs = 0;
+	bool swapped = false;
+	if (mb_fs_swap && mb_host_fs_while_guest) {
+		guest_fs = mb_rdfsbase();
+		if (guest_fs != mb_host_fs_while_guest) {
+			mb_wrfsbase(mb_host_fs_while_guest);
+			swapped = true;
+		}
+	}
+	handler_inner(sig, info, ucontext);
+	if (swapped) mb_wrfsbase(guest_fs);
+#else
+	handler_inner(sig, info, ucontext);
+#endif
+}
+
+static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
@@ -150,7 +186,33 @@ static void initialize(void) {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
+
+/* Same reason as the Linux handler above: while a guest with its own thread
+ * pointer runs, %fs is the guest's, and this is host code that reaches its own
+ * thread locals through %fs. On Windows the host's %fs is nobody's, so running
+ * on the guest's is not merely wrong but immediately fatal. */
+__attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
+#ifdef MB_HAVE_FSBASE
+	uintptr_t guest_fs = 0;
+	bool swapped = false;
+	if (mb_fs_swap && mb_host_fs_while_guest) {
+		guest_fs = mb_rdfsbase();
+		if (guest_fs != mb_host_fs_while_guest) {
+			mb_wrfsbase(mb_host_fs_while_guest);
+			swapped = true;
+		}
+	}
+	LONG r = veh_inner(ep);
+	if (swapped) mb_wrfsbase(guest_fs);
+	return r;
+#else
+	return veh_inner(ep);
+#endif
+}
+
+static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
 	if (code == STATUS_GUARD_PAGE_VIOLATION) {
 		/* A cothread/RWStack guard trip. If it is ours, dirtiness is recovered

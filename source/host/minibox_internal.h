@@ -215,6 +215,11 @@ bool mb_fsbase_ok(void);
 /* Plain global, not a call: the dispatcher must decide whether to swap BEFORE
  * it may safely call anything (it is entered on the guest's %fs). */
 extern bool mb_fs_swap;
+/* The host's %fs for as long as a guest is running, as a PLAIN global.
+ * The fault handler needs it before it may touch anything at all, and a
+ * thread-local could only be reached through the very register that is
+ * wrong. Written on the way in to the guest, by both entry paths. */
+extern uintptr_t mb_host_fs_while_guest;
 #endif
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
