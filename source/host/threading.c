@@ -26,6 +26,8 @@ typedef struct {
 	uintptr_t rsp;         /* guest_rsp when next run */
 	uintptr_t thread_area; /* pthread_self */
 	uintptr_t tid_address; /* set_tid_address */
+	mb_range stack;        /* this thread's own stack, from its pthread struct */
+	mb_range pending;      /* a munmap of that stack, held until it has left it */
 } gthread;
 
 typedef struct { uintptr_t addr; uint32_t *tids; size_t n, cap; } futex_queue;
@@ -151,7 +153,7 @@ mb_sword mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
 	child_stack[0] = 0;          /* rbp */
 	child_stack[1] = guest_rip;  /* ret target */
 	*parent_tid = tid;
-	gthread g = { tid, T_RUNNABLE, sok(0), guest_rsp - 16, thread_area, child_tid };
+	gthread g = { tid, T_RUNNABLE, sok(0), guest_rsp - 16, thread_area, child_tid, stack, { 0, 0 } };
 	insert_thread(t, g);
 	t->next_tid++;
 	TDBG("spawn tid=%u rip=%lx rsp=%lx\n",tid,(unsigned long)guest_rip,(unsigned long)(guest_rsp-16));
@@ -169,6 +171,35 @@ uintptr_t mb_threads_exit(mb_threads *t, mb_context *c) {
 	if (t->active_tid == dead) { fprintf(stderr, "miniBox: last thread exited\n"); __builtin_trap(); }
 	remove_thread(t, dead);
 	return ret;
+}
+
+/* A thread that is ending unmaps its OWN stack and then exits - musl's
+ * __unmapself, which on real Linux is asm that touches no stack between the two
+ * syscalls. Here a syscall is a call OUT of the box that has to RETURN, onto
+ * exactly the stack just freed. So hold the unmap: take it at exit, once the
+ * thread has been swapped off that stack for good. Without this the return path
+ * reads a freed page and the box takes the fault.
+ * Returns true when the range was taken over and must not be unmapped now. */
+bool mb_threads_hold_stack_unmap(mb_threads *t, mb_range r) {
+	gthread *self = find_thread(t, t->active_tid);
+	if (self == NULL || self->stack.size == 0) return false;
+	const uintptr_t rs = r.start, re = r.start + r.size;
+	const uintptr_t ss = self->stack.start, se = self->stack.start + self->stack.size;
+	if (rs >= se || re <= ss) return false;   /* nothing to do with this thread's stack */
+	self->pending = r;
+	TDBG("hold stack unmap tid=%u addr=%lx size=%lx\n",
+		t->active_tid,(unsigned long)r.start,(unsigned long)r.size);
+	return true;
+}
+
+/* The unmap held above, to be done by the caller once mb_threads_exit returns
+ * - by then the dead thread is off its stack and another one is running. */
+bool mb_threads_take_held_unmap(mb_threads *t, mb_range *out) {
+	gthread *self = find_thread(t, t->active_tid);
+	if (self == NULL || self->pending.size == 0) return false;
+	*out = self->pending;
+	self->pending = (mb_range){ 0, 0 };
+	return true;
 }
 
 uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare) {

@@ -47,6 +47,9 @@ enum {
 #define FUTEX_WAKE 1
 #define FUTEX_REQUEUE 3
 #define FUTEX_LOCK_PI 6
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_UNLOCK_PI 7
 
 static uintptr_t serr(int e) { return (uintptr_t)(intptr_t)(-e); }  /* -errno as usize */
@@ -159,7 +162,12 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			int res = mb_block_mprotect(h->block, r, prot);
 			return res ? serr(-res) : sok(0);
 		}
-		case NR_munmap: { mb_range r = { a1, a2 }; int res = mb_block_munmap(h->block, r); return res ? serr(-res) : sok(0); }
+		case NR_munmap: {
+			mb_range r = { a1, a2 };
+			/* a thread freeing the stack it is standing on: hold it until it exits */
+			if (mb_threads_hold_stack_unmap(h->threads, r)) return sok(0);
+			int res = mb_block_munmap(h->block, r); return res ? serr(-res) : sok(0);
+		}
 		case NR_madvise:
 			if (a3 == MADV_DONTNEED) { mb_range r = { a1, a2 }; int res = mb_block_madvise_dontneed(h->block, r); return res ? serr(-res) : sok(0); }
 			return sok(0);
@@ -300,12 +308,37 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			*(uint8_t *)a3 = 1;
 			return sok(8);
 		}
-		case NR_exit: return mb_threads_exit(h->threads, &h->context);
+		case NR_exit: {
+			/* take it BEFORE the thread is gone, do it AFTER it has been swapped
+			 * off that stack - by which point another thread is running */
+			mb_range held; const bool has_held = mb_threads_take_held_unmap(h->threads, &held);
+			const uintptr_t r = mb_threads_exit(h->threads, &h->context);
+			if (has_held) mb_block_munmap(h->block, held);
+			return r;
+		}
 		case NR_futex: {
-			int op = (int)a2 & ~FUTEX_PRIVATE_FLAG;
+			/* CLOCK_REALTIME only picks which clock a timeout is against, and a
+			 * timeout is not honoured here at all (see the bitset ops below). */
+			int op = (int)a2 & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 			switch (op) {
 				case FUTEX_WAIT: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
 				case FUTEX_WAKE: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
+				/* The bitset pair is the plain pair with a mask and an ABSOLUTE
+				 * timeout. Rust's std reaches for these - its Mutex, Condvar and
+				 * thread::park all wait this way - so a guest built from it spun
+				 * on ENOSYS forever: 53.8 million refused calls in 90 seconds, and
+				 * not one frame drawn.
+				 *
+				 * The mask is FUTEX_BITSET_MATCH_ANY in practice, and where it is
+				 * not, waking a waiter that did not match is a spurious wake -
+				 * which every futex user must already tolerate, because it
+				 * re-checks its own condition on waking. So: match any.
+				 *
+				 * The timeout is ignored, exactly as FUTEX_WAIT's relative one
+				 * already is. A waiter here is woken by another guest thread or
+				 * not at all; there is no clock in the box to expire against. */
+				case FUTEX_WAIT_BITSET: return mb_threads_futex_wait(h->threads, &h->context, a1, (uint32_t)a3);
+				case FUTEX_WAKE_BITSET: return sok(mb_threads_futex_wake(h->threads, a1, (uint32_t)a3));
 				case FUTEX_REQUEUE: return sok(mb_threads_futex_requeue(h->threads, a1, a5, (uint32_t)a3, (uint32_t)a4));
 				case FUTEX_LOCK_PI: return mb_threads_futex_lock_pi(h->threads, &h->context, a1);
 				case FUTEX_UNLOCK_PI: return mb_threads_futex_unlock_pi(h->threads, &h->context, a1);
