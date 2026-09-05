@@ -36,7 +36,18 @@ enum {
 	 * append-only, so a host whose list is at least as long as the guest's
 	 * knows every opcode the guest can emit - and a guest that learns
 	 * otherwise refuses to start rather than calling into a hole. */
-	GL_OP_LIST_LENGTH = 3
+	GL_OP_LIST_LENGTH = 3,
+
+	/* Which context this is. Every GL object a renderer holds is a NAME the
+	 * driver handed out, and those names live in guest memory - so they go
+	 * into a savestate, and come back in a session where they mean nothing:
+	 * the context that owned them is gone, every call naming one is refused,
+	 * and the guest is never told. A renderer that remembers this number
+	 * alongside its objects can see that for itself, and rebuild them.
+	 *
+	 * Any two contexts differ; a host too old to know the question answers 0,
+	 * which a guest must read as "cannot tell" rather than as a context. */
+	GL_OP_CONTEXT_ID = 4
 };
 
 struct GlVersionArgs {
@@ -72,6 +83,12 @@ bool chimera_gl_install(chimera_gl_bridge_fn bridge);
  * core does not carry one - which is what a driver answers for a call it does
  * not have. */
 void *chimera_gl_lookup(const char *name);
+
+/* Which context the calls are landing on (GL_OP_CONTEXT_ID). Zero when there
+ * is no bridge, or the host is older than the question. A renderer that stores
+ * this next to its objects can tell, after a savestate load, that the objects
+ * it remembers were another context's - and rebuild rather than draw nothing. */
+uint64_t chimera_gl_context_id(void);
 
 #ifdef __cplusplus
 }

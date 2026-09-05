@@ -282,7 +282,18 @@ bool chimera_gl_install(chimera_gl_bridge_fn bridge)
 	}}
 
 	g_bridge = bridge;
-""" + "".join(f"\tglad_{n} = w_{n};\n" for n, _, _ in entries) + "\treturn true;\n}\n\n"
+""" + "".join(f"\tglad_{n} = w_{n};\n" for n, _, _ in entries) + """	return true;
+}
+
+/* Which context the calls land on. Zero means "cannot tell": no bridge, or a
+ * host that predates the question - and a renderer must treat that as "assume
+ * nothing changed" rather than as a context of its own. */
+uint64_t chimera_gl_context_id(void)
+{
+	return g_bridge ? g_bridge(GL_OP_CONTEXT_ID, 0, 0, 0, 0, 0) : 0;
+}
+
+"""
                 + "\n".join(lookup) + "\n")
 
     with open(f"{outdir}/gl-bridge-host.inc", "w") as f:
