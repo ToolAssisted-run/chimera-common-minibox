@@ -66,7 +66,7 @@ ninja compile -C build/meson-windows
 ## Consumption
 
 Chimera consumes this repository as a submodule at
-`extern/tools/chimera-common-minibox` and builds the host with its own meson
+`extern/chimera-common-minibox` and builds the host with its own meson
 arrangement, shipping it with the
 frontend's OS-dependent artifacts. Core authors use `source/guest/` (with the
 `extern/` libraries) to compile their emulation source into a platform-neutral
