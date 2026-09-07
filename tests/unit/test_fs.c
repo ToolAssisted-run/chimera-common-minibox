@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Virtual filesystem: mounting, open/read/write/seek, fd semantics, errors. */
 #include "minibox_internal.h"
 #include "test_util.h"
