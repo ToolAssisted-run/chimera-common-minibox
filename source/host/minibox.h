@@ -67,6 +67,36 @@ void wbx_mount_file_path(mb_host *obj, const char *name, const char *host_path, 
 void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);
+
+/* ---- epochs and deltas ----
+ *
+ * A savestate carries every page the machine has dirtied since it was sealed,
+ * which for a long run is most of the machine every time. An EPOCH asks the
+ * smaller question - what changed since this moment - so a caller keeping a
+ * history along a timeline can pay for what a frame DID rather than for what
+ * the machine IS.
+ *
+ * wbx_epoch_begin marks now. Afterwards:
+ *   wbx_save_delta(forward=true)  the machine as it is now, given the machine
+ *                                 as it was at the mark. Play a run forwards.
+ *   wbx_save_delta(forward=false) the machine as it was at the mark, given the
+ *                                 machine as it is now. Step a frame back.
+ * wbx_load_delta applies either, and ends the epoch: the machine has moved and
+ * the mark no longer describes it, so the caller marks again when it wants to.
+ *
+ * A delta is not a savestate and cannot stand alone. It is only meaningful
+ * applied to exactly the machine it was measured against; applied to any other
+ * it produces nonsense, which is the caller's contract to keep. It carries the
+ * ELF hash and the page count, so the grossest mistakes are refused.
+ *
+ * None of this is visible to the guest - it is host protection bookkeeping, the
+ * same trick the baseline dirty tracking already plays - so the machine spec is
+ * untouched and no movie is affected. */
+void wbx_epoch_begin(mb_host *obj, mb_return *ret);
+void wbx_save_delta(mb_host *obj, bool forward, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
+void wbx_load_delta(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);
+/* pages the open epoch has touched: what a delta would cost, before writing one */
+void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret);
 void wbx_set_always_evict_blocks(bool val);
 void wbx_get_page_len(mb_host *obj, mb_return *ret);
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);

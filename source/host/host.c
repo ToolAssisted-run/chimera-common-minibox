@@ -22,6 +22,11 @@ struct mb_host {
 	mb_thunks *thunks;
 	mb_threads *threads;
 	uint64_t getrandom_state; /* deterministic entropy stream, per host */
+	/* what the machine's small non-memory state was when the epoch began, so a
+	 * REVERSE delta can put it back. The memory half lives in the block. */
+	uintptr_t epoch_brk;
+	uint8_t *epoch_threads;
+	size_t epoch_threads_len;
 };
 
 /* ---- syscall numbers (x86-64) ---- */
@@ -575,4 +580,105 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 done:
 	if (!was_active) mb_host_deactivate(h);
 	return rc;
+}
+
+/* ---- epochs and deltas (see minibox_internal.h) ----
+ *
+ * A savestate is the whole machine; a delta is one epoch's worth of it. The
+ * memory half is the block's (mb_block_delta_save), and this adds the small
+ * non-memory half - the program break and the thread set - which is a few
+ * kilobytes and is simply carried whole rather than differenced.
+ */
+
+static const char DELTA_START[] = "MiniBoxHostDelta_v1";
+
+/* a growable buffer, so the thread set can be captured at epoch time */
+typedef struct { uint8_t *buf; size_t len, cap, pos; } hostbuf;
+static int32_t hostbuf_write(uintptr_t ud, const uint8_t *d, uintptr_t n) {
+	hostbuf *m = (hostbuf *)ud;
+	if (m->len + n > m->cap) {
+		size_t cap = (m->len + n) * 2 + 64;
+		uint8_t *nb = (uint8_t *)realloc(m->buf, cap);
+		if (!nb) return -1;
+		m->buf = nb; m->cap = cap;
+	}
+	memcpy(m->buf + m->len, d, n); m->len += n;
+	return 0;
+}
+static intptr_t hostbuf_read(uintptr_t ud, uint8_t *d, uintptr_t n) {
+	hostbuf *m = (hostbuf *)ud;
+	uintptr_t avail = m->len - m->pos;
+	if (n > avail) n = avail;
+	if (n == 0) return -1;
+	memcpy(d, m->buf + m->pos, n); m->pos += n;
+	return (intptr_t)n;
+}
+
+int mb_host_epoch_begin(mb_host *h, char *errbuf, size_t errlen) {
+	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
+	bool was_active = h->active; mb_host_activate(h);
+	int rc = -1;
+	if (mb_block_epoch_begin(h->block) != 0) { snprintf(errbuf, errlen, "epoch begin failed"); goto done; }
+	h->epoch_brk = h->program_break;
+	free(h->epoch_threads); h->epoch_threads = NULL; h->epoch_threads_len = 0;
+	{
+		hostbuf t = { 0 };
+		if (mb_threads_save(h->threads, &h->context, hostbuf_write, (uintptr_t)&t) != 0) {
+			free(t.buf);
+			snprintf(errbuf, errlen, "thread set capture failed");
+			goto done;
+		}
+		h->epoch_threads = t.buf; h->epoch_threads_len = t.len;
+	}
+	rc = 0;
+done:
+	if (!was_active) mb_host_deactivate(h);
+	return rc;
+}
+
+int mb_host_delta_save(mb_host *h, bool forward, mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
+	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
+	if (!forward && h->epoch_threads == NULL) { snprintf(errbuf, errlen, "no epoch to reverse"); return -1; }
+	bool was_active = h->active; mb_host_activate(h);
+	int rc = -1;
+	uintptr_t brk = forward ? h->program_break : h->epoch_brk;
+	if (w_all(w, ud, DELTA_START, sizeof(DELTA_START)-1)) goto done;
+	if (w_all(w, ud, &brk, sizeof(brk))) goto done;
+	if (w_all(w, ud, mb_elf_hash(h->elf), 32)) goto done;
+	if (mb_block_delta_save(h->block, forward, w, ud) != 0) { snprintf(errbuf, errlen, "memory delta failed"); goto done; }
+	if (forward) {
+		if (mb_threads_save(h->threads, &h->context, w, ud) != 0) goto done;
+	} else {
+		if (w_all(w, ud, h->epoch_threads, h->epoch_threads_len)) goto done;
+	}
+	if (w_all(w, ud, SAVE_END, sizeof(SAVE_END)-1)) goto done;
+	rc = 0;
+done:
+	if (!was_active) mb_host_deactivate(h);
+	if (rc) snprintf(errbuf, errlen, "delta write failed");
+	return rc;
+}
+
+int mb_host_delta_apply(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
+	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
+	bool was_active = h->active; mb_host_activate(h);
+	int rc = -1;
+	uint8_t elfhash[32];
+	if (expect(r, ud, DELTA_START, sizeof(DELTA_START)-1)) { snprintf(errbuf, errlen, "bad delta magic"); goto done; }
+	if (r_all(r, ud, &h->program_break, sizeof(h->program_break))) goto done;
+	if (r_all(r, ud, elfhash, 32)) goto done;
+	if (memcmp(elfhash, mb_elf_hash(h->elf), 32) != 0) { snprintf(errbuf, errlen, "ELF hash mismatch"); goto done; }
+	if (mb_block_delta_apply(h->block, r, ud) != 0) { snprintf(errbuf, errlen, "memory delta apply failed"); goto done; }
+	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
+	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad delta end magic"); goto done; }
+	/* the epoch is spent: it described the machine we have just left */
+	free(h->epoch_threads); h->epoch_threads = NULL; h->epoch_threads_len = 0;
+	rc = 0;
+done:
+	if (!was_active) mb_host_deactivate(h);
+	return rc;
+}
+
+size_t mb_host_epoch_page_count(const mb_host *h) {
+	return mb_block_epoch_page_count(h->block);
 }

@@ -26,6 +26,10 @@ size_t    mb_host_page_len(mb_host *h);
 uint8_t   mb_host_page_info(mb_host *h, size_t i);
 int       mb_host_save_state(mb_host *h, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
 int       mb_host_load_state(mb_host *h, mb_read_callback r, uintptr_t ud, char *errbuf, size_t errlen);
+int       mb_host_epoch_begin(mb_host *h, char *errbuf, size_t errlen);
+int       mb_host_delta_save(mb_host *h, bool forward, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
+int       mb_host_delta_apply(mb_host *h, mb_read_callback r, uintptr_t ud, char *errbuf, size_t errlen);
+size_t    mb_host_epoch_page_count(const mb_host *h);
 
 static bool g_always_evict = true;
 
@@ -123,6 +127,26 @@ void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_re
 	if (mb_host_load_state(obj, cb, userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
 	ok(ret, 0);
 }
+
+void wbx_epoch_begin(mb_host *obj, mb_return *ret) {
+	char e[256]; e[0] = 0;
+	if (mb_host_epoch_begin(obj, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+void wbx_save_delta(mb_host *obj, bool forward, mb_write_callback cb, uintptr_t userdata, mb_return *ret) {
+	char e[256]; e[0] = 0;
+	if (mb_host_delta_save(obj, forward, cb, userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+void wbx_load_delta(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret) {
+	char e[256]; e[0] = 0;
+	if (mb_host_delta_apply(obj, cb, userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret) { ok(ret, mb_host_epoch_page_count(obj)); }
 
 void wbx_set_always_evict_blocks(bool val) { g_always_evict = val; (void)g_always_evict; }
 

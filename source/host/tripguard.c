@@ -123,6 +123,10 @@ static bool trip(uintptr_t addr) {
 	uint8_t s = p->status;
 	if (!(s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK))
 		return false;  /* not a tracked clean page: the guest's, or nobody's */
+	/* Order matters: the epoch wants what the page held before THIS write, and
+	 * so does the baseline the first time round. Both read the same bytes, so
+	 * both must run before the write is let through. */
+	mb_page_epoch_capture(p, mirror_of(b, page_start));
 	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
 	p->dirty = true;
 	mb_range r = { page_start, MB_PAGESIZE };

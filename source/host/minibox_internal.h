@@ -93,6 +93,16 @@ typedef struct {
 	mb_snap_kind snap_kind;
 	uint8_t *snap_data;  /* MB_PAGESIZE bytes when snap_kind==DATA, else NULL */
 	bool uncommitted;    /* lazy blocks only: neither view is backed yet (reads as zero) */
+	/* ---- epochs (see mb_block_epoch_begin) ----
+	 * dirty says "changed since the baseline", which only ever grows. These say
+	 * "changed since a MOMENT", so a caller can ask what one frame did rather
+	 * than what the whole run did. hold means the page is write-protected for
+	 * this epoch and has not been written yet; the fault that lifts it captures
+	 * what the page held, which is the reverse delta. */
+	bool epoch_hold;
+	bool epoch_dirty;
+	mb_snap_kind epoch_snap_kind;
+	uint8_t *epoch_snap;  /* MB_PAGESIZE bytes of PRE-epoch content when DATA */
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
@@ -114,6 +124,8 @@ typedef struct mb_block {
 	bool active;
 	uint8_t hash[32];
 	mb_handle handle;
+	bool epoch_active;      /* an epoch is open; pages carry epoch_* above */
+	uint8_t *epoch_status;  /* the status array as the epoch began, npages bytes */
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);
@@ -138,6 +150,33 @@ uint8_t mb_block_page_info(const mb_block *b, size_t index);
 /* Savestate (structure per docs/docs/MACHINE-SPEC.md section 6). Return 0 on success. */
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud);
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
+
+/* ---- epochs and deltas ----
+ *
+ * A savestate carries every page dirtied since the baseline, which for a long
+ * run is the whole machine every time. An EPOCH asks a smaller question: what
+ * changed since this moment. Beginning one re-protects the writable pages so
+ * the next write to each faults again, and the fault captures what the page
+ * held before that write.
+ *
+ * That yields two deltas over the same page set:
+ *   forward - the pages as they are NOW. Apply to the machine as it was at the
+ *             epoch's start and you have the machine as it is now.
+ *   reverse - the pages as they were at the epoch's START. Apply to the machine
+ *             as it is now and you have the machine as it was then.
+ *
+ * None of this is observable by the guest: it is protection bookkeeping, the
+ * same trick the baseline tracking already plays, so the machine spec is
+ * untouched. Return 0 on success. */
+int mb_block_epoch_begin(mb_block *b);
+int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud);
+int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud);
+/* Drops the open epoch and everything it remembered. Anything that moves the
+ * machine underneath an epoch (a state load, a seal) calls this: the epoch
+ * described a machine that is no longer the one here. */
+void mb_block_epoch_clear(mb_block *b);
+/* how many pages the open epoch has touched (for budgeting and for tests) */
+size_t mb_block_epoch_page_count(const mb_block *b);
 
 /* ---- tripguard.c ---- */
 void mb_tripguard_register(mb_block *b);
@@ -292,6 +331,7 @@ mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
 void    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
+void    mb_page_epoch_capture(mb_page *p, uintptr_t mirror_addr);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

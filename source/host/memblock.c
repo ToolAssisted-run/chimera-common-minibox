@@ -52,13 +52,17 @@ static uint8_t prot_status(mb_prot prot) {
  * it is a guard page (RW|GUARD) when clean and plain RW once dirtied. */
 mb_prot mb_page_native_prot(const mb_page *p) {
 	if (p->status == MB_ST_FREE) return MB_PROT_NONE;
+	/* An open epoch holds a page read-only until it is written, exactly as the
+	 * baseline tracking does - so one page can be held for either reason, and
+	 * the fault that lifts the hold serves both. */
+	bool clean = !p->dirty || p->epoch_hold;
 #ifdef _WIN32
 	if (p->status == MB_ST_RWSTACK && p->dirty) return MB_PROT_RW;
 #endif
-	if (p->status == MB_ST_RW && !p->dirty) return MB_PROT_R;
-	if (p->status == MB_ST_RWX && !p->dirty) return MB_PROT_RX;
+	if (p->status == MB_ST_RW && clean) return MB_PROT_R;
+	if (p->status == MB_ST_RWX && clean) return MB_PROT_RX;
 #ifndef _WIN32
-	if (p->status == MB_ST_RWSTACK) return p->dirty ? MB_PROT_RW : MB_PROT_R;
+	if (p->status == MB_ST_RWSTACK) return clean ? MB_PROT_R : MB_PROT_RW;
 #endif
 	return status_prot(p->status);  /* Windows RWStack-clean falls through -> RW|GUARD */
 }
@@ -131,6 +135,21 @@ void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 		memcpy(p->snap_data, (const void *)maddr, MB_PAGESIZE);
 		p->snap_kind = MB_SNAP_DATA;
 	}
+}
+
+/* The epoch's half of the same fault: what this page held before the write that
+ * is happening now, which is the reverse delta's content. Runs in the handler,
+ * so it allocates from the same signal-safe pool the baseline snapshots use. */
+void mb_page_epoch_capture(mb_page *p, uintptr_t maddr) {
+	if (!p->epoch_hold) return;
+	p->epoch_hold = false;
+	p->epoch_dirty = true;
+	if (p->epoch_snap_kind != MB_SNAP_NONE) return;  /* already have this epoch's */
+	if (p->uncommitted) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
+	p->epoch_snap = snap_alloc();
+	if (!p->epoch_snap) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
+	memcpy(p->epoch_snap, (const void *)maddr, MB_PAGESIZE);
+	p->epoch_snap_kind = MB_SNAP_DATA;
 }
 
 /* ---- construction ---- */
@@ -234,7 +253,11 @@ void mb_block_free(mb_block *b) {
 	}
 	mb_pal_unmap_anon(b->mirror);
 	mb_pal_close_handle(b->handle);
-	for (size_t i = 0; i < b->npages; i++) snap_release(b->pages[i].snap_data);
+	for (size_t i = 0; i < b->npages; i++) {
+		snap_release(b->pages[i].snap_data);
+		if (b->pages[i].epoch_snap_kind == MB_SNAP_DATA) snap_release(b->pages[i].epoch_snap);
+	}
+	free(b->epoch_status);
 	free(b->pages);
 	free(b);
 }
@@ -495,6 +518,9 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 int mb_block_seal(mb_block *b) {
 	if (b->sealed) { fprintf(stderr, "miniBox: already sealed\n"); return -EINVAL; }
 	get_stack_dirty(b);
+	/* the baseline is about to become the live image, so any epoch measured
+	 * against the old one is meaningless */
+	mb_block_epoch_clear(b);
 	for (size_t i = 0; i < b->npages; i++) {
 		if (b->pages[i].dirty && !b->pages[i].invisible) {
 			b->pages[i].dirty = false;
@@ -587,6 +613,8 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
 	get_stack_dirty(b);
+	/* the load replaces the machine, so an open epoch no longer describes it */
+	mb_block_epoch_clear(b);
 	char magic[sizeof(MAGIC) - 1];
 	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
 	if (memcmp(magic, MAGIC, sizeof(magic)) != 0) return -EINVAL;
@@ -637,5 +665,181 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	}
 	if (run_start != (size_t)-1) refresh_range(b, run_start, run_end - run_start + 1);
 	free(statii); free(dirtii);
+	return 0;
+}
+
+/* ---- epochs and deltas (see minibox_internal.h) ---- */
+
+static const char DELTA_MAGIC[] = "MiniBoxDelta1";
+
+/* Forget what an epoch knew about one page, returning its pre-image. */
+static void epoch_clear_page(mb_page *p) {
+	if (p->epoch_snap_kind == MB_SNAP_DATA) snap_release(p->epoch_snap);
+	p->epoch_snap = NULL;
+	p->epoch_snap_kind = MB_SNAP_NONE;
+	p->epoch_dirty = false;
+	p->epoch_hold = false;
+}
+
+void mb_block_epoch_clear(mb_block *b) {
+	for (size_t i = 0; i < b->npages; i++) epoch_clear_page(&b->pages[i]);
+	free(b->epoch_status);
+	b->epoch_status = NULL;
+	b->epoch_active = false;
+}
+
+/* Is this a page an epoch tracks at all? Invisible pages are excluded for the
+ * same reason savestates exclude them - they are not machine state - and a free
+ * page has nothing to say. */
+static bool epoch_tracks(const mb_page *p) {
+	return !p->invisible
+		&& (p->status == MB_ST_RW || p->status == MB_ST_RWX || p->status == MB_ST_RWSTACK);
+}
+
+int mb_block_epoch_begin(mb_block *b) {
+	if (!b->sealed) return -EINVAL;
+	get_stack_dirty(b);
+
+	uint8_t *status = (uint8_t *)malloc(b->npages ? b->npages : 1);
+	if (!status) return -ENOMEM;
+
+	for (size_t i = 0; i < b->npages; i++) {
+		mb_page *p = &b->pages[i];
+		epoch_clear_page(p);
+		status[i] = p->status;
+		if (!epoch_tracks(p)) continue;
+#ifdef _WIN32
+		/* A guard-page stack write clears the guard bit before anything can
+		 * observe which page it was, so the hold cannot be re-armed reliably.
+		 * Take these eagerly instead: always in the delta, pre-image copied
+		 * now. Stacks are usually invisible and so never reach here at all. */
+		if (p->status == MB_ST_RWSTACK) {
+			p->epoch_dirty = true;
+			if (!p->uncommitted) {
+				ensure_committed(b, i, 1);
+				p->epoch_snap = snap_alloc();
+				if (p->epoch_snap) {
+					memcpy(p->epoch_snap, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+					p->epoch_snap_kind = MB_SNAP_DATA;
+				} else {
+					p->epoch_snap_kind = MB_SNAP_ZERO;
+				}
+			} else {
+				p->epoch_snap_kind = MB_SNAP_ZERO;
+			}
+			continue;
+		}
+#endif
+		p->epoch_hold = true;
+	}
+
+	free(b->epoch_status);
+	b->epoch_status = status;
+	b->epoch_active = true;
+
+	/* The holds only mean anything once the pages are actually protected - but
+	 * only the pages whose protection CHANGES need a syscall, and only a page
+	 * that was dirty (so mapped writable) changes when it is held. Walking the
+	 * whole arena instead costs a pass over every page in the layout on every
+	 * epoch, which on a 2GB machine is half a million of them and was most of
+	 * the cost when this was measured. Refresh the maximal runs that moved, the
+	 * same way loading a state does. */
+	size_t run_start = (size_t)-1;
+	for (size_t i = 0; i < b->npages; i++) {
+		bool moved = b->pages[i].epoch_hold && b->pages[i].dirty;
+		if (moved) {
+			if (run_start == (size_t)-1) run_start = i;
+		} else if (run_start != (size_t)-1) {
+			refresh_range(b, run_start, i - run_start);
+			run_start = (size_t)-1;
+		}
+	}
+	if (run_start != (size_t)-1) refresh_range(b, run_start, b->npages - run_start);
+	return 0;
+}
+
+size_t mb_block_epoch_page_count(const mb_block *b) {
+	size_t n = 0;
+	for (size_t i = 0; i < b->npages; i++) if (b->pages[i].epoch_dirty) n++;
+	return n;
+}
+
+int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) {
+	if (!b->epoch_active) return -EINVAL;
+	get_stack_dirty(b);
+
+	/* What the allocation map did, so applying a delta lands on the same shape
+	 * of machine and not merely the same bytes. Forward carries where it ended,
+	 * reverse where it began. */
+	uint64_t nstatus = 0;
+	for (size_t i = 0; i < b->npages; i++)
+		if (b->pages[i].status != b->epoch_status[i]) nstatus++;
+
+	uint64_t npages64 = b->npages, ndata = mb_block_epoch_page_count(b);
+	if (wr(w, ud, DELTA_MAGIC, sizeof(DELTA_MAGIC) - 1)) return -EIO;
+	if (wr(w, ud, &npages64, sizeof(npages64))) return -EIO;
+	if (wr(w, ud, &nstatus, sizeof(nstatus))) return -EIO;
+	for (size_t i = 0; i < b->npages; i++) {
+		if (b->pages[i].status == b->epoch_status[i]) continue;
+		uint64_t idx = i;
+		uint8_t s = forward ? b->pages[i].status : b->epoch_status[i];
+		if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, &s, 1)) return -EIO;
+	}
+
+	if (wr(w, ud, &ndata, sizeof(ndata))) return -EIO;
+	static const uint8_t zero[MB_PAGESIZE] = { 0 };
+	for (size_t i = 0; i < b->npages; i++) {
+		mb_page *p = &b->pages[i];
+		if (!p->epoch_dirty) continue;
+		uint64_t idx = i;
+		if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
+		if (forward) {
+			/* as it is now: the live page */
+			ensure_committed(b, i, 1);
+			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
+		} else {
+			/* as it was: what the fault captured before the first write */
+			const void *src = p->epoch_snap_kind == MB_SNAP_DATA ? (const void *)p->epoch_snap : (const void *)zero;
+			if (wr(w, ud, src, MB_PAGESIZE)) return -EIO;
+		}
+	}
+	return 0;
+}
+
+int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
+	if (!b->sealed) return -EINVAL;
+	char magic[sizeof(DELTA_MAGIC) - 1];
+	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
+	if (memcmp(magic, DELTA_MAGIC, sizeof(magic)) != 0) return -EINVAL;
+
+	uint64_t npages64 = 0, nstatus = 0, ndata = 0;
+	if (rd(r, ud, &npages64, sizeof(npages64))) return -EIO;
+	if (npages64 != b->npages) return -EINVAL;  /* a delta of another machine */
+	if (rd(r, ud, &nstatus, sizeof(nstatus))) return -EIO;
+	for (uint64_t k = 0; k < nstatus; k++) {
+		uint64_t idx = 0; uint8_t s = 0;
+		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) return -EIO;
+		if (idx >= b->npages) return -EINVAL;
+		b->pages[idx].status = s;
+	}
+
+	if (rd(r, ud, &ndata, sizeof(ndata))) return -EIO;
+	for (uint64_t k = 0; k < ndata; k++) {
+		uint64_t idx = 0;
+		if (rd(r, ud, &idx, sizeof(idx))) return -EIO;
+		if (idx >= b->npages) return -EINVAL;
+		mb_page *p = &b->pages[idx];
+		ensure_committed(b, (size_t)idx, 1);
+		if (rd(r, ud, (void *)mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
+		/* the content is no longer the baseline's, so a full state must carry
+		 * it; and the epoch that described it has been overtaken */
+		mb_page_maybe_snapshot(p, mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT)));
+		p->dirty = true;
+	}
+
+	/* A delta moves the machine, so whatever epoch was open no longer describes
+	 * anything. The caller opens the next one when it wants it. */
+	mb_block_epoch_clear(b);
+	refresh_all(b);
 	return 0;
 }
