@@ -139,6 +139,45 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	return res;
 }
 
+/* Who asked for it.
+ *
+ * A guest handed NULL by a refused allocation does not die there. It dies
+ * later and somewhere else entirely - a std::map insert, a recompiler
+ * dispatch, a settings write - each reading through a null pointer, with
+ * nothing left to say which allocation had failed. The syscall boundary is the
+ * last place that still knows, so a refusal, or a request large enough to be a
+ * mistake in itself, prints the return addresses sitting on the guest's stack.
+ *
+ * They are guest text addresses, and a core package ships its core.wbx
+ * unstripped: addr2line -f -C -e core.wbx <addr> names them.
+ *
+ * Only what is safe to read: the scan starts at the guest rsp the interop blob
+ * parked on the way in and stops at the end of whichever guest stack that rsp
+ * is on, so it never walks off into a guard page. */
+static void diag_guest_callers(mb_host *h) {
+	const uintptr_t rsp = h->context.guest_rsp;
+	if (rsp == 0) return;
+	mb_range stack;
+	if (mb_range_contains(h->layout.main_thread, rsp))     stack = h->layout.main_thread;
+	else if (mb_range_contains(h->layout.alt_thread, rsp)) stack = h->layout.alt_thread;
+	else return;
+
+	uintptr_t stop = rsp + MB_PAGESIZE * 8;
+	if (stop > mb_range_end(stack)) stop = mb_range_end(stack);
+
+	mb_diag("[mmap]   guest callers:");
+	int shown = 0;
+	for (uintptr_t p = rsp; p + sizeof(uintptr_t) <= stop && shown < 12; p += sizeof(uintptr_t)) {
+		const uintptr_t v = *(const uintptr_t *)p;
+		if (mb_range_contains(h->layout.elf, v)) {
+			mb_diag(" %llx", (unsigned long long)v);
+			shown++;
+		}
+	}
+	mb_diag(shown ? "\n" : " (none on the stack)\n");
+	mb_diag("[mmap]   addr2line -f -C -e core.wbx <addr> names these\n");
+}
+
 static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
 	mb_host *h = (mb_host *)hp;
@@ -154,6 +193,13 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			/* the kernel rounds an unaligned length up to a page; so do we */
 			mb_range r = { a1, (a2 + 0xFFF) & ~(uintptr_t)0xFFF };
 			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
+			/* A request bigger than the whole arena is not a tight fit, it is a
+			 * mistake - a corrupted size, or a reservation nobody sized against
+			 * this machine. Either way the guest is about to be handed NULL and
+			 * to die somewhere unrelated, so say who asked while that is still
+			 * knowable. mb_block_mmap has already said what the arena looked
+			 * like; this adds the caller. */
+			if (res < 0 && r.size > h->layout.mmap_arena.size) diag_guest_callers(h);
 			return res < 0 ? serr((int)-res) : sok(res);
 		}
 		case NR_mremap: {
@@ -399,6 +445,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		free(h->image); free(h); return NULL;
 	}
 
+	mb_tripguard_set_layout(&h->layout);
 	h->block = mb_block_new(all);
 	if (!h->block) { snprintf(errbuf, errlen, "failed to create memory block"); free(h->image); free(h); return NULL; }
 	h->program_break = L->sbrk.start;

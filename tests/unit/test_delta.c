@@ -169,6 +169,74 @@ static void test_delta_carries_allocation(void) {
 	mb_block_free(b);
 }
 
+/* A page can change hands inside an epoch - munmap'd and handed back - and the
+ * delta owes the frame its BYTES, not just the shape of the map. Neither mmap
+ * nor munmap goes through the fault handler, so this is the case where nothing
+ * lifts the epoch's hold: it is covered today by free_pages taking the baseline
+ * snapshot and zeroing as it goes, which is not obvious from either end. Pinned
+ * here so that it stays true. */
+static void test_delta_carries_remapped_contents(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000)
+		memset((void *)(b->addr.start + i), (uint8_t)(i >> 12), 0x1000);
+
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	uint8_t *before = snapshot(b, SIZE);
+
+	mb_range page = { b->addr.start + 0x4000, 0x1000 };
+	CHECK_EQ(mb_block_munmap(b, page), 0);
+	CHECK_EQ(mb_block_mmap_fixed(b, page, MB_PROT_RW, false), 0);
+	memset((void *)page.start, 0xEE, 0x1000);
+	uint8_t *after = snapshot(b, SIZE);
+	CHECK(memcmp(before, after, SIZE) != 0);
+
+	membuf fwd = { 0 }, rev = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
+	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
+
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
+	CHECK(memcmp((const void *)b->addr.start, before, SIZE) == 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
+	CHECK(memcmp((const void *)b->addr.start, after, SIZE) == 0);
+
+	membuf_free(&fwd); membuf_free(&rev);
+	free(before); free(after);
+	mb_block_free(b);
+}
+
+/* The other direction: a page that was FREE when the epoch began and is handed
+ * to the guest during it. Its pre-image is zero - a free page cannot be read -
+ * and its forward contents are whatever the guest just put there. */
+static void test_delta_carries_freshly_mapped_contents(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000)
+		memset((void *)(b->addr.start + i), (uint8_t)(i >> 12), 0x1000);
+	mb_range page = { b->addr.start + 0x6000, 0x1000 };
+	CHECK_EQ(mb_block_munmap(b, page), 0);
+
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK_EQ(mb_block_mmap_fixed(b, page, MB_PROT_RW, false), 0);
+	memset((void *)page.start, 0x5A, 0x1000);
+	uint8_t *after = snapshot(b, SIZE);
+
+	membuf fwd = { 0 }, rev = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
+	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
+
+	/* back to free, then forward again: the bytes have to come with it */
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
+	CHECK_EQ(mb_block_page_info(b, 6) & 0x3f, 0);
+	memset((void *)(b->addr.start + 0x7000), 0x11, 0x1000);   /* churn around it */
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
+	CHECK(memcmp((const void *)page.start, (const uint8_t *)after + 0x6000, 0x1000) == 0);
+
+	membuf_free(&fwd); membuf_free(&rev);
+	free(after);
+	mb_block_free(b);
+}
+
 /* A delta of one machine is refused by another shape of machine, and rubbish
  * is refused outright, rather than being applied to produce nonsense. */
 static void test_delta_refusals(void) {

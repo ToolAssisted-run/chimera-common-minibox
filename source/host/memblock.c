@@ -147,7 +147,16 @@ void mb_page_epoch_capture(mb_page *p, uintptr_t maddr) {
 	if (p->epoch_snap_kind != MB_SNAP_NONE) return;  /* already have this epoch's */
 	if (p->uncommitted) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
 	p->epoch_snap = snap_alloc();
-	if (!p->epoch_snap) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
+	if (!p->epoch_snap) {
+		/* The baseline's version of this can fall back to "leave it clean" and
+		 * lose nothing. An epoch's cannot: a reverse delta with no pre-image
+		 * for a page carries ZEROS for it, and stepping back a frame then wipes
+		 * memory the machine still needs. Nothing else would ever say so. */
+		mb_diag_banner("snapshot pool exhausted");
+		mb_diag("[epoch] no pre-image for a written page: a reverse delta would carry zeros\n");
+		p->epoch_snap_kind = MB_SNAP_ZERO;
+		return;
+	}
 	memcpy(p->epoch_snap, (const void *)maddr, MB_PAGESIZE);
 	p->epoch_snap_kind = MB_SNAP_DATA;
 }

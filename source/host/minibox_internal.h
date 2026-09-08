@@ -202,6 +202,9 @@ void mb_tripguard_set_guest_fault_handler(mb_guest_fault_fn fn);
 void mb_tripguard_ensure_altstack(void);  /* per-thread; see tripguard.c */
 #endif
 void mb_tripguard_unregister(mb_block *b);
+/* The live machine's layout, so an unhandled fault can name the region it
+ * landed in rather than a page number somebody has to work out by hand. */
+void mb_tripguard_set_layout(const mb_layout *l);
 
 /* ---- context.c: host<->guest transitions (interop.bin at 0x35f00000000) ---- */
 #define MB_ORG            0x35f00000000ull

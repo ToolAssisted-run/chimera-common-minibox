@@ -16,6 +16,43 @@
 #define MAX_BLOCKS 64
 static mb_block *g_blocks[MAX_BLOCKS];
 static int g_nblocks = 0;
+
+/* Where an address IS, in the words the layout uses.
+ *
+ * "inside a registered block, page 20768" is arithmetic somebody has to do by
+ * hand against the core's own ELF before it means anything - and the answer is
+ * usually the difference between a bug and a symptom. The layout knows, so it
+ * says: the region, the offset into it, and for the two guest stacks whether
+ * the address is in the guard at the bottom, which is what a stack that ran out
+ * looks like.
+ *
+ * Set by mb_host_new. One machine runs at a time; a second host replaces it,
+ * which is right, because its layout is the live one. */
+static const mb_layout *g_layout = NULL;
+
+void mb_tripguard_set_layout(const mb_layout *l) { g_layout = l; }
+
+static void say_region(uintptr_t a) {
+	const mb_layout *L = g_layout;
+	if (L == NULL) return;
+	static const char *names[] = { "elf", "main stack", "alt stack", "sbrk",
+	                               "sealed heap", "invisible heap", "plain heap", "mmap arena" };
+	/* walked as an array, so the struct had better be exactly those eight */
+	_Static_assert(sizeof(mb_layout) == 8 * sizeof(mb_range),
+	               "mb_layout must be the eight ranges say_region names, in that order");
+	const mb_range *rs = &L->elf;
+	for (int i = 0; i < 8; i++) {
+		if (!mb_range_contains(rs[i], a)) continue;
+		mb_diag(" in the %s +0x%llx", names[i], (unsigned long long)(a - rs[i].start));
+		/* elf.c guards the low 4 pages of each guest stack; landing there is a
+		 * stack that ran out, not a wild pointer */
+		if ((i == 1 || i == 2) && a < rs[i].start + MB_PAGESIZE * 4)
+			mb_diag(" - THE GUARD AT ITS BOTTOM: this stack overflowed");
+		return;
+	}
+	mb_diag(" in no region of the layout");
+}
+
 static bool g_initialized = false;
 
 static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
@@ -181,6 +218,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 #endif
 }
 
+
 static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
@@ -202,6 +240,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 			mb_diag(" (page %zu status=%u dirty=%u invisible=%u)",
 			        pi, owner->pages[pi].status, owner->pages[pi].dirty, owner->pages[pi].invisible);
 		}
+		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
 	}
 	if (rethrow) {
@@ -316,6 +355,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			mb_diag(" (page %zu status=%u dirty=%u invisible=%u)",
 			        pi, owner->pages[pi].status, owner->pages[pi].dirty, owner->pages[pi].invisible);
 		}
+		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
