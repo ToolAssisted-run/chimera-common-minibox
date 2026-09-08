@@ -171,6 +171,18 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
 int mb_block_epoch_begin(mb_block *b);
 int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud);
 int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud);
+
+/* Two forward block deltas, one after the other, written as a single delta
+ * that does what applying both in order does: the touched set is the union,
+ * and where both touched a page the LATER one wins - for the page's contents
+ * and for its allocation status alike.
+ *
+ * It needs no block and no running machine, being a transform on the bytes.
+ * That is the point: a history thins itself by merging adjacent deltas, and it
+ * must be able to do that to states it is only storing, long after the machine
+ * that made them has moved on. */
+int mb_block_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t udb,
+                           mb_write_cb w, uintptr_t ud);
 /* Drops the open epoch and everything it remembered. Anything that moves the
  * machine underneath an epoch (a state load, a seal) calls this: the epoch
  * described a machine that is no longer the one here. */

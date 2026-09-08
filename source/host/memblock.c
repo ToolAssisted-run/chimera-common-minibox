@@ -806,6 +806,115 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 	return 0;
 }
 
+/* ---- composing two deltas ----
+ *
+ * A delta's two lists are written in ascending page order (both loops above
+ * walk the block), so composing is a merge of sorted runs. Held in memory
+ * rather than streamed because the counts are written before the entries and a
+ * write callback cannot be seeked back to; a delta is the frame's churn, which
+ * is megabytes, not the machine.
+ */
+
+typedef struct {
+	uint64_t npages;
+	uint64_t nstatus;
+	uint64_t *sidx;
+	uint8_t *sval;
+	uint64_t ndata;
+	uint64_t *didx;
+	uint8_t *data;   /* ndata * MB_PAGESIZE */
+} delta_parts;
+
+static void parts_free(delta_parts *d) {
+	free(d->sidx); free(d->sval); free(d->didx); free(d->data);
+	memset(d, 0, sizeof(*d));
+}
+
+static int parts_read(mb_read_cb r, uintptr_t ud, delta_parts *d) {
+	memset(d, 0, sizeof(*d));
+	char magic[sizeof(DELTA_MAGIC) - 1];
+	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
+	if (memcmp(magic, DELTA_MAGIC, sizeof(magic)) != 0) return -EINVAL;
+	if (rd(r, ud, &d->npages, sizeof(d->npages))) return -EIO;
+	if (rd(r, ud, &d->nstatus, sizeof(d->nstatus))) return -EIO;
+	if (d->nstatus > d->npages) return -EINVAL;
+	if (d->nstatus) {
+		d->sidx = malloc(d->nstatus * sizeof(uint64_t));
+		d->sval = malloc(d->nstatus);
+		if (!d->sidx || !d->sval) { parts_free(d); return -ENOMEM; }
+	}
+	for (uint64_t k = 0; k < d->nstatus; k++) {
+		if (rd(r, ud, &d->sidx[k], sizeof(uint64_t)) || rd(r, ud, &d->sval[k], 1)) { parts_free(d); return -EIO; }
+		if (d->sidx[k] >= d->npages) { parts_free(d); return -EINVAL; }
+	}
+	if (rd(r, ud, &d->ndata, sizeof(d->ndata))) { parts_free(d); return -EIO; }
+	if (d->ndata > d->npages) { parts_free(d); return -EINVAL; }
+	if (d->ndata) {
+		d->didx = malloc(d->ndata * sizeof(uint64_t));
+		d->data = malloc(d->ndata * MB_PAGESIZE);
+		if (!d->didx || !d->data) { parts_free(d); return -ENOMEM; }
+	}
+	for (uint64_t k = 0; k < d->ndata; k++) {
+		if (rd(r, ud, &d->didx[k], sizeof(uint64_t))
+			|| rd(r, ud, d->data + k * MB_PAGESIZE, MB_PAGESIZE)) { parts_free(d); return -EIO; }
+		if (d->didx[k] >= d->npages) { parts_free(d); return -EINVAL; }
+	}
+	return 0;
+}
+
+/* how many entries a merge of two ascending index runs produces */
+static uint64_t merged_count(const uint64_t *a, uint64_t na, const uint64_t *b, uint64_t nb) {
+	uint64_t i = 0, j = 0, n = 0;
+	while (i < na && j < nb) {
+		if (a[i] < b[j]) i++;
+		else if (b[j] < a[i]) j++;
+		else { i++; j++; }
+		n++;
+	}
+	return n + (na - i) + (nb - j);
+}
+
+int mb_block_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t udb,
+                           mb_write_cb w, uintptr_t ud) {
+	delta_parts a, b;
+	int rc = parts_read(ra, uda, &a);
+	if (rc) return rc;
+	rc = parts_read(rb, udb, &b);
+	if (rc) { parts_free(&a); return rc; }
+	if (a.npages != b.npages) { parts_free(&a); parts_free(&b); return -EINVAL; }
+
+	rc = -EIO;
+	uint64_t nstatus = merged_count(a.sidx, a.nstatus, b.sidx, b.nstatus);
+	uint64_t ndata = merged_count(a.didx, a.ndata, b.didx, b.ndata);
+	if (wr(w, ud, DELTA_MAGIC, sizeof(DELTA_MAGIC) - 1)) goto done;
+	if (wr(w, ud, &a.npages, sizeof(a.npages))) goto done;
+
+	if (wr(w, ud, &nstatus, sizeof(nstatus))) goto done;
+	for (uint64_t i = 0, j = 0; i < a.nstatus || j < b.nstatus; ) {
+		/* where both moved the same page, the later allocation map is the one
+		 * the composed delta has to land on */
+		bool takeB = i >= a.nstatus || (j < b.nstatus && b.sidx[j] <= a.sidx[i]);
+		uint64_t idx = takeB ? b.sidx[j] : a.sidx[i];
+		uint8_t s = takeB ? b.sval[j] : a.sval[i];
+		if (takeB) { if (i < a.nstatus && a.sidx[i] == idx) i++; j++; } else i++;
+		if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, &s, 1)) goto done;
+	}
+
+	if (wr(w, ud, &ndata, sizeof(ndata))) goto done;
+	for (uint64_t i = 0, j = 0; i < a.ndata || j < b.ndata; ) {
+		bool takeB = i >= a.ndata || (j < b.ndata && b.didx[j] <= a.didx[i]);
+		uint64_t idx = takeB ? b.didx[j] : a.didx[i];
+		const uint8_t *page = takeB ? b.data + j * MB_PAGESIZE : a.data + i * MB_PAGESIZE;
+		if (takeB) { if (i < a.ndata && a.didx[i] == idx) i++; j++; } else i++;
+		if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, page, MB_PAGESIZE)) goto done;
+	}
+	rc = 0;
+done:
+	parts_free(&a);
+	parts_free(&b);
+	return rc;
+}
+
 int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
 	char magic[sizeof(DELTA_MAGIC) - 1];

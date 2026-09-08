@@ -95,6 +95,14 @@ void wbx_load_state(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_re
 void wbx_epoch_begin(mb_host *obj, mb_return *ret);
 void wbx_save_delta(mb_host *obj, bool forward, mb_write_callback cb, uintptr_t userdata, mb_return *ret);
 void wbx_load_delta(mb_host *obj, mb_read_callback cb, uintptr_t userdata, mb_return *ret);
+/* Two forward deltas, the second measured from where the first ended, written
+ * out as one delta that spans both. Applying the result lands on exactly the
+ * machine applying the pair in order would. Takes no host: a delta is bytes,
+ * and this is a transform on them, so a caller can thin a stored history with
+ * no machine loaded at all. */
+void wbx_compose_delta(mb_read_callback a, uintptr_t a_userdata,
+                       mb_read_callback b, uintptr_t b_userdata,
+                       mb_write_callback out, uintptr_t out_userdata, mb_return *ret);
 /* pages the open epoch has touched: what a delta would cost, before writing one */
 void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret);
 void wbx_set_always_evict_blocks(bool val);

@@ -679,6 +679,48 @@ done:
 	return rc;
 }
 
+/* Two forward deltas as one. See mb_block_delta_compose: the block's lists
+ * merge, and everything outside them - where the program break ended, which
+ * threads there are - is taken from the LATER delta, because that is the
+ * machine the pair lands on.
+ *
+ * No host is touched. A history composes deltas it is merely storing, which it
+ * must be able to do with no machine loaded and none of these bytes live. */
+int mb_host_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t udb,
+                          mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
+	uintptr_t brk_a = 0, brk_b = 0;
+	uint8_t hash_a[32], hash_b[32];
+	if (expect(ra, uda, DELTA_START, sizeof(DELTA_START)-1)
+		|| expect(rb, udb, DELTA_START, sizeof(DELTA_START)-1)) {
+		snprintf(errbuf, errlen, "bad delta magic"); return -1;
+	}
+	if (r_all(ra, uda, &brk_a, sizeof(brk_a)) || r_all(ra, uda, hash_a, 32)
+		|| r_all(rb, udb, &brk_b, sizeof(brk_b)) || r_all(rb, udb, hash_b, 32)) {
+		snprintf(errbuf, errlen, "delta read failed"); return -1;
+	}
+	(void)brk_a;
+	if (memcmp(hash_a, hash_b, 32) != 0) {
+		snprintf(errbuf, errlen, "deltas are of different machines"); return -1;
+	}
+	if (w_all(w, ud, DELTA_START, sizeof(DELTA_START)-1)
+		|| w_all(w, ud, &brk_b, sizeof(brk_b)) || w_all(w, ud, hash_b, 32)) {
+		snprintf(errbuf, errlen, "delta write failed"); return -1;
+	}
+	if (mb_block_delta_compose(ra, uda, rb, udb, w, ud) != 0) {
+		snprintf(errbuf, errlen, "memory delta compose failed"); return -1;
+	}
+	/* Whatever the later delta has left - its thread set and its end magic -
+	 * goes out verbatim. Its length is the thread set's business, so this
+	 * copies to the end of the stream rather than parsing what it does not own. */
+	for (;;) {
+		uint8_t buf[65536];
+		intptr_t got = rb(udb, buf, sizeof(buf));
+		if (got <= 0) break;
+		if (w_all(w, ud, buf, (size_t)got)) { snprintf(errbuf, errlen, "delta write failed"); return -1; }
+	}
+	return 0;
+}
+
 size_t mb_host_epoch_page_count(const mb_host *h) {
 	return mb_block_epoch_page_count(h->block);
 }
