@@ -1,0 +1,5 @@
+
+=== miniBox: state hash mismatch (2026-09-08 21:15:10) ===
+[state] refused: this state was made by another machine
+[state]   state 7e2e9033a4c13694
+[state]   block cc57cb140ab580d8

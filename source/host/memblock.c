@@ -565,6 +565,12 @@ int mb_block_seal(mb_block *b) {
 
 size_t mb_block_page_len(const mb_block *b) { return b->npages; }
 
+/* The sealed baseline's identity: what every clean page reads back as. Two
+ * machines that disagree here cannot exchange states, however alike their
+ * configuration looks - which is why anything CACHING states across sessions
+ * has to key them on this and not on the core's name and settings. */
+const uint8_t *mb_block_hash(const mb_block *b) { return b->hash; }
+
 uint8_t mb_block_page_info(const mb_block *b, size_t i) {
 	const mb_page *p = &b->pages[i];
 	uint8_t res = p->status; /* status bytes already match page_info's low bits */
@@ -629,7 +635,27 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (memcmp(magic, MAGIC, sizeof(magic)) != 0) return -EINVAL;
 	uint8_t hash[32];
 	if (rd(r, ud, hash, 32)) return -EIO;
-	if (memcmp(hash, b->hash, 32) != 0) fprintf(stderr, "miniBox: unexpected MemoryBlock hash mismatch\n");
+	if (memcmp(hash, b->hash, 32) != 0) {
+		/* This state was made by a different machine. It used to say so and
+		 * load it anyway, which cannot work and does not fail where it happens:
+		 * a savestate carries only the DIRTY pages and every clean one is read
+		 * back from the sealed baseline, so a state from another baseline
+		 * assembles a machine out of two different ones. It runs. It crashes
+		 * later, somewhere unrelated - measured on PS2 as a null dereference
+		 * inside std::_Rb_tree_rebalance_for_erase, sixty frames after the load
+		 * and with nothing left to connect the two.
+		 *
+		 * So it is refused. A caller whose states are a CACHE (Chimera's
+		 * greenzone) should be throwing them away at this point, and a refusal
+		 * is what tells it to. */
+		mb_diag_banner("state hash mismatch");
+		mb_diag("[state] refused: this state was made by another machine\n[state]   state ");
+		for (int i = 0; i < 8; i++) mb_diag("%02x", hash[i]);
+		mb_diag("\n[state]   block ");
+		for (int i = 0; i < 8; i++) mb_diag("%02x", b->hash[i]);
+		mb_diag("\n");
+		return -EINVAL;
+	}
 	mb_range addr;
 	if (rd(r, ud, &addr, sizeof(addr))) return -EIO;
 	if (addr.start != b->addr.start || addr.size != b->addr.size) return -EINVAL;

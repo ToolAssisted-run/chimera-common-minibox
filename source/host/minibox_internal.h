@@ -146,6 +146,7 @@ int  mb_block_seal(mb_block *b);
 
 size_t  mb_block_page_len(const mb_block *b);
 uint8_t mb_block_page_info(const mb_block *b, size_t index);
+const uint8_t *mb_block_hash(const mb_block *b);  /* 32 bytes; valid once sealed */
 
 /* Savestate (structure per docs/docs/MACHINE-SPEC.md section 6). Return 0 on success. */
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud);

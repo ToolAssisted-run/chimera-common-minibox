@@ -104,11 +104,48 @@ static void test_save_before_seal(void) {
 	mb_block_free(b);
 }
 
+/* A state from a machine with a DIFFERENT sealed baseline is refused.
+ *
+ * It cannot be loaded correctly and the failure does not land where the mistake
+ * is: a state carries only the pages dirtied since the seal, and every clean
+ * page is read back from the baseline - so a state from another baseline
+ * assembles a machine out of two. It runs, and it dies later somewhere with
+ * nothing to connect the two. Refusing is what lets a caller whose states are a
+ * cache know to throw them away. */
+static void test_foreign_state_refused(void) {
+	/* The baseline's identity is WHICH pages the machine touched on its way to
+	 * being sealed, so two machines differ by having touched different ones -
+	 * which is exactly how two boots of one core can differ. */
+	mb_block *a = fresh_rw(0x10000);
+	for (int i = 0; i < 0x8000; i++) gp(a, i)[0] = (uint8_t)(i * 7 + 1);
+	CHECK_EQ(mb_block_seal(a), 0);
+	gp(a, 0x0010)[0] = 0xAA;
+
+	membuf st = {0};
+	CHECK_EQ(mb_block_save_state(a, membuf_write, (uintptr_t)&st), 0);
+	mb_block_free(a);
+
+	/* same shape, same size, different baseline - which is the whole point:
+	 * nothing about the SHAPE says these are different machines */
+	mb_block *b = fresh_rw(0x10000);
+	for (int i = 0; i < 0xC000; i++) gp(b, i)[0] = (uint8_t)(i * 11 + 3);
+	CHECK_EQ(mb_block_seal(b), 0);
+
+	st.pos = 0;
+	CHECK(mb_block_load_state(b, membuf_read, (uintptr_t)&st) != 0);
+	/* and it is refused rather than half-applied */
+	CHECK_EQ(gp(b, 0x0010)[0], (uint8_t)(0x0010 * 11 + 3));
+
+	membuf_free(&st);
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	RUN(test_revert_after_save);
 	RUN(test_invisible_excluded);
 	RUN(test_zerofilled_baseline);
 	RUN(test_repeated_roundtrip);
 	RUN(test_save_before_seal);
+	RUN(test_foreign_state_refused);
 }
 TEST_MAIN()

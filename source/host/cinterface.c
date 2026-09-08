@@ -23,6 +23,7 @@ int       mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_
 int       mb_host_mount_path(mb_host *h, const char *name, const char *path);
 int       mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *outlen);
 size_t    mb_host_page_len(mb_host *h);
+const uint8_t *mb_host_hash(mb_host *h);
 uint8_t   mb_host_page_info(mb_host *h, size_t i);
 int       mb_host_save_state(mb_host *h, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
 int       mb_host_load_state(mb_host *h, mb_read_callback r, uintptr_t ud, char *errbuf, size_t errlen);
@@ -161,6 +162,17 @@ void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret) { ok(ret, mb_host_ep
 void wbx_set_always_evict_blocks(bool val) { g_always_evict = val; (void)g_always_evict; }
 
 void wbx_get_page_len(mb_host *obj, mb_return *ret) { ok(ret, mb_host_page_len(obj)); }
+
+/* The sealed machine's identity, 32 bytes, copied into the caller's buffer.
+ * A caller that CACHES states across sessions needs this: two boots of one core
+ * with one configuration can still seal differently - they touched different
+ * pages getting there - and states do not cross that line. Without it the only
+ * warning is a refused load somewhere far from where the cache was trusted. */
+void wbx_machine_hash(mb_host *obj, uint8_t *out, mb_return *ret) {
+	if (out == NULL) { err(ret, "no buffer"); return; }
+	memcpy(out, mb_host_hash(obj), 32);
+	ok(ret, 32);
+}
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret) {
 	if (index >= mb_host_page_len(obj)) { err(ret, "Index out of range"); return; }
 	ok(ret, mb_host_page_info(obj, index));
