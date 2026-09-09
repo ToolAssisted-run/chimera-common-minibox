@@ -16,6 +16,26 @@
 
 static const char DOG[] = "The quick brown fox jumps over the lazy dog.";
 
+/* A temp file where THIS machine keeps them, opened for writing.
+ *
+ * These paths used to be "/tmp/...", which is not somewhere a Windows runner
+ * has: mkstemp returned -1 and twenty-nine checks fell over behind the one
+ * that did, which had this suite red on Windows while it was green on Linux.
+ * The directory is the one the environment names, and /tmp only as the last
+ * resort it always was. */
+static int host_tempfile(char *out, size_t cap, const char *stem)
+{
+	const char *base = getenv("TMPDIR");
+	if (base == NULL || base[0] == '\0') base = getenv("TEMP");
+	if (base == NULL || base[0] == '\0') base = getenv("TMP");
+	if (base == NULL || base[0] == '\0') base = "/tmp";
+	size_t n = strlen(base);
+	while (n > 1 && (base[n - 1] == '/' || base[n - 1] == '\\')) n--;
+	int wrote = snprintf(out, cap, "%.*s/%sXXXXXX", (int)n, base, stem);
+	if (wrote < 0 || (size_t)wrote >= cap) return -1;
+	return mkstemp(out);
+}
+
 static void test_ro_read(void) {
 	mb_fs *fs = mb_fs_new();
 	CHECK_EQ(mb_fs_mount(fs, "f", (const uint8_t *)DOG, sizeof(DOG)-1, false), 0);
@@ -133,8 +153,8 @@ static void test_host_file(void) {
 	static const char text[] = "0123456789abcdefghij";
 	const size_t len = sizeof(text) - 1;
 
-	char path[] = "/tmp/mb-fs-hostXXXXXX";
-	int tmpfd = mkstemp(path);
+	char path[512];
+	int tmpfd = host_tempfile(path, sizeof path, "mb-fs-host");
 	CHECK(tmpfd >= 0);
 	CHECK_EQ((size_t)write(tmpfd, text, len), len);
 	close(tmpfd);
@@ -176,8 +196,8 @@ static void test_host_file(void) {
 	 * return every byte asked for. This is the shape of the bug that made
 	 * PCSX2's EE RAM differ from its native reference by 5778 bytes. */
 	{
-		char bigpath[] = "/tmp/mb-fs-bigXXXXXX";
-		int bfd = mkstemp(bigpath);
+		char bigpath[512];
+		int bfd = host_tempfile(bigpath, sizeof bigpath, "mb-fs-big");
 		CHECK(bfd >= 0);
 		const size_t big = 512 * 1024;          /* well over any stdio buffer */
 		uint8_t *pattern = malloc(big);
@@ -213,8 +233,11 @@ static void test_host_file(void) {
 	mb_fs_close(fs, (int)c);
 	CHECK_EQ(mb_fs_unmount(fs, "disc", NULL, NULL), 0);
 
-	/* a file that is not there is refused rather than mounted empty */
-	CHECK_EQ(mb_fs_mount_path(fs, "ghost", "/tmp/mb-fs-does-not-exist"), -ENOENT);
+	/* a file that is not there is refused rather than mounted empty - beside
+	 * the one that IS there, so the path is absent rather than the directory */
+	char ghost[512];
+	snprintf(ghost, sizeof ghost, "%s-does-not-exist", path);
+	CHECK_EQ(mb_fs_mount_path(fs, "ghost", ghost), -ENOENT);
 
 	mb_fs_free(fs);
 	unlink(path);
