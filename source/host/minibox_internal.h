@@ -206,6 +206,12 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud);
  * That is the point: a history thins itself by merging adjacent deltas, and it
  * must be able to do that to states it is only storing, long after the machine
  * that made them has moved on. */
+/* The same, for two deltas already in memory: walked where they lie, nothing
+ * allocated, a third of the memory traffic. This is the one the history uses
+ * every frame; the streaming version below is for a delta coming off a disk. */
+int mb_block_delta_compose_mem(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen,
+                               mb_write_cb w, uintptr_t ud, size_t *b_used);
+
 int mb_block_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t udb,
                            mb_write_cb w, uintptr_t ud);
 /* Drops the open epoch and everything it remembered. Anything that moves the

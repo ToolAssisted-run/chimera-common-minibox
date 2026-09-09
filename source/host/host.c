@@ -769,6 +769,40 @@ int mb_host_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t
 	return 0;
 }
 
+/* The same for two deltas already in memory (mb_block_delta_compose_mem). The
+ * history composes every frame and holds both deltas contiguously, so reading
+ * them in through a callback was copying megabytes to look at megabytes. */
+int mb_host_delta_compose_mem(const uint8_t *abuf, size_t alen, const uint8_t *bbuf, size_t blen,
+                              mb_write_cb w, uintptr_t ud, char *errbuf, size_t errlen) {
+	const size_t head = sizeof(DELTA_START) - 1, stamp = sizeof(uintptr_t) + 32;
+	if (alen < head + stamp || blen < head + stamp
+		|| memcmp(abuf, DELTA_START, head) != 0 || memcmp(bbuf, DELTA_START, head) != 0) {
+		snprintf(errbuf, errlen, "bad delta magic"); return -1;
+	}
+	const uint8_t *ap = abuf + head, *bp = bbuf + head;
+	uintptr_t brk_b;
+	memcpy(&brk_b, bp, sizeof(brk_b));
+	if (memcmp(ap + sizeof(uintptr_t), bp + sizeof(uintptr_t), 32) != 0) {
+		snprintf(errbuf, errlen, "deltas are of different machines"); return -1;
+	}
+	if (w_all(w, ud, DELTA_START, head) || w_all(w, ud, &brk_b, sizeof(brk_b))
+		|| w_all(w, ud, bp + sizeof(uintptr_t), 32)) {
+		snprintf(errbuf, errlen, "delta write failed"); return -1;
+	}
+	ap += stamp; bp += stamp;
+	size_t used = 0;
+	if (mb_block_delta_compose_mem(ap, alen - (size_t)(ap - abuf), bp, blen - (size_t)(bp - bbuf),
+			w, ud, &used) != 0) {
+		snprintf(errbuf, errlen, "memory delta compose failed"); return -1;
+	}
+	/* the later delta's thread set and end magic, verbatim */
+	const size_t tail = blen - (size_t)(bp - bbuf) - used;
+	if (tail != 0 && w_all(w, ud, bp + used, tail)) {
+		snprintf(errbuf, errlen, "delta write failed"); return -1;
+	}
+	return 0;
+}
+
 size_t mb_host_epoch_page_count(const mb_host *h) {
 	return mb_block_epoch_page_count(h->block);
 }

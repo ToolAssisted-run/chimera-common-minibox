@@ -32,6 +32,8 @@ int       mb_host_delta_save(mb_host *h, bool forward, mb_write_callback w, uint
 int       mb_host_delta_apply(mb_host *h, mb_read_callback r, uintptr_t ud, char *errbuf, size_t errlen);
 int       mb_host_delta_compose(mb_read_callback a, uintptr_t aud, mb_read_callback b, uintptr_t bud,
                                 mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
+int       mb_host_delta_compose_mem(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen,
+                                    mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
 size_t    mb_host_epoch_page_count(const mb_host *h);
 
 static bool g_always_evict = true;
@@ -154,6 +156,19 @@ void wbx_compose_delta(mb_read_callback a, uintptr_t a_userdata,
                        mb_write_callback out, uintptr_t out_userdata, mb_return *ret) {
 	char e[256]; e[0] = 0;
 	if (mb_host_delta_compose(a, a_userdata, b, b_userdata, out, out_userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+/* Composing two deltas the caller already holds in memory, which is what the
+ * history does every frame. The same answer as wbx_compose_delta for a third of
+ * the memory traffic; a frontend that does not find this export falls back to
+ * that one. */
+void wbx_compose_delta_mem(const uint8_t *a, uintptr_t a_len, const uint8_t *b, uintptr_t b_len,
+                           mb_write_callback out, uintptr_t out_userdata, mb_return *ret) {
+	char e[256]; e[0] = 0;
+	if (mb_host_delta_compose_mem(a, (size_t)a_len, b, (size_t)b_len, out, out_userdata, e, sizeof(e)) != 0) {
+		err(ret, e); return;
+	}
 	ok(ret, 0);
 }
 

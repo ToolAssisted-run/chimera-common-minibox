@@ -496,6 +496,52 @@ static void test_compose_refuses_a_foreign_delta(void) {
 	mb_block_free(small); mb_block_free(big);
 }
 
+/* The in-memory compose is the streaming one's answer, exactly. It exists only
+ * because the caller that runs it every frame already holds both deltas
+ * contiguously, so reading them into buffers to look at them was copying
+ * megabytes for nothing - not because it does anything different. */
+static void test_compose_in_memory_matches_streaming(void) {
+	const uintptr_t SIZE = 0x40000;
+	mb_block *b = sealed(SIZE);
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000) memset((void *)(b->addr.start + i), (uint8_t)(i >> 12), 0x1000);
+
+	/* two deltas that overlap in part, and that move the allocation map too */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x2000)[0] = 1;
+	gp(b, 0x5000)[0] = 2;
+	mb_range page = { b->addr.start + 0x9000, 0x1000 };
+	CHECK_EQ(mb_block_munmap(b, page), 0);
+	membuf d1 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d1), 0);
+
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x5000)[0] = 3;                                  /* the same page again */
+	gp(b, 0x7000)[0] = 4;                                  /* and one only this frame has */
+	CHECK_EQ(mb_block_mmap_fixed(b, page, MB_PROT_RW, false), 0);
+	membuf d2 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d2), 0);
+
+	membuf streamed = { 0 }, inmem = { 0 };
+	d1.pos = 0; d2.pos = 0;
+	CHECK_EQ(mb_block_delta_compose(membuf_read, (uintptr_t)&d1, membuf_read, (uintptr_t)&d2,
+		membuf_write, (uintptr_t)&streamed), 0);
+	size_t used = 0;
+	CHECK_EQ(mb_block_delta_compose_mem(d1.buf, d1.len, d2.buf, d2.len,
+		membuf_write, (uintptr_t)&inmem, &used), 0);
+
+	CHECK_EQ(inmem.len, streamed.len);
+	CHECK(memcmp(inmem.buf, streamed.buf, streamed.len) == 0);
+	CHECK_EQ(used, d2.len);   /* it consumed the whole of the later delta */
+
+	/* rubbish is refused rather than read past the end of */
+	membuf junk = { 0 };
+	CHECK(mb_block_delta_compose_mem(d1.buf, d1.len, d1.buf, 4, membuf_write, (uintptr_t)&junk, NULL) != 0);
+	CHECK(mb_block_delta_compose_mem(d1.buf, d1.len - 1, d2.buf, d2.len, membuf_write, (uintptr_t)&junk, NULL) != 0);
+
+	membuf_free(&d1); membuf_free(&d2); membuf_free(&streamed); membuf_free(&inmem); membuf_free(&junk);
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	test_epoch_tracks_what_changed();
 	test_forward_delta_reproduces();
@@ -512,6 +558,7 @@ static void run_all(void) {
 	test_composing_a_chain_down_to_one();
 	test_compose_carries_allocation();
 	test_compose_refuses_a_foreign_delta();
+	test_compose_in_memory_matches_streaming();
 }
 
 TEST_MAIN()

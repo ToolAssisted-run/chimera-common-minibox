@@ -1024,6 +1024,115 @@ static uint64_t merged_count(const uint64_t *a, uint64_t na, const uint64_t *b, 
 	return n + (na - i) + (nb - j);
 }
 
+/* ---- composing two deltas that are already in memory --------------------
+ *
+ * The streaming version above reads both deltas into buffers of its own before
+ * it can merge them, because a count is written before its list and a write
+ * callback cannot be seeked back to. That is the right shape for a delta coming
+ * off a disk. It is the wrong shape for the caller that actually does this
+ * every frame: the history holds both deltas as contiguous bytes already, so
+ * reading them in means copying two megabytes to look at two megabytes.
+ *
+ * This walks them where they lie. Nothing is allocated, each byte of input is
+ * read once, and each byte of output is written once - a third of the memory
+ * traffic for the same answer.
+ */
+typedef struct {
+	uint64_t npages, nstatus, ndata;
+	const uint8_t *status;   /* nstatus entries: u64 index, u8 value */
+	const uint8_t *data;     /* ndata entries: u64 index, MB_PAGESIZE bytes */
+} delta_view;
+
+#define DELTA_STATUS_STRIDE (sizeof(uint64_t) + 1)
+#define DELTA_DATA_STRIDE   (sizeof(uint64_t) + MB_PAGESIZE)
+
+static uint64_t view_idx(const uint8_t *entry) {
+	uint64_t v;
+	memcpy(&v, entry, sizeof v);
+	return v;
+}
+
+/* Bounds-checked because a delta can come from a file somebody edited. */
+static int view_open(const uint8_t *buf, size_t len, delta_view *v) {
+	const size_t head = sizeof(DELTA_MAGIC) - 1;
+	if (len < head + 3 * sizeof(uint64_t)) return -EINVAL;
+	if (memcmp(buf, DELTA_MAGIC, head) != 0) return -EINVAL;
+	const uint8_t *p = buf + head;
+	memcpy(&v->npages, p, sizeof(uint64_t)); p += sizeof(uint64_t);
+	memcpy(&v->nstatus, p, sizeof(uint64_t)); p += sizeof(uint64_t);
+	if (v->nstatus > v->npages) return -EINVAL;
+	size_t left = len - (size_t)(p - buf);
+	if (v->nstatus > left / DELTA_STATUS_STRIDE) return -EINVAL;
+	v->status = p;
+	p += (size_t)v->nstatus * DELTA_STATUS_STRIDE;
+	if ((size_t)(p - buf) + sizeof(uint64_t) > len) return -EINVAL;
+	memcpy(&v->ndata, p, sizeof(uint64_t)); p += sizeof(uint64_t);
+	if (v->ndata > v->npages) return -EINVAL;
+	left = len - (size_t)(p - buf);
+	if (v->ndata > left / DELTA_DATA_STRIDE) return -EINVAL;
+	v->data = p;
+	return 0;
+}
+
+/* How many entries a sorted merge of two index lists produces. */
+static uint64_t view_merged(const uint8_t *a, uint64_t na, const uint8_t *b, uint64_t nb, size_t stride) {
+	uint64_t n = 0, i = 0, j = 0;
+	while (i < na || j < nb) {
+		if (i >= na) { j++; }
+		else if (j >= nb) { i++; }
+		else {
+			uint64_t ia = view_idx(a + i * stride), ib = view_idx(b + j * stride);
+			if (ia == ib) { i++; j++; }
+			else if (ia < ib) i++;
+			else j++;
+		}
+		n++;
+	}
+	return n;
+}
+
+int mb_block_delta_compose_mem(const uint8_t *abuf, size_t alen, const uint8_t *bbuf, size_t blen,
+                               mb_write_cb w, uintptr_t ud, size_t *b_used) {
+	delta_view a, b;
+	int rc = view_open(abuf, alen, &a);
+	if (rc) return rc;
+	rc = view_open(bbuf, blen, &b);
+	if (rc) return rc;
+	if (a.npages != b.npages) return -EINVAL;
+
+	uint64_t nstatus = view_merged(a.status, a.nstatus, b.status, b.nstatus, DELTA_STATUS_STRIDE);
+	uint64_t ndata = view_merged(a.data, a.ndata, b.data, b.ndata, DELTA_DATA_STRIDE);
+	if (wr(w, ud, DELTA_MAGIC, sizeof(DELTA_MAGIC) - 1)) return -EIO;
+	if (wr(w, ud, &a.npages, sizeof(a.npages))) return -EIO;
+
+	if (wr(w, ud, &nstatus, sizeof(nstatus))) return -EIO;
+	for (uint64_t i = 0, j = 0; i < a.nstatus || j < b.nstatus; ) {
+		/* where both moved the same page, the later allocation map is the one
+		 * the composed delta has to land on */
+		bool takeB = i >= a.nstatus
+			|| (j < b.nstatus && view_idx(b.status + j * DELTA_STATUS_STRIDE) <= view_idx(a.status + i * DELTA_STATUS_STRIDE));
+		const uint8_t *e = takeB ? b.status + j * DELTA_STATUS_STRIDE : a.status + i * DELTA_STATUS_STRIDE;
+		uint64_t idx = view_idx(e);
+		if (takeB) { if (i < a.nstatus && view_idx(a.status + i * DELTA_STATUS_STRIDE) == idx) i++; j++; } else i++;
+		if (wr(w, ud, e, DELTA_STATUS_STRIDE)) return -EIO;
+	}
+
+	if (wr(w, ud, &ndata, sizeof(ndata))) return -EIO;
+	for (uint64_t i = 0, j = 0; i < a.ndata || j < b.ndata; ) {
+		bool takeB = i >= a.ndata
+			|| (j < b.ndata && view_idx(b.data + j * DELTA_DATA_STRIDE) <= view_idx(a.data + i * DELTA_DATA_STRIDE));
+		const uint8_t *e = takeB ? b.data + j * DELTA_DATA_STRIDE : a.data + i * DELTA_DATA_STRIDE;
+		uint64_t idx = view_idx(e);
+		if (takeB) { if (i < a.ndata && view_idx(a.data + i * DELTA_DATA_STRIDE) == idx) i++; j++; } else i++;
+		/* index and page in one write: they are already adjacent in the source */
+		if (wr(w, ud, e, DELTA_DATA_STRIDE)) return -EIO;
+	}
+	/* Where the later delta's own bytes end - what follows them belongs to
+	 * whoever wrapped it, and is theirs to pass through. */
+	if (b_used != NULL) *b_used = (size_t)(b.data - bbuf) + (size_t)b.ndata * DELTA_DATA_STRIDE;
+	return 0;
+}
+
 int mb_block_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_t udb,
                            mb_write_cb w, uintptr_t ud) {
 	delta_parts a, b;
