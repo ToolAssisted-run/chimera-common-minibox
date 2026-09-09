@@ -301,8 +301,51 @@ static size_t validate(mb_block *b, mb_range addr, size_t *pcount) {
 	return (addr.start - b->addr.start) >> MB_PAGESHIFT;
 }
 
+static bool epoch_tracks(const mb_page *p);
+
+/* A page whose ALLOCATION changes inside an epoch has to enter that epoch's
+ * delta exactly as a written one does.
+ *
+ * A write is not the only way a page stops holding what the epoch began with.
+ * mmap hands the guest a page that was free, munmap takes one away and ZEROES
+ * it on the way out, mprotect turns a read-only page writable - and none of
+ * those goes through the fault handler, so none of them lifted the epoch's hold
+ * or copied a pre-image. The status list already said what the allocation map
+ * DID; without this the delta carries the new shape of the machine and not the
+ * bytes that came with it.
+ *
+ * The one that bites is munmap. A guest's heap gives pages back and takes them
+ * again all day, and musl hands fresh anonymous memory to malloc on the promise
+ * that it reads as zero. Replay a delta that only recorded the page moving and
+ * it comes back holding what it held BEFORE it was freed - which the guest then
+ * hands out as fresh memory. That is a seek backwards on a big core dying a
+ * hundred frames later inside somebody's std::map, with nothing to connect the
+ * two.
+ *
+ * The pre-image depends on what the page WAS. One the epoch tracks is captured
+ * the way a write would capture it. A free page reads as zero and that is its
+ * pre-image. One that is mapped but untracked (read-only, executable) holds
+ * real bytes that nothing else will copy, so they are copied here. */
+static void epoch_note_status_change(mb_block *b, size_t i, uint8_t to) {
+	mb_page *p = &b->pages[i];
+	if (!b->epoch_active || p->invisible || p->status == to) return;
+	if (epoch_tracks(p)) {
+		mb_page_epoch_capture(p, mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
+		return;
+	}
+	if (p->epoch_dirty) return;              /* already spoken for this epoch */
+	p->epoch_dirty = true;
+	if (p->epoch_snap_kind != MB_SNAP_NONE) return;
+	if (p->status == MB_ST_FREE || p->uncommitted) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
+	p->epoch_snap = snap_alloc();
+	if (!p->epoch_snap) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
+	memcpy(p->epoch_snap, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+	p->epoch_snap_kind = MB_SNAP_DATA;
+}
+
 /* apply a uniform status to a page range and refresh */
 static void set_protections(mb_block *b, size_t pstart, size_t pcount, uint8_t status) {
+	for (size_t i = pstart; i < pstart + pcount; i++) epoch_note_status_change(b, i, status);
 	for (size_t i = pstart; i < pstart + pcount; i++) b->pages[i].status = status;
 	refresh_range(b, pstart, pcount);
 #ifdef _WIN32
@@ -454,6 +497,9 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 	for (size_t i = ps; i < ps + pcount; i++) {
 		uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
 		mb_page_maybe_snapshot(&b->pages[i], maddr);
+		/* before the memset below, not after: an open epoch's pre-image of this
+		 * page is what it held while the guest still had it */
+		epoch_note_status_change(b, i, MB_ST_FREE);
 		if (!b->pages[i].uncommitted) memset((void *)maddr, 0, MB_PAGESIZE);
 		/* undirty pages whose sealed baseline was already zero */
 		b->pages[i].dirty = !b->pages[i].invisible && b->pages[i].snap_kind != MB_SNAP_ZERO;

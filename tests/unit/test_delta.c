@@ -237,6 +237,60 @@ static void test_delta_carries_freshly_mapped_contents(void) {
 	mb_block_free(b);
 }
 
+/* A page the guest GAVE BACK reads as zero, and a frame rebuilt from deltas has
+ * to agree.
+ *
+ * munmap zeroes the page it takes away, because that is what the guest's next
+ * mmap of it is entitled to find - musl hands fresh anonymous memory to malloc
+ * on exactly that promise. Nothing about that zeroing goes through the fault
+ * handler, so the epoch never hears about it: the delta records the page moving
+ * to free and back, and not a byte of content. Replay the deltas and the page
+ * comes back holding what it held BEFORE it was freed, which the guest then
+ * hands out as fresh memory.
+ *
+ * This is the shape of a heap in ordinary use, and it is why a seek backwards
+ * on a big core dies somewhere unrelated a hundred frames later. */
+static void test_delta_zeroes_a_page_the_guest_gave_back(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000)
+		memset((void *)(b->addr.start + i), 0xAB, 0x1000);
+
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
+	mb_range page = { b->addr.start + 0x4000, 0x1000 };
+
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	memset((void *)page.start, 0xCD, 0x1000);
+	membuf d1 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d1), 0);
+
+	/* given back and taken again, which is what a heap does all day */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK_EQ(mb_block_munmap(b, page), 0);
+	CHECK_EQ(mb_block_mmap_fixed(b, page, MB_PROT_RW, false), 0);
+	membuf d2 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d2), 0);
+
+	CHECK_EQ(((const volatile uint8_t *)page.start)[0], 0);  /* the machine says zero */
+	uint8_t *live = snapshot(b, SIZE);
+
+	/* now rebuild that frame the way a seek does: the anchor, then the deltas */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	d1.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d1), 0);
+	d2.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d2), 0);
+	CHECK_EQ(((const volatile uint8_t *)page.start)[0], 0);  /* and so must the rebuild */
+	CHECK(memcmp((const void *)b->addr.start, live, SIZE) == 0);
+
+	membuf_free(&anchor); membuf_free(&d1); membuf_free(&d2);
+	free(live);
+	mb_block_free(b);
+}
+
 /* A delta of one machine is refused by another shape of machine, and rubbish
  * is refused outright, rather than being applied to produce nonsense. */
 static void test_delta_refusals(void) {
@@ -441,6 +495,9 @@ static void run_all(void) {
 	test_reverse_delta_returns();
 	test_delta_chain_equals_the_run();
 	test_delta_carries_allocation();
+	test_delta_carries_remapped_contents();
+	test_delta_carries_freshly_mapped_contents();
+	test_delta_zeroes_a_page_the_guest_gave_back();
 	test_delta_refusals();
 	test_delta_needs_an_epoch();
 	test_full_state_after_delta();
