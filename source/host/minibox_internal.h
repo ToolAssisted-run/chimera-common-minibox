@@ -97,12 +97,16 @@ typedef struct {
 	 * dirty says "changed since the baseline", which only ever grows. These say
 	 * "changed since a MOMENT", so a caller can ask what one frame did rather
 	 * than what the whole run did. hold means the page is write-protected for
-	 * this epoch and has not been written yet; the fault that lifts it captures
-	 * what the page held, which is the reverse delta. */
+	 * this epoch and has not been written yet.
+	 *
+	 * There is no pre-image here. An epoch used to copy a page's content the
+	 * first time a frame wrote it, so that the frame could be described
+	 * BACKWARDS as well as forwards - a page copy inside the fault handler for
+	 * every page every frame, paid whether or not anybody ever stepped back. A
+	 * frame is rebuilt by loading an anchor and applying the deltas since it,
+	 * so nothing ever asked. */
 	bool epoch_hold;
 	bool epoch_dirty;
-	mb_snap_kind epoch_snap_kind;
-	uint8_t *epoch_snap;  /* MB_PAGESIZE bytes of PRE-epoch content when DATA */
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
@@ -125,7 +129,27 @@ typedef struct mb_block {
 	uint8_t hash[32];
 	mb_handle handle;
 	bool epoch_active;      /* an epoch is open; pages carry epoch_* above */
-	uint8_t *epoch_status;  /* the status array as the epoch began, npages bytes */
+
+	/* ---- what a frame touched, as bitmaps (see mb_block_epoch_begin) ----
+	 *
+	 * One bit a page. Every per-frame path reads these instead of walking the
+	 * page array, which is what keeps a captured frame proportional to what the
+	 * machine DID rather than to how big it could be. Iteration is ascending,
+	 * which the delta format needs: both its lists are in page order so that
+	 * composing two deltas is a merge of sorted runs. */
+	size_t nwords;          /* (npages + 63) / 64 */
+	uint64_t *epoch_bits;   /* pages written during this epoch */
+	uint64_t *stat_bits;    /* pages whose status changed during this epoch */
+	uint64_t *unheld_bits;  /* pages mapped writable now: what an epoch must hold */
+	size_t epoch_ndirty;    /* set bits in epoch_bits */
+	size_t epoch_nstat;     /* set bits in stat_bits */
+	uint8_t *epoch_status;  /* what a stat_bits page's status WAS, npages bytes */
+
+	/* The page range that has ever been a stack, or hi < lo for none. Windows
+	 * recovers stack dirtiness by asking the OS about each one, and without
+	 * this that ask is a walk of the whole arena on every frame. A range that
+	 * is wider than the truth costs a little time and is never wrong. */
+	size_t stack_lo, stack_hi;
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);
@@ -347,7 +371,11 @@ mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
 void    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
-void    mb_page_epoch_capture(mb_page *p, uintptr_t mirror_addr);
+void    mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t mirror_addr);
+
+/* One page just became writable, so an epoch has to hold it again next time.
+ * Called from the fault handler, which is why it only sets a bit. */
+void    mb_block_note_unheld(mb_block *b, size_t pi);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

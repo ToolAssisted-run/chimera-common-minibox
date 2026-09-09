@@ -137,28 +137,73 @@ void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 	}
 }
 
-/* The epoch's half of the same fault: what this page held before the write that
- * is happening now, which is the reverse delta's content. Runs in the handler,
- * so it allocates from the same signal-safe pool the baseline snapshots use. */
-void mb_page_epoch_capture(mb_page *p, uintptr_t maddr) {
-	if (!p->epoch_hold) return;
+static bool epoch_tracks(const mb_page *p);
+
+/* ---- page-index bitmaps -------------------------------------------------
+ *
+ * Every per-frame path used to walk the page array from end to end. On a two
+ * gigabyte arena that is half a million forty-byte structs - twenty-one
+ * megabytes of memory traffic - several times per captured frame, to describe
+ * a few hundred pages of change. Measured, it cost around nine milliseconds a
+ * frame, and it cost the same whether the frame wrote sixteen pages or a
+ * thousand: the work was proportional to how big the machine COULD be.
+ *
+ * So the sets a frame cares about are bitmaps instead: one bit a page, sixty
+ * four kilobytes for that same arena, scanned a word at a time and skipping
+ * the empty ones. Ascending, which the delta format needs - both its lists are
+ * in page order so that composing two deltas is a merge of sorted runs. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline int bits_first(uint64_t x) { unsigned long i; _BitScanForward64(&i, x); return (int)i; }
+#else
+static inline int bits_first(uint64_t x) { return __builtin_ctzll(x); }
+#endif
+
+static inline void bits_set(uint64_t *w, size_t i) { w[i >> 6] |= 1ull << (i & 63); }
+static inline void bits_clr(uint64_t *w, size_t i) { w[i >> 6] &= ~(1ull << (i & 63)); }
+static inline bool bits_get(const uint64_t *w, size_t i) { return (w[i >> 6] >> (i & 63)) & 1u; }
+static inline void bits_none(mb_block *b, uint64_t *w) { memset(w, 0, b->nwords * sizeof(uint64_t)); }
+
+/* A page is "unheld" when it is mapped writable right now, which is exactly
+ * the set an epoch has to protect again. Kept where protections are applied,
+ * so the bitmap cannot drift from what the OS was actually told. */
+static void note_prot(mb_block *b, size_t i, mb_prot prot) {
+	bool writable = prot == MB_PROT_RW || prot == MB_PROT_RWX || prot == MB_PROT_RWSTACK;
+	/* A Windows stack page is a guard page when clean, and its write clears the
+	 * guard before anything can see which page it was - so it is never held the
+	 * ordinary way and has to be visited by every epoch regardless. */
+	if (b->pages[i].status == MB_ST_RWSTACK) writable = true;
+	if (writable) bits_set(b->unheld_bits, i);
+	else bits_clr(b->unheld_bits, i);
+}
+
+void mb_block_note_unheld(mb_block *b, size_t pi) { bits_set(b->unheld_bits, pi); }
+
+/* Remembers that a page is, or has been, a stack. See mb_block::stack_lo. */
+static void note_status(mb_block *b, size_t i, uint8_t status) {
+	b->pages[i].status = status;
+	if (status != MB_ST_RWSTACK) return;
+	if (b->stack_hi < b->stack_lo) { b->stack_lo = b->stack_hi = i; return; }
+	if (i < b->stack_lo) b->stack_lo = i;
+	if (i > b->stack_hi) b->stack_hi = i;
+}
+
+/* The epoch's half of the same fault: this page has been written, so the frame
+ * owes it. Nothing is copied here - a delta is read off the live pages when it
+ * is saved - so this runs in the handler and touches two words. */
+void mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t maddr) {
+	(void)maddr;
+	mb_page *p = &b->pages[pi];
+	/* Whether or not an epoch wants this page, the hold is over: the write that
+	 * brought us here is about to be let through. */
 	p->epoch_hold = false;
+	/* An epoch tracks a page whether or not it was HELD. A page that was
+	 * already read-only - clean against the baseline - needed no hold and got
+	 * none, and it still belongs in the delta the moment it is written. */
+	if (!b->epoch_active || !epoch_tracks(p) || p->epoch_dirty) return;
 	p->epoch_dirty = true;
-	if (p->epoch_snap_kind != MB_SNAP_NONE) return;  /* already have this epoch's */
-	if (p->uncommitted) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
-	p->epoch_snap = snap_alloc();
-	if (!p->epoch_snap) {
-		/* The baseline's version of this can fall back to "leave it clean" and
-		 * lose nothing. An epoch's cannot: a reverse delta with no pre-image
-		 * for a page carries ZEROS for it, and stepping back a frame then wipes
-		 * memory the machine still needs. Nothing else would ever say so. */
-		mb_diag_banner("snapshot pool exhausted");
-		mb_diag("[epoch] no pre-image for a written page: a reverse delta would carry zeros\n");
-		p->epoch_snap_kind = MB_SNAP_ZERO;
-		return;
-	}
-	memcpy(p->epoch_snap, (const void *)maddr, MB_PAGESIZE);
-	p->epoch_snap_kind = MB_SNAP_DATA;
+	bits_set(b->epoch_bits, pi);
+	b->epoch_ndirty++;
 }
 
 /* ---- construction ---- */
@@ -176,6 +221,17 @@ mb_block *mb_block_new(mb_range addr) {
 	if (!b) return NULL;
 	b->npages = addr.size >> MB_PAGESHIFT;
 	b->pages = (mb_page *)calloc(b->npages, sizeof(mb_page));
+	b->nwords = (b->npages + 63) / 64;
+	b->epoch_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
+	b->stat_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
+	b->unheld_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
+	b->epoch_status = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
+	b->stack_lo = 1; b->stack_hi = 0;   /* hi < lo: no stack yet */
+	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->epoch_status) {
+		free(b->pages); free(b->epoch_bits); free(b->stat_bits);
+		free(b->unheld_bits); free(b->epoch_status); free(b);
+		return NULL;
+	}
 	b->addr = addr;
 	for (size_t i = 0; i < b->npages; i++) {
 		b->pages[i].status = MB_ST_FREE;
@@ -264,9 +320,11 @@ void mb_block_free(mb_block *b) {
 	mb_pal_close_handle(b->handle);
 	for (size_t i = 0; i < b->npages; i++) {
 		snap_release(b->pages[i].snap_data);
-		if (b->pages[i].epoch_snap_kind == MB_SNAP_DATA) snap_release(b->pages[i].epoch_snap);
 	}
 	free(b->epoch_status);
+	free(b->epoch_bits);
+	free(b->stat_bits);
+	free(b->unheld_bits);
 	free(b->pages);
 	free(b);
 }
@@ -283,6 +341,7 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 		mb_range r = { b->addr.start + (i << MB_PAGESHIFT), (j - i) << MB_PAGESHIFT };
 		if (prot != MB_PROT_NONE) ensure_committed(b, i, j - i);
 		mb_pal_protect(r, prot);
+		for (size_t k = i; k < j; k++) note_prot(b, k, prot);
 		i = j;
 	}
 }
@@ -300,8 +359,6 @@ static size_t validate(mb_block *b, mb_range addr, size_t *pcount) {
 	*pcount = addr.size >> MB_PAGESHIFT;
 	return (addr.start - b->addr.start) >> MB_PAGESHIFT;
 }
-
-static bool epoch_tracks(const mb_page *p);
 
 /* A page whose ALLOCATION changes inside an epoch has to enter that epoch's
  * delta exactly as a written one does.
@@ -328,25 +385,31 @@ static bool epoch_tracks(const mb_page *p);
  * real bytes that nothing else will copy, so they are copied here. */
 static void epoch_note_status_change(mb_block *b, size_t i, uint8_t to) {
 	mb_page *p = &b->pages[i];
-	if (!b->epoch_active || p->invisible || p->status == to) return;
+	if (!b->epoch_active || p->status == to) return;
+	/* The allocation map's half of the delta. Recorded as it happens rather
+	 * than found by comparing the whole map against a copy of it taken when the
+	 * epoch opened - that copy was half a megabyte a frame on a big machine,
+	 * and the comparison was another pass over every page there is. */
+	if (!bits_get(b->stat_bits, i)) {
+		bits_set(b->stat_bits, i);
+		b->epoch_status[i] = p->status;
+		b->epoch_nstat++;
+	}
+	if (p->invisible) return;
 	if (epoch_tracks(p)) {
-		mb_page_epoch_capture(p, mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
+		mb_block_epoch_capture(b, i, mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
 		return;
 	}
 	if (p->epoch_dirty) return;              /* already spoken for this epoch */
 	p->epoch_dirty = true;
-	if (p->epoch_snap_kind != MB_SNAP_NONE) return;
-	if (p->status == MB_ST_FREE || p->uncommitted) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
-	p->epoch_snap = snap_alloc();
-	if (!p->epoch_snap) { p->epoch_snap_kind = MB_SNAP_ZERO; return; }
-	memcpy(p->epoch_snap, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
-	p->epoch_snap_kind = MB_SNAP_DATA;
+	bits_set(b->epoch_bits, i);
+	b->epoch_ndirty++;
 }
 
 /* apply a uniform status to a page range and refresh */
 static void set_protections(mb_block *b, size_t pstart, size_t pcount, uint8_t status) {
 	for (size_t i = pstart; i < pstart + pcount; i++) epoch_note_status_change(b, i, status);
-	for (size_t i = pstart; i < pstart + pcount; i++) b->pages[i].status = status;
+	for (size_t i = pstart; i < pstart + pcount; i++) note_status(b, i, status);
 	refresh_range(b, pstart, pcount);
 #ifdef _WIN32
 	/* On Windows a guard-page (RWStack) write clears the guard bit before we can
@@ -362,14 +425,15 @@ static void set_protections(mb_block *b, size_t pstart, size_t pcount, uint8_t s
  * on Linux (RWStack goes through the fault handler). */
 static void get_stack_dirty(mb_block *b) {
 #ifdef _WIN32
-	if (!b->swapped_in) return;
-	uintptr_t start = b->addr.start;
-	size_t pi = 0;
-	while (start < mb_range_end(b->addr)) {
+	if (!b->swapped_in || b->stack_hi < b->stack_lo) return;
+	size_t pi = b->stack_lo;
+	uintptr_t start = b->addr.start + (pi << MB_PAGESHIFT);
+	const uintptr_t stop = b->addr.start + ((b->stack_hi + 1) << MB_PAGESHIFT);
+	while (start < stop) {
 		if (!b->pages[pi].dirty && b->pages[pi].status == MB_ST_RWSTACK) {
 			uintptr_t size; bool dirty;
 			if (mb_pal_get_stack_dirty(start, &size, &dirty) != 0) { pi++; start += MB_PAGESIZE; continue; }
-			while (size > 0 && start < mb_range_end(b->addr)) {
+			while (size > 0 && start < stop) {
 				if (dirty && b->pages[pi].status == MB_ST_RWSTACK) b->pages[pi].dirty = true;
 				size -= size < MB_PAGESIZE ? size : MB_PAGESIZE;
 				start += MB_PAGESIZE; pi++;
@@ -735,7 +799,7 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 			}
 			p->dirty = new_d;
 		}
-		p->status = statii[i];
+		note_status(b, i, statii[i]);
 		if (mb_page_native_prot(p) != prot_before) {
 			if (run_start == (size_t)-1) run_start = i;
 			run_end = i;
@@ -755,17 +819,27 @@ static const char DELTA_MAGIC[] = "MiniBoxDelta1";
 
 /* Forget what an epoch knew about one page, returning its pre-image. */
 static void epoch_clear_page(mb_page *p) {
-	if (p->epoch_snap_kind == MB_SNAP_DATA) snap_release(p->epoch_snap);
-	p->epoch_snap = NULL;
-	p->epoch_snap_kind = MB_SNAP_NONE;
 	p->epoch_dirty = false;
 	p->epoch_hold = false;
 }
 
+/* Forgets the whole of the last epoch, visiting only the pages it touched. */
+static void epoch_forget(mb_block *b) {
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->epoch_bits[w];
+		while (m) {
+			epoch_clear_page(&b->pages[(w << 6) + (size_t)bits_first(m)]);
+			m &= m - 1;
+		}
+	}
+	bits_none(b, b->epoch_bits);
+	bits_none(b, b->stat_bits);
+	b->epoch_ndirty = 0;
+	b->epoch_nstat = 0;
+}
+
 void mb_block_epoch_clear(mb_block *b) {
-	for (size_t i = 0; i < b->npages; i++) epoch_clear_page(&b->pages[i]);
-	free(b->epoch_status);
-	b->epoch_status = NULL;
+	epoch_forget(b);
 	b->epoch_active = false;
 }
 
@@ -777,111 +851,106 @@ static bool epoch_tracks(const mb_page *p) {
 		&& (p->status == MB_ST_RW || p->status == MB_ST_RWX || p->status == MB_ST_RWSTACK);
 }
 
+/* Opens an epoch: from here, what changed is answerable per frame.
+ *
+ * Two things have to happen and neither may walk the arena. The last epoch's
+ * per-page state is forgotten, which touches only the pages it wrote. And the
+ * pages that are mapped WRITABLE are protected again so their next write
+ * faults - which is only ever the pages written since the last epoch opened,
+ * because everything else is still protected from that one. The old version
+ * set a flag on every tracked page and then re-protected every page that had
+ * ever been written, both proportional to the arena and most of the cost of a
+ * captured frame.
+ *
+ * A clean page needs neither: it is already read-only for the baseline's sake,
+ * its write already faults, and that fault records the epoch's pre-image too.
+ * The hold exists only to make a DIRTY page - one already mapped writable -
+ * fault once more. */
 int mb_block_epoch_begin(mb_block *b) {
 	if (!b->sealed) return -EINVAL;
 	get_stack_dirty(b);
+	epoch_forget(b);
+	b->epoch_active = true;   /* before the refresh below: it reads the holds */
 
-	uint8_t *status = (uint8_t *)malloc(b->npages ? b->npages : 1);
-	if (!status) return -ENOMEM;
-
-	for (size_t i = 0; i < b->npages; i++) {
-		mb_page *p = &b->pages[i];
-		epoch_clear_page(p);
-		status[i] = p->status;
-		if (!epoch_tracks(p)) continue;
+	size_t run_start = (size_t)-1, run_last = 0;
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->unheld_bits[w];
+		if (!m) continue;
+		/* Taken now, because refreshing a run below re-records what it applied
+		 * and may legitimately set bits in this word again. */
+		b->unheld_bits[w] = 0;
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			mb_page *p = &b->pages[i];
+			if (epoch_tracks(p)) {
 #ifdef _WIN32
-		/* A guard-page stack write clears the guard bit before anything can
-		 * observe which page it was, so the hold cannot be re-armed reliably.
-		 * Take these eagerly instead: always in the delta, pre-image copied
-		 * now. Stacks are usually invisible and so never reach here at all. */
-		if (p->status == MB_ST_RWSTACK) {
-			p->epoch_dirty = true;
-			if (!p->uncommitted) {
-				ensure_committed(b, i, 1);
-				p->epoch_snap = snap_alloc();
-				if (p->epoch_snap) {
-					memcpy(p->epoch_snap, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
-					p->epoch_snap_kind = MB_SNAP_DATA;
-				} else {
-					p->epoch_snap_kind = MB_SNAP_ZERO;
+				/* A guard-page stack write clears the guard bit before anything
+				 * can observe which page it was, so the hold cannot be re-armed
+				 * reliably. Take these eagerly instead: always in the delta,
+				 * pre-image copied now. Stacks are usually invisible and so
+				 * never reach here at all. */
+				if (p->status == MB_ST_RWSTACK) {
+					p->epoch_dirty = true;
+					bits_set(b->epoch_bits, i);
+					b->epoch_ndirty++;
+					continue;
 				}
-			} else {
-				p->epoch_snap_kind = MB_SNAP_ZERO;
-			}
-			continue;
-		}
 #endif
-		p->epoch_hold = true;
-	}
-
-	free(b->epoch_status);
-	b->epoch_status = status;
-	b->epoch_active = true;
-
-	/* The holds only mean anything once the pages are actually protected - but
-	 * only the pages whose protection CHANGES need a syscall, and only a page
-	 * that was dirty (so mapped writable) changes when it is held. Walking the
-	 * whole arena instead costs a pass over every page in the layout on every
-	 * epoch, which on a 2GB machine is half a million of them and was most of
-	 * the cost when this was measured. Refresh the maximal runs that moved, the
-	 * same way loading a state does. */
-	size_t run_start = (size_t)-1;
-	for (size_t i = 0; i < b->npages; i++) {
-		bool moved = b->pages[i].epoch_hold && b->pages[i].dirty;
-		if (moved) {
-			if (run_start == (size_t)-1) run_start = i;
-		} else if (run_start != (size_t)-1) {
-			refresh_range(b, run_start, i - run_start);
-			run_start = (size_t)-1;
+				p->epoch_hold = true;
+			}
+			/* maximal runs, so the syscalls are as few as the pages allow */
+			if (run_start == (size_t)-1) { run_start = run_last = i; }
+			else if (i == run_last + 1) { run_last = i; }
+			else { refresh_range(b, run_start, run_last - run_start + 1); run_start = run_last = i; }
 		}
 	}
-	if (run_start != (size_t)-1) refresh_range(b, run_start, b->npages - run_start);
+	if (run_start != (size_t)-1) refresh_range(b, run_start, run_last - run_start + 1);
 	return 0;
 }
 
-size_t mb_block_epoch_page_count(const mb_block *b) {
-	size_t n = 0;
-	for (size_t i = 0; i < b->npages; i++) if (b->pages[i].epoch_dirty) n++;
-	return n;
-}
+size_t mb_block_epoch_page_count(const mb_block *b) { return b->epoch_ndirty; }
 
 int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) {
 	if (!b->epoch_active) return -EINVAL;
 	get_stack_dirty(b);
 
 	/* What the allocation map did, so applying a delta lands on the same shape
-	 * of machine and not merely the same bytes. Forward carries where it ended,
-	 * reverse where it began. */
-	uint64_t nstatus = 0;
-	for (size_t i = 0; i < b->npages; i++)
-		if (b->pages[i].status != b->epoch_status[i]) nstatus++;
+	 * of machine and not merely the same bytes. */
+	/* Forwards only. A delta used to be saveable backwards as well, so that a
+	 * frontend could step back a frame by undoing it; keeping that possible
+	 * meant copying every page a frame wrote, inside the fault handler, for
+	 * every frame - and nothing asked, because a frame is reached by loading an
+	 * anchor and applying the deltas since it. Refused rather than quietly
+	 * answered with zeros. */
+	if (!forward) return -ENOTSUP;
 
-	uint64_t npages64 = b->npages, ndata = mb_block_epoch_page_count(b);
+	uint64_t nstatus = b->epoch_nstat;
+	uint64_t npages64 = b->npages, ndata = b->epoch_ndirty;
 	if (wr(w, ud, DELTA_MAGIC, sizeof(DELTA_MAGIC) - 1)) return -EIO;
 	if (wr(w, ud, &npages64, sizeof(npages64))) return -EIO;
 	if (wr(w, ud, &nstatus, sizeof(nstatus))) return -EIO;
-	for (size_t i = 0; i < b->npages; i++) {
-		if (b->pages[i].status == b->epoch_status[i]) continue;
-		uint64_t idx = i;
-		uint8_t s = forward ? b->pages[i].status : b->epoch_status[i];
-		if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, &s, 1)) return -EIO;
+	for (size_t bw = 0; bw < b->nwords; bw++) {
+		uint64_t m = b->stat_bits[bw];
+		while (m) {
+			size_t i = (bw << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			uint64_t idx = i;
+			uint8_t st = b->pages[i].status;
+			if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, &st, 1)) return -EIO;
+		}
 	}
 
 	if (wr(w, ud, &ndata, sizeof(ndata))) return -EIO;
-	static const uint8_t zero[MB_PAGESIZE] = { 0 };
-	for (size_t i = 0; i < b->npages; i++) {
-		mb_page *p = &b->pages[i];
-		if (!p->epoch_dirty) continue;
-		uint64_t idx = i;
-		if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
-		if (forward) {
-			/* as it is now: the live page */
-			ensure_committed(b, i, 1);
+	for (size_t bw = 0; bw < b->nwords; bw++) {
+		uint64_t m = b->epoch_bits[bw];
+		while (m) {
+			size_t i = (bw << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			uint64_t idx = i;
+			if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
+			ensure_committed(b, i, 1);   /* the live page, as the frame left it */
 			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
-		} else {
-			/* as it was: what the fault captured before the first write */
-			const void *src = p->epoch_snap_kind == MB_SNAP_DATA ? (const void *)p->epoch_snap : (const void *)zero;
-			if (wr(w, ud, src, MB_PAGESIZE)) return -EIO;
 		}
 	}
 	return 0;
@@ -1010,7 +1079,7 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		uint64_t idx = 0; uint8_t s = 0;
 		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) return -EIO;
 		if (idx >= b->npages) return -EINVAL;
-		b->pages[idx].status = s;
+		note_status(b, (size_t)idx, s);
 	}
 
 	if (rd(r, ud, &ndata, sizeof(ndata))) return -EIO;

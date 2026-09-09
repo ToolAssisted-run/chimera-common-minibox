@@ -87,26 +87,25 @@ static void test_forward_delta_reproduces(void) {
 	mb_block_free(b);
 }
 
-/* A reverse delta carries it back - this is what stepping back a frame is. */
-static void test_reverse_delta_returns(void) {
-	const uintptr_t SIZE = 0x20000;
-	mb_block *b = sealed(SIZE);
-	for (uintptr_t i = 0; i < SIZE; i += 0x1000) gp(b, i)[0] = (uint8_t)(i >> 12);
-
+/* Backwards is not offered. A frame is reached by loading an anchor and
+ * applying the deltas since it, and keeping the other direction possible cost a
+ * page copy in the fault handler for every page every frame. Refused outright,
+ * because a delta answered with zeros would wipe memory the machine needs. */
+static void test_reverse_delta_is_refused(void) {
+	mb_block *b = sealed(0x20000);
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
-	uint8_t *before = snapshot(b, SIZE);
-
-	gp(b, 0x2000)[0] = 0xAA;
-	gp(b, 0x7000)[9] = 0xCC;
+	gp(b, 0x2000)[0] = 9;
 
 	membuf rev = { 0 };
-	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
-	CHECK(memcmp((const void *)b->addr.start, before, SIZE) != 0);
-	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
-	CHECK(memcmp((const void *)b->addr.start, before, SIZE) == 0);
+	CHECK(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev) != 0);
+	CHECK_EQ(rev.len, 0);
 
-	membuf_free(&rev);
-	free(before);
+	/* and forwards still works from the same epoch */
+	membuf fwd = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
+	CHECK(fwd.len > 0);
+
+	membuf_free(&rev); membuf_free(&fwd);
 	mb_block_free(b);
 }
 
@@ -150,22 +149,24 @@ static void test_delta_carries_allocation(void) {
 	CHECK_EQ(mb_block_munmap(b, gone), 0);
 	CHECK_EQ(mb_block_page_info(b, 4) & 0x3f, 0);   /* free */
 
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
 	CHECK_EQ(mb_block_mmap_fixed(b, gone, MB_PROT_RW, false), 0);
 	CHECK(((mb_block_page_info(b, 4) & 0x3f) != 0));
 
-	membuf fwd = { 0 }, rev = { 0 };
+	membuf fwd = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
-	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
 
-	/* the reverse delta takes the mapping away again */
-	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
+	/* rebuild the frame the way a seek does: back to the anchor, then forward */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
 	CHECK_EQ(mb_block_page_info(b, 4) & 0x3f, 0);
-	/* and the forward one brings it back */
 	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
 	CHECK(((mb_block_page_info(b, 4) & 0x3f) != 0));
 
-	membuf_free(&fwd); membuf_free(&rev);
+	membuf_free(&fwd); membuf_free(&anchor);
 	mb_block_free(b);
 }
 
@@ -181,6 +182,9 @@ static void test_delta_carries_remapped_contents(void) {
 	for (uintptr_t i = 0; i < SIZE; i += 0x1000)
 		memset((void *)(b->addr.start + i), (uint8_t)(i >> 12), 0x1000);
 
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
 	uint8_t *before = snapshot(b, SIZE);
 
@@ -191,23 +195,23 @@ static void test_delta_carries_remapped_contents(void) {
 	uint8_t *after = snapshot(b, SIZE);
 	CHECK(memcmp(before, after, SIZE) != 0);
 
-	membuf fwd = { 0 }, rev = { 0 };
+	membuf fwd = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
-	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
 
-	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
 	CHECK(memcmp((const void *)b->addr.start, before, SIZE) == 0);
 	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
 	CHECK(memcmp((const void *)b->addr.start, after, SIZE) == 0);
 
-	membuf_free(&fwd); membuf_free(&rev);
+	membuf_free(&fwd); membuf_free(&anchor);
 	free(before); free(after);
 	mb_block_free(b);
 }
 
-/* The other direction: a page that was FREE when the epoch began and is handed
- * to the guest during it. Its pre-image is zero - a free page cannot be read -
- * and its forward contents are whatever the guest just put there. */
+/* The other case: a page that was FREE when the epoch began and is handed to
+ * the guest during it. Its contents are whatever the guest just put there, and
+ * the delta owes them even though nothing faulted to say so. */
 static void test_delta_carries_freshly_mapped_contents(void) {
 	const uintptr_t SIZE = 0x20000;
 	mb_block *b = sealed(SIZE);
@@ -216,23 +220,26 @@ static void test_delta_carries_freshly_mapped_contents(void) {
 	mb_range page = { b->addr.start + 0x6000, 0x1000 };
 	CHECK_EQ(mb_block_munmap(b, page), 0);
 
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
 	CHECK_EQ(mb_block_mmap_fixed(b, page, MB_PROT_RW, false), 0);
 	memset((void *)page.start, 0x5A, 0x1000);
 	uint8_t *after = snapshot(b, SIZE);
 
-	membuf fwd = { 0 }, rev = { 0 };
+	membuf fwd = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
-	CHECK_EQ(mb_block_delta_save(b, false, membuf_write, (uintptr_t)&rev), 0);
 
 	/* back to free, then forward again: the bytes have to come with it */
-	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&rev), 0);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
 	CHECK_EQ(mb_block_page_info(b, 6) & 0x3f, 0);
 	memset((void *)(b->addr.start + 0x7000), 0x11, 0x1000);   /* churn around it */
 	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
 	CHECK(memcmp((const void *)page.start, (const uint8_t *)after + 0x6000, 0x1000) == 0);
 
-	membuf_free(&fwd); membuf_free(&rev);
+	membuf_free(&fwd); membuf_free(&anchor);
 	free(after);
 	mb_block_free(b);
 }
@@ -492,7 +499,7 @@ static void test_compose_refuses_a_foreign_delta(void) {
 static void run_all(void) {
 	test_epoch_tracks_what_changed();
 	test_forward_delta_reproduces();
-	test_reverse_delta_returns();
+	test_reverse_delta_is_refused();
 	test_delta_chain_equals_the_run();
 	test_delta_carries_allocation();
 	test_delta_carries_remapped_contents();

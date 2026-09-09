@@ -163,11 +163,14 @@ static bool trip(uintptr_t addr) {
 	/* Order matters: the epoch wants what the page held before THIS write, and
 	 * so does the baseline the first time round. Both read the same bytes, so
 	 * both must run before the write is let through. */
-	mb_page_epoch_capture(p, mirror_of(b, page_start));
+	mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
 	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
 	p->dirty = true;
 	mb_range r = { page_start, MB_PAGESIZE };
 	if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
+	/* It is writable from here, so the next epoch has to hold it again. Only a
+	 * bit: this is a signal handler. */
+	mb_block_note_unheld(b, pi);
 	return true;
 }
 
