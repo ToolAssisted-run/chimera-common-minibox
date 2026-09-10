@@ -37,6 +37,7 @@ static void test_revert_after_save(void) {
 	CHECK_EQ(gp(b, 0x3abc)[0], 0xBB);
 	CHECK_EQ(gp(b, 0x8000)[0], (uint8_t)(0x8000 * 7 + 1));  /* reverted to baseline */
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -59,6 +60,7 @@ static void test_invisible_excluded(void) {
 	CHECK_EQ(gp(b, 0x1000)[0], 0x55);   /* normal page reverted */
 	CHECK_EQ(gp(b, 0x9000)[0], 0x88);   /* invisible page NOT reverted */
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -75,6 +77,7 @@ static void test_zerofilled_baseline(void) {
 	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&st), 0);
 	CHECK_EQ(gp(b, 0x100)[0], 0);   /* reverted to zero baseline */
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -92,6 +95,7 @@ static void test_repeated_roundtrip(void) {
 		CHECK_EQ(gp(b, 0x10)[0], 0xAB);
 	}
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -101,6 +105,7 @@ static void test_save_before_seal(void) {
 	membuf st = {0};
 	CHECK(mb_block_save_state(b, membuf_write, (uintptr_t)&st) != 0);
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -137,6 +142,7 @@ static void test_foreign_state_refused(void) {
 	CHECK_EQ(gp(b, 0x0010)[0], (uint8_t)(0x0010 * 11 + 3));
 
 	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 

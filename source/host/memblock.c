@@ -80,6 +80,9 @@ static uint8_t prot_status(mb_prot prot) {
  * that; it asks for them with MAP_STACK now. */
 mb_prot mb_page_native_prot(const mb_page *p) {
 	if (p->status == MB_ST_FREE) return MB_PROT_NONE;
+	/* A hot page is never held: it is written every frame, so the fault a
+	 * hold buys would come every frame too. It is compared instead (page_heat). */
+	if (p->hot) return status_prot(p->status);
 	/* An open epoch holds a page read-only until it is written, exactly as the
 	 * baseline tracking does - so one page can be held for either reason, and
 	 * the fault that lifts the hold serves both. */
@@ -194,7 +197,8 @@ static inline void bits_none(mb_block *b, uint64_t *w) { memset(w, 0, b->nwords 
  * so the bitmap cannot drift from what the OS was actually told. */
 static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 	bool writable = prot == MB_PROT_RW || prot == MB_PROT_RWX || prot == MB_PROT_RWSTACK;
-	if (writable) bits_set(b->unheld_bits, i);
+	/* a hot page is writable and is never to be held, so it is not "unheld" */
+	if (writable && !b->pages[i].hot) bits_set(b->unheld_bits, i);
 	else bits_clr(b->unheld_bits, i);
 }
 
@@ -202,16 +206,147 @@ void mb_block_note_unheld(mb_block *b, size_t pi) { bits_set(b->unheld_bits, pi)
 
 /* Membership of the stack set, which only Windows uses (mb_page_native_prot):
  * a page that stops being a stack gives its shadow back. */
+static void page_cool(mb_block *b, size_t i);
+
 static void note_status(mb_block *b, size_t i, uint8_t status) {
+	/* an allocation that moves is a different page, whatever it held */
+	if (b->pages[i].hot && b->pages[i].status != status) page_cool(b, i);
 	b->pages[i].status = status;
+	b->status_map[i] = status;
 #ifdef _WIN32
 	if (status == MB_ST_RWSTACK) { bits_set(b->stack_bits, i); return; }
 	if (bits_get(b->stack_bits, i)) {
 		bits_clr(b->stack_bits, i);
-		snap_release(b->pages[i].stack_shadow);
-		b->pages[i].stack_shadow = NULL;
+		snap_release(b->pages[i].shadow);
+		b->pages[i].shadow = NULL;
 	}
 #endif
+}
+
+static inline void set_dirty(mb_block *b, size_t i, bool dirty) {
+	b->pages[i].dirty = dirty;
+	b->dirty_map[i] = dirty;
+}
+
+void mb_block_note_dirty(mb_block *b, size_t pi, bool dirty) { set_dirty(b, pi, dirty); }
+
+bool mb_block_maps_consistent(const mb_block *b) {
+	size_t hot = 0;
+	for (size_t i = 0; i < b->npages; i++) {
+		const mb_page *p = &b->pages[i];
+		if (b->status_map[i] != p->status || b->dirty_map[i] != (uint8_t)p->dirty) return false;
+		if (p->hot != bits_get(b->hot_bits, i)) return false;
+		if (p->hot && (!p->dirty || p->shadow == NULL || bits_get(b->unheld_bits, i))) return false;
+		if (!p->hot && p->shadow != NULL && p->status != MB_ST_RWSTACK) return false;
+		hot += p->hot;
+	}
+	return hot == b->nhot;
+}
+
+/* ---- hot pages -------------------------------------------------------------
+ *
+ * Every write a delta reports costs a fault: the page is read-only until the
+ * guest touches it, the handler marks it and makes it writable, and the next
+ * epoch protects it again so that the same can happen next frame. That is the
+ * right price for a page the machine writes now and then. It is the wrong
+ * price for the pages it writes EVERY frame - a framebuffer, the audio ring,
+ * the CPU's own registers - which pay a fault and a re-protection each, per
+ * frame, forever, to report what was already known. Measured on ares' N64: a
+ * frame writes some three hundred pages, most of them the same three hundred
+ * as last frame, and the faults were two thirds of what capturing it cost.
+ *
+ * So a page written a few frames in a row goes hot: it stays writable, and
+ * what it did is found by comparing it with a copy taken when the epoch
+ * opened. Copying and comparing four kilobytes is a fraction of a microsecond;
+ * a fault is several. A hot page that stops changing cools after a few frames
+ * and is held again like any other. The comparison is also exact where the
+ * fault is not: a page written with the bytes it already held is left out of
+ * the delta, which is memory the fault could never save.
+ *
+ * The invariant is that a hot page's shadow is the page as the epoch opened.
+ * Opening an epoch copies every hot page - nothing here can know whether the
+ * guest ran since the last delta was saved - and the two operations that
+ * rewrite pages from outside the guest, a state loaded and a delta applied,
+ * refresh the copy or cool the page as they go. A page whose allocation
+ * changes cools (note_status); so does one a state load makes clean, because
+ * a clean page is held for the baseline's sake. Windows stacks are never hot:
+ * they have a shadow of their own already, kept against the sealed baseline. */
+#define HOT_AFTER   3       /* frames written in a row before a page goes hot */
+#define COLD_AFTER  8       /* frames unchanged in a row before it cools */
+#define HOT_MOST    32768   /* pages - 128MB of shadows - a cap, not a target */
+
+static void page_cool(mb_block *b, size_t i) {
+	mb_page *p = &b->pages[i];
+	if (!p->hot) return;
+	p->hot = false;
+	p->heat = 0;
+	snap_release(p->shadow);
+	p->shadow = NULL;
+	bits_clr(b->hot_bits, i);
+	b->nhot--;
+	/* it is mapped writable - a hot page always is - so the next epoch owes it
+	 * a hold, exactly as if a fault had just let a write through */
+	bits_set(b->unheld_bits, i);
+}
+
+/* A page that has earned it, if it may: tracked, dirty (a written page always
+ * is), mapped writable right now (unheld: a hot page stays as it is mapped),
+ * and not a stack. */
+static void page_heat(mb_block *b, size_t i) {
+	mb_page *p = &b->pages[i];
+	if (p->hot || p->invisible || p->uncommitted || !p->dirty) return;
+	if (p->status != MB_ST_RW && p->status != MB_ST_RWX) return;
+	if (!bits_get(b->unheld_bits, i) || b->nhot >= HOT_MOST) return;
+	uint8_t *shadow = snap_alloc();
+	if (!shadow) return;
+	memcpy(shadow, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+	p->shadow = shadow;
+	p->hot = true;
+	p->heat = 0;
+	bits_set(b->hot_bits, i);
+	bits_clr(b->unheld_bits, i);
+	b->nhot++;
+}
+
+/* What the hot pages did this epoch, by looking. */
+static void get_hot_epoch(mb_block *b) {
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->hot_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			mb_page *p = &b->pages[i];
+			const void *live = (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+			if (memcmp(live, p->shadow, MB_PAGESIZE) == 0) {
+				if (++p->heat >= COLD_AFTER) page_cool(b, i);
+				continue;
+			}
+			p->heat = 0;
+			if (p->epoch_dirty) continue;
+			p->epoch_dirty = true;
+			bits_set(b->epoch_bits, i);
+			b->epoch_ndirty++;
+		}
+	}
+}
+
+/* Pages written this frame that were written last frame too are on their way
+ * to hot. Runs after the delta is out, so the shadow a promotion takes is the
+ * page as the delta left it. */
+static void heat_written_pages(mb_block *b) {
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->epoch_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			mb_page *p = &b->pages[i];
+			if (p->hot) continue;
+			if (p->seen == (uint16_t)(b->epoch_no - 1)) { if (p->heat < 255) p->heat++; }
+			else p->heat = 1;
+			p->seen = b->epoch_no;
+			if (p->heat >= HOT_AFTER) page_heat(b, i);
+		}
+	}
 }
 
 /* The epoch's half of the same fault: this page has been written, so the frame
@@ -252,10 +387,15 @@ mb_block *mb_block_new(mb_range addr) {
 	b->stat_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->unheld_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->stack_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
+	b->hot_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->epoch_status = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
-	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->stack_bits || !b->epoch_status) {
+	b->status_map = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
+	b->dirty_map = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
+	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->stack_bits || !b->hot_bits
+		|| !b->epoch_status || !b->status_map || !b->dirty_map) {
 		free(b->pages); free(b->epoch_bits); free(b->stat_bits);
-		free(b->unheld_bits); free(b->stack_bits); free(b->epoch_status); free(b);
+		free(b->unheld_bits); free(b->stack_bits); free(b->hot_bits); free(b->epoch_status);
+		free(b->status_map); free(b->dirty_map); free(b);
 		return NULL;
 	}
 	b->addr = addr;
@@ -346,13 +486,16 @@ void mb_block_free(mb_block *b) {
 	mb_pal_close_handle(b->handle);
 	for (size_t i = 0; i < b->npages; i++) {
 		snap_release(b->pages[i].snap_data);
-		snap_release(b->pages[i].stack_shadow);
+		snap_release(b->pages[i].shadow);
 	}
 	free(b->epoch_status);
 	free(b->epoch_bits);
 	free(b->stat_bits);
 	free(b->unheld_bits);
 	free(b->stack_bits);
+	free(b->hot_bits);
+	free(b->status_map);
+	free(b->dirty_map);
 	free(b->pages);
 	free(b);
 }
@@ -375,6 +518,27 @@ static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 }
 
 static void refresh_all(mb_block *b) { refresh_range(b, 0, b->npages); }
+
+/* Pages whose protection an operation changed, refreshed as runs.
+ *
+ * A delta's lists come in ascending page order, so consecutive changed pages
+ * make one run and the first page that is skipped - or whose protection did
+ * not change - closes it. A page whose protection did NOT change is not
+ * refreshed at all: the OS already has what mb_page_native_prot says, which
+ * is the same invariant load_state relies on. */
+typedef struct { size_t start, last; bool open; } prot_run;
+
+static void run_note(mb_block *b, prot_run *run, size_t i) {
+	if (run->open && i == run->last + 1) { run->last = i; return; }
+	if (run->open) refresh_range(b, run->start, run->last - run->start + 1);
+	run->start = run->last = i;
+	run->open = true;
+}
+
+static void run_close(mb_block *b, prot_run *run) {
+	if (run->open) refresh_range(b, run->start, run->last - run->start + 1);
+	run->open = false;
+}
 
 /* ---- range validation ---- */
 
@@ -488,8 +652,8 @@ static bool stack_page_is_baseline(const mb_page *p, const void *live) {
 static void stack_dirty_page(mb_block *b, size_t i) {
 	mb_page *p = &b->pages[i];
 	if (p->invisible || p->uncommitted) return;
-	p->dirty = !stack_page_is_baseline(
-		p, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
+	set_dirty(b, i, !stack_page_is_baseline(
+		p, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT))));
 }
 #endif
 
@@ -542,9 +706,9 @@ static void get_stack_epoch(mb_block *b) {
 			const void *live = (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
 			/* No shadow means nothing has ever compared this page - it was
 			 * mapped since - so everything in it is owed. */
-			if (p->stack_shadow && memcmp(live, p->stack_shadow, MB_PAGESIZE) == 0) continue;
-			if (!p->stack_shadow) p->stack_shadow = snap_alloc();
-			if (p->stack_shadow) memcpy(p->stack_shadow, live, MB_PAGESIZE);
+			if (p->shadow && memcmp(live, p->shadow, MB_PAGESIZE) == 0) continue;
+			if (!p->shadow) p->shadow = snap_alloc();
+			if (p->shadow) memcpy(p->shadow, live, MB_PAGESIZE);
 			if (p->epoch_dirty) continue;
 			p->epoch_dirty = true;
 			bits_set(b->epoch_bits, i);
@@ -677,7 +841,7 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 		epoch_note_status_change(b, i, MB_ST_FREE);
 		if (!b->pages[i].uncommitted) memset((void *)maddr, 0, MB_PAGESIZE);
 		/* undirty pages whose sealed baseline was already zero */
-		b->pages[i].dirty = !b->pages[i].invisible && b->pages[i].snap_kind != MB_SNAP_ZERO;
+		set_dirty(b, i, !b->pages[i].invisible && b->pages[i].snap_kind != MB_SNAP_ZERO);
 	}
 	if (advise_only) refresh_range(b, ps, pcount);
 	else set_protections(b, ps, pcount, MB_ST_FREE);
@@ -726,7 +890,7 @@ int mb_block_mark_invisible(mb_block *b, mb_range addr) {
 	if (b->sealed) { fprintf(stderr, "miniBox: mark_invisible after seal\n"); return -EINVAL; }
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
-	for (size_t i = ps; i < ps + pcount; i++) { b->pages[i].dirty = true; b->pages[i].invisible = true; }
+	for (size_t i = ps; i < ps + pcount; i++) { set_dirty(b, i, true); b->pages[i].invisible = true; }
 	refresh_range(b, ps, pcount);
 	return 0;
 }
@@ -736,7 +900,7 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 	mb_range e = mb_range_align_expand(r);
 	size_t pcount, ps = validate(b, e, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
-	for (size_t i = ps; i < ps + pcount; i++) b->pages[i].dirty = true;
+	for (size_t i = ps; i < ps + pcount; i++) { set_dirty(b, i, true); page_cool(b, i); }
 	ensure_committed(b, ps, pcount);
 	memcpy((void *)mirror_addr(b, start), src, len);
 	return 0;
@@ -752,7 +916,8 @@ int mb_block_seal(mb_block *b) {
 	mb_block_epoch_clear(b);
 	for (size_t i = 0; i < b->npages; i++) {
 		if (b->pages[i].dirty && !b->pages[i].invisible) {
-			b->pages[i].dirty = false;
+			page_cool(b, i);
+			set_dirty(b, i, false);
 			snap_release(b->pages[i].snap_data);
 			b->pages[i].snap_data = NULL;
 			b->pages[i].snap_kind = MB_SNAP_NONE; /* live memory is the baseline */
@@ -834,13 +999,8 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	 * marshalled calls per state - which, with rewind taking a state every frame,
 	 * cost more than the emulation itself. The bytes on the wire are unchanged, so
 	 * existing savestates still load (the reader already reads them in bulk). */
-	uint8_t *flags = (uint8_t *)malloc(b->npages);
-	if (!flags) return -ENOMEM;
-	for (size_t i = 0; i < b->npages; i++) flags[i] = b->pages[i].status;
-	if (wr(w, ud, flags, b->npages)) { free(flags); return -EIO; }
-	for (size_t i = 0; i < b->npages; i++) flags[i] = b->pages[i].dirty;
-	if (wr(w, ud, flags, b->npages)) { free(flags); return -EIO; }
-	free(flags);
+	if (wr(w, ud, b->status_map, b->npages)) return -EIO;
+	if (wr(w, ud, b->dirty_map, b->npages)) return -EIO;
 	for (size_t i = 0; i < b->npages; i++) {
 		if (!b->pages[i].invisible && b->pages[i].dirty) {
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
@@ -890,13 +1050,30 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	uint8_t *dirtii = (uint8_t *)malloc(b->npages);
 	if (rd(r, ud, statii, b->npages) || rd(r, ud, dirtii, b->npages)) { free(statii); free(dirtii); return -EIO; }
 
-	/* Re-protecting the whole arena after every load is what made a savestate cost
-	 * time proportional to the DECLARED layout instead of to what actually
-	 * changed: a 272MB layout is 69,632 pages, walked and re-protected per frame
-	 * under rewind or a rerecord replay. Only the pages whose protection actually
-	 * changes need a syscall, so track those and refresh just their runs. */
-	size_t run_start = (size_t)-1, run_end = 0;
-	for (size_t i = 0; i < b->npages; i++) {
+	/* Proportional to what the load CHANGES, not to the arena.
+	 *
+	 * Two things used to be proportional to the arena. Re-protecting every page
+	 * after the load: a 272MB layout is 69,632 pages, walked and re-protected
+	 * per frame under rewind or a rerecord replay, so now only the pages whose
+	 * protection actually changes get a syscall, in runs. And finding those
+	 * pages: the walk that compared the state's maps against the page array
+	 * read forty bytes a page to learn that the page was clean in both and had
+	 * not moved, which on the ares arena was half a million pages and three
+	 * milliseconds an anchor, most of the anchor's cost. The packed maps make
+	 * that comparison a word at a time, so a run of eight such pages costs two
+	 * loads and nothing else. */
+	prot_run run = { 0, 0, false };
+	size_t i = 0;
+	while (i < b->npages) {
+		if ((i & 7) == 0 && i + 8 <= b->npages) {
+			uint64_t ds, dm, ss, sm;
+			memcpy(&ds, dirtii + i, sizeof ds);
+			memcpy(&dm, b->dirty_map + i, sizeof dm);
+			memcpy(&ss, statii + i, sizeof ss);
+			memcpy(&sm, b->status_map + i, sizeof sm);
+			if ((ds | dm) == 0 && ss == sm) { i += 8; continue; }
+		}
+		if (dirtii[i] == 0 && b->dirty_map[i] == 0 && statii[i] == b->status_map[i]) { i++; continue; }
 		mb_page *p = &b->pages[i];
 		mb_prot prot_before = mb_page_native_prot(p);
 		if (!p->invisible) {
@@ -913,18 +1090,19 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 			} else if (old_d && new_d) {
 				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { free(statii); free(dirtii); return -EIO; }
 			}
-			p->dirty = new_d;
+			set_dirty(b, i, new_d);
+			/* a hot page just rewritten keeps its shadow true; one made clean
+			 * cools, because a clean page is held for the baseline's sake */
+			if (p->hot) {
+				if (new_d) memcpy(p->shadow, (const void *)maddr, MB_PAGESIZE);
+				else page_cool(b, i);
+			}
 		}
 		note_status(b, i, statii[i]);
-		if (mb_page_native_prot(p) != prot_before) {
-			if (run_start == (size_t)-1) run_start = i;
-			run_end = i;
-		} else if (run_start != (size_t)-1) {
-			refresh_range(b, run_start, run_end - run_start + 1);
-			run_start = (size_t)-1;
-		}
+		if (mb_page_native_prot(p) != prot_before) run_note(b, &run, i);
+		i++;
 	}
-	if (run_start != (size_t)-1) refresh_range(b, run_start, run_end - run_start + 1);
+	run_close(b, &run);
 	free(statii); free(dirtii);
 	return 0;
 }
@@ -986,6 +1164,16 @@ int mb_block_epoch_begin(mb_block *b) {
 	if (!b->sealed) return -EINVAL;
 	epoch_forget(b);
 	b->epoch_active = true;   /* before the refresh below: it reads the holds */
+	b->epoch_no++;
+	/* the hot pages as this epoch finds them, for the comparison at its end */
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->hot_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			memcpy(b->pages[i].shadow, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+		}
+	}
 
 	size_t run_start = (size_t)-1, run_last = 0;
 	for (size_t w = 0; w < b->nwords; w++) {
@@ -1016,6 +1204,7 @@ size_t mb_block_epoch_page_count(const mb_block *b) { return b->epoch_ndirty; }
 int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) {
 	if (!b->epoch_active) return -EINVAL;
 	get_stack_epoch(b);
+	get_hot_epoch(b);
 
 	/* What the allocation map did, so applying a delta lands on the same shape
 	 * of machine and not merely the same bytes. */
@@ -1055,6 +1244,7 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
 		}
 	}
+	heat_written_pages(b);
 	return 0;
 }
 
@@ -1276,6 +1466,16 @@ done:
 	return rc;
 }
 
+/* Applies one frame's delta on top of the machine as it stands.
+ *
+ * Proportional to the delta, not to the arena. This used to end by
+ * re-protecting every page there is, which on a 2GB arena was half a million
+ * protection lookups and however many syscalls the map coalesced to - measured
+ * at 2.3ms for a delta of sixteen pages, and paid once per delta in a chain, so
+ * a seek that applied thirty of them spent seventy milliseconds refreshing
+ * pages the deltas never mentioned. Only the pages in the two lists can have
+ * changed protection, so only those are looked at, and only the ones whose
+ * protection actually moved are told to the OS. */
 int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
 	char magic[sizeof(DELTA_MAGIC) - 1];
@@ -1286,12 +1486,17 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (rd(r, ud, &npages64, sizeof(npages64))) return -EIO;
 	if (npages64 != b->npages) return -EINVAL;  /* a delta of another machine */
 	if (rd(r, ud, &nstatus, sizeof(nstatus))) return -EIO;
+	prot_run run = { 0, 0, false };
 	for (uint64_t k = 0; k < nstatus; k++) {
 		uint64_t idx = 0; uint8_t s = 0;
 		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) return -EIO;
 		if (idx >= b->npages) return -EINVAL;
+		mb_page *p = &b->pages[idx];
+		const mb_prot before = mb_page_native_prot(p);
 		note_status(b, (size_t)idx, s);
+		if (mb_page_native_prot(p) != before) run_note(b, &run, (size_t)idx);
 	}
+	run_close(b, &run);
 
 	if (rd(r, ud, &ndata, sizeof(ndata))) return -EIO;
 	for (uint64_t k = 0; k < ndata; k++) {
@@ -1299,17 +1504,28 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		if (rd(r, ud, &idx, sizeof(idx))) return -EIO;
 		if (idx >= b->npages) return -EINVAL;
 		mb_page *p = &b->pages[idx];
+		const mb_prot before = mb_page_native_prot(p);
+		const uintptr_t maddr = mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT));
 		ensure_committed(b, (size_t)idx, 1);
-		if (rd(r, ud, (void *)mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
-		/* the content is no longer the baseline's, so a full state must carry
-		 * it; and the epoch that described it has been overtaken */
-		mb_page_maybe_snapshot(p, mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT)));
-		p->dirty = true;
+		/* The baseline copy BEFORE the page is overwritten, as the fault handler
+		 * and load_state take it. Taken after, a page this process had never
+		 * written - one from a history file, applied to a machine that had not
+		 * reached that frame itself - would keep the delta's bytes as its
+		 * baseline, and every later return to a frame where the page was clean
+		 * would put those bytes back instead of the sealed ones. */
+		mb_page_maybe_snapshot(p, maddr);
+		if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) return -EIO;
+		/* the content is no longer the baseline's, so a full state must carry it */
+		set_dirty(b, (size_t)idx, true);
+		if (p->hot) memcpy(p->shadow, (const void *)maddr, MB_PAGESIZE);
+		if (mb_page_native_prot(p) != before) run_note(b, &run, (size_t)idx);
 	}
+	run_close(b, &run);
 
 	/* A delta moves the machine, so whatever epoch was open no longer describes
-	 * anything. The caller opens the next one when it wants it. */
+	 * anything. The caller opens the next one when it wants it. Forgetting it
+	 * touches only the pages it wrote, and none of them changes protection by
+	 * being forgotten: a written page had its hold lifted by the write. */
 	mb_block_epoch_clear(b);
-	refresh_all(b);
 	return 0;
 }

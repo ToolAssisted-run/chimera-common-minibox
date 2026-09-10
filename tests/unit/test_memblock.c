@@ -29,6 +29,7 @@ static void test_dirty_offset(void) {
 	CHECK(!dirty(b, 2));
 	CHECK(!dirty(b, 4));
 	CHECK_EQ(gp(b, 0x3005)[0], 42);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -45,6 +46,7 @@ static void test_mmap_errors(void) {
 	/* out of range -> EINVAL */
 	mb_range oor = { b->addr.start + 0x10000, 0x1000 };
 	CHECK_EQ(mb_block_mmap_fixed(b, oor, MB_PROT_RW, true), -EINVAL);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -60,6 +62,7 @@ static void test_mmap_movable_bestfit(void) {
 	mb_range req = { 0, 0x2000 };   /* want 2 pages -> should land in the 2-page hole */
 	mb_sword got = mb_block_mmap(b, req, MB_PROT_RW, all, false);
 	CHECK_EQ(got, (mb_sword)(b->addr.start + 0x1000));
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -67,6 +70,7 @@ static void test_mprotect_free_enomem(void) {
 	mb_block *b = fresh(0x10000);
 	mb_range one = { b->addr.start + 0x2000, 0x1000 };  /* Free */
 	CHECK_EQ(mb_block_mprotect(b, one, MB_PROT_RW), -ENOMEM);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -85,6 +89,7 @@ static void test_munmap_zeroes(void) {
 	mb_range fr = { b->addr.start + 0x9000, 0x1000 };
 	CHECK_EQ(mb_block_munmap(b, fr), 0);
 	CHECK_EQ(mb_block_munmap(b, fr), -EINVAL);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -97,6 +102,7 @@ static void test_madvise_keeps_allocated(void) {
 	CHECK_EQ(mb_block_madvise_dontneed(b, one), 0);
 	CHECK(!freed(b, 4));            /* still allocated... */
 	CHECK_EQ(gp(b, 0x4000)[0], 0);  /* ...but zeroed */
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -116,6 +122,7 @@ static void test_mremap_inplace(void) {
 	/* shrink: tail becomes free */
 	CHECK_EQ(mb_block_mremap(b, four, 0x2000, (mb_range){0,0}), (mb_sword)b->addr.start);
 	CHECK(freed(b, 3));
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -128,6 +135,7 @@ static void test_invisible(void) {
 	/* mark_invisible after seal -> error */
 	mb_range two = { b->addr.start + 0x8000, 0x1000 };
 	CHECK(mb_block_mark_invisible(b, two) != 0);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -135,6 +143,7 @@ static void test_double_seal(void) {
 	mb_block *b = fresh(0x2000);
 	CHECK_EQ(mb_block_seal(b), 0);
 	CHECK(mb_block_seal(b) != 0);   /* already sealed */
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -147,6 +156,7 @@ static void test_copy_from_external(void) {
 	CHECK_EQ(mb_block_copy_from_external(b, src, b->addr.start + 0x1234, 100), 0);
 	for (int i = 0; i < 100; i++) CHECK_EQ(gp(b, 0x1234 + i)[0], (uint8_t)(i*3+1));
 	CHECK(dirty(b, 1));  /* the touched page is dirty */
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -159,6 +169,7 @@ static void test_page_info_encoding(void) {
 	CHECK_EQ(mb_block_mmap_fixed(b, r2, MB_PROT_R, true), 0);
 	CHECK_EQ(pi(b, 1) & 0x3f, 0x01);   /* R */
 	CHECK_EQ(pi(b, 7) & 0x3f, 0x00);   /* Free */
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -205,6 +216,7 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 
 	CHECK_EQ(got, 0x5aull);   /* the push and pop actually happened */
 	CHECK(dirty(b, 8));       /* and the write is in the state, not lost */
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 

@@ -56,6 +56,7 @@ static void test_epoch_tracks_what_changed(void) {
 	gp(b, 0x1000)[0] = 2;
 	CHECK_EQ(mb_block_epoch_page_count(b), 3);
 
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -84,6 +85,197 @@ static void test_forward_delta_reproduces(void) {
 
 	membuf_free(&fwd);
 	free(before); free(after);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A delta applied to a page THIS process never wrote must not turn the
+ * delta's bytes into the page's baseline.
+ *
+ * The page's sealed content is copied aside the first time it changes, and a
+ * delta from a history file applied to a machine that had not reached that
+ * frame is such a first time. Copied AFTER the delta had overwritten the page,
+ * the copy was the delta's bytes, and every later load of a state in which the
+ * page was clean put those back instead of the sealed ones. The load here is of
+ * the anchor taken before the delta, and it must find the sealed byte. */
+static void test_delta_applied_to_a_clean_page_keeps_the_baseline(void) {
+	const uintptr_t SIZE = 0x8000;
+	mb_block *b = sealed(SIZE);
+	/* the delta is made on one machine ... */
+	mb_block *other = sealed_at(0x37000000000ull, SIZE);
+	gp(other, 0x3000)[0] = 0x11;   /* the sealed byte, on both machines */
+	gp(b, 0x3000)[0] = 0x11;
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+	CHECK_EQ(mb_block_epoch_begin(other), 0);
+	gp(other, 0x3000)[0] = 0x22;
+	membuf fwd = { 0 };
+	CHECK_EQ(mb_block_delta_save(other, true, membuf_write, (uintptr_t)&fwd), 0);
+	/* ... and applied to another that never touched the page since sealing. The
+	 * two machines have the same layout, which is all a delta checks. */
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
+	CHECK_EQ(gp(b, 0x3000)[0], 0x22);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(gp(b, 0x3000)[0], 0x11);
+	membuf_free(&fwd); membuf_free(&anchor);
+	mb_block_free(other);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* After a delta is applied, the pages it brought are watched again: a write
+ * to one of them lands in the next delta. Applying used to re-protect the
+ * whole arena to guarantee that; now only the pages the delta touched are
+ * looked at, and this is what would break if one were missed. */
+static void test_delta_apply_leaves_its_pages_watched(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
+	/* a frame that writes a page and maps a new one */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x4000)[0] = 0xAA;
+	membuf fwd = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
+
+	/* back to the anchor, forward by the delta, then the next frame writes the
+	 * same page again and a page beside it */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x4000)[1] = 0xBB;
+	gp(b, 0x5000)[0] = 0xCC;
+	CHECK_EQ(mb_block_epoch_page_count(b), 2);
+	membuf next = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&next), 0);
+
+	/* and that delta reproduces both writes on a machine that lacks them */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	fwd.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&fwd), 0);
+	CHECK_EQ(gp(b, 0x4000)[1], 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&next), 0);
+	CHECK_EQ(gp(b, 0x4000)[0], 0xAA);
+	CHECK_EQ(gp(b, 0x4000)[1], 0xBB);
+	CHECK_EQ(gp(b, 0x5000)[0], 0xCC);
+	membuf_free(&fwd); membuf_free(&next); membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A page written frame after frame goes hot: it stops faulting, and every
+ * change to it still lands in the delta of the frame that made it. */
+static void test_hot_page_still_reports_every_change(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+	membuf deltas[12];
+	memset(deltas, 0, sizeof deltas);
+	for (int f = 0; f < 12; f++) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		gp(b, 0x4000)[f] = (uint8_t)(f + 1);           /* the hot one */
+		if (f == 5) gp(b, 0x9000)[0] = 0x55;            /* a cold one, once */
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&deltas[f]), 0);
+		CHECK(mb_block_maps_consistent(b));
+	}
+	CHECK(b->pages[4].hot);
+	CHECK(!b->pages[9].hot);
+	uint8_t *end = snapshot(b, SIZE);
+	/* back to the anchor and forward through every delta: the machine the run
+	 * ended on, and the page was in every delta after the hold came off */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(gp(b, 0x4000)[3], 0);
+	for (int f = 0; f < 12; f++) CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&deltas[f]), 0);
+	CHECK(memcmp((const void *)b->addr.start, end, SIZE) == 0);
+	free(end);
+	for (int f = 0; f < 12; f++) membuf_free(&deltas[f]);
+	membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A hot page written with the bytes it already held is not in the delta - the
+ * comparison is exact where a fault is not - and a hot page left alone cools
+ * and is held again, so its next write is caught by a fault as before. */
+static void test_hot_page_cools_and_is_exact(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	for (int f = 0; f < 4; f++) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		gp(b, 0x4000)[0] = (uint8_t)(f + 1);
+		membuf d = { 0 };
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+		membuf_free(&d);
+	}
+	CHECK(b->pages[4].hot);
+	/* written, and written back: nothing to report */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x4000)[0] = 0x77;
+	gp(b, 0x4000)[0] = 4;
+	membuf d = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 0);
+	membuf_free(&d);
+	/* left alone: cools, and its next write faults its way into the delta */
+	int frames = 0;
+	while (b->pages[4].hot && frames < 64) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		membuf e = { 0 };
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&e), 0);
+		membuf_free(&e);
+		frames++;
+	}
+	CHECK(!b->pages[4].hot);
+	CHECK(mb_block_maps_consistent(b));
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x4000)[1] = 0x99;
+	membuf e = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&e), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	membuf_free(&e);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A state loaded over a hot page, or a delta applied to it, leaves the shadow
+ * true: the frame after reports exactly what the guest did and nothing else. */
+static void test_hot_page_survives_a_load(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	membuf anchor = { 0 };
+	for (int f = 0; f < 4; f++) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		gp(b, 0x4000)[0] = (uint8_t)(f + 1);
+		membuf d = { 0 };
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+		membuf_free(&d);
+		if (f == 1) CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+	}
+	CHECK(b->pages[4].hot);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(gp(b, 0x4000)[0], 2);
+	CHECK(b->pages[4].hot);
+	/* the guest writes the value the page held BEFORE the load: a stale shadow
+	 * would call that unchanged */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x4000)[0] = 4;
+	membuf d = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	/* and the delta, applied over the loaded state, lands the write */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d), 0);
+	CHECK_EQ(gp(b, 0x4000)[0], 4);
+	membuf_free(&d); membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -106,6 +298,7 @@ static void test_reverse_delta_is_refused(void) {
 	CHECK(fwd.len > 0);
 
 	membuf_free(&rev); membuf_free(&fwd);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -138,6 +331,7 @@ static void test_delta_chain_equals_the_run(void) {
 
 	for (int s = 0; s < STEPS; s++) { membuf_free(&steps[s]); free(expected[s]); }
 	free(anchor);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -167,6 +361,7 @@ static void test_delta_carries_allocation(void) {
 	CHECK(((mb_block_page_info(b, 4) & 0x3f) != 0));
 
 	membuf_free(&fwd); membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -206,6 +401,7 @@ static void test_delta_carries_remapped_contents(void) {
 
 	membuf_free(&fwd); membuf_free(&anchor);
 	free(before); free(after);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -241,6 +437,7 @@ static void test_delta_carries_freshly_mapped_contents(void) {
 
 	membuf_free(&fwd); membuf_free(&anchor);
 	free(after);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -295,6 +492,7 @@ static void test_delta_zeroes_a_page_the_guest_gave_back(void) {
 
 	membuf_free(&anchor); membuf_free(&d1); membuf_free(&d2);
 	free(live);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -306,6 +504,7 @@ static void test_delta_refusals(void) {
 	gp(b, 0x2000)[0] = 1;
 	membuf d = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 
 	mb_block *other = sealed(0x10000);   /* half the pages */
@@ -327,6 +526,7 @@ static void test_delta_needs_an_epoch(void) {
 	membuf d = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), -EINVAL);
 	membuf_free(&d);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -351,6 +551,7 @@ static void test_full_state_after_delta(void) {
 	CHECK(memcmp((const void *)b->addr.start, expected, SIZE) == 0);
 
 	membuf_free(&fwd); membuf_free(&full); free(expected);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -396,6 +597,7 @@ static void test_compose_equals_applying_both(void) {
 
 	membuf_free(&anchor); membuf_free(&first); membuf_free(&second); membuf_free(&both);
 	free(after);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -437,6 +639,7 @@ static void test_composing_a_chain_down_to_one(void) {
 	CHECK(memcmp((const void *)b->addr.start, after, SIZE) == 0);
 
 	membuf_free(&anchor); membuf_free(&link[0]); free(after);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -473,6 +676,7 @@ static void test_compose_carries_allocation(void) {
 	CHECK_EQ(mb_block_page_info(b, 6) & 0x3f, 0);                    /* the second freed it */
 
 	membuf_free(&anchor); membuf_free(&first); membuf_free(&second); membuf_free(&both);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
@@ -539,12 +743,18 @@ static void test_compose_in_memory_matches_streaming(void) {
 	CHECK(mb_block_delta_compose_mem(d1.buf, d1.len - 1, d2.buf, d2.len, membuf_write, (uintptr_t)&junk, NULL) != 0);
 
 	membuf_free(&d1); membuf_free(&d2); membuf_free(&streamed); membuf_free(&inmem); membuf_free(&junk);
+	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
 
 static void run_all(void) {
 	test_epoch_tracks_what_changed();
 	test_forward_delta_reproduces();
+	test_delta_applied_to_a_clean_page_keeps_the_baseline();
+	test_delta_apply_leaves_its_pages_watched();
+	test_hot_page_still_reports_every_change();
+	test_hot_page_cools_and_is_exact();
+	test_hot_page_survives_a_load();
 	test_reverse_delta_is_refused();
 	test_delta_chain_equals_the_run();
 	test_delta_carries_allocation();

@@ -103,10 +103,19 @@ typedef struct {
 	 * so nothing ever asked. */
 	bool epoch_hold;
 	bool epoch_dirty;
-	/* Windows stacks only (see mb_page_native_prot): the page as the epoch
-	 * found it, because a write to a stack cannot be seen there and has to be
-	 * discovered by comparing bytes. NULL everywhere else. */
-	uint8_t *stack_shadow;
+	/* ---- hot pages (see page_heat in memblock.c) ----
+	 * A page written frame after frame is left writable and compared instead
+	 * of faulted. hot says so; heat counts frames written in a row (while
+	 * cold) or frames unchanged in a row (while hot); seen is the epoch that
+	 * last wrote it, so that "in a row" costs nothing on the frames between. */
+	bool hot;
+	uint8_t heat;
+	uint16_t seen;
+	/* The page as the epoch found it, for a page whose writes nothing reports:
+	 * a hot page on every platform, and a stack on Windows (see
+	 * mb_page_native_prot). What it did is discovered by comparing bytes. NULL
+	 * for everything else. */
+	uint8_t *shadow;
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
@@ -142,9 +151,23 @@ typedef struct mb_block {
 	uint64_t *stat_bits;    /* pages whose status changed during this epoch */
 	uint64_t *unheld_bits;  /* pages mapped writable now: what an epoch must hold */
 	uint64_t *stack_bits;   /* pages that are stacks: Windows compares these by hand */
+	uint64_t *hot_bits;     /* pages that are hot: compared every frame, never held */
+	size_t nhot;            /* set bits in hot_bits */
+	uint16_t epoch_no;      /* counts epochs opened, for mb_page.seen */
 	size_t epoch_ndirty;    /* set bits in epoch_bits */
 	size_t epoch_nstat;     /* set bits in stat_bits */
 	uint8_t *epoch_status;  /* what a stat_bits page's status WAS, npages bytes */
+
+	/* ---- two facts about every page, packed (see mb_block_load_state) ----
+	 *
+	 * Loading a state compares the machine's allocation and dirty maps with the
+	 * state's to find the pages that differ, and the page array is forty bytes a
+	 * page: walking it costs more than the load on a big arena. These are the
+	 * same two facts kept the way a state carries them, one byte a page, so the
+	 * comparison is a word at a time over a megabyte instead of a struct at a
+	 * time over twenty. Written wherever status or dirty is, and nowhere else. */
+	uint8_t *status_map;    /* pages[i].status */
+	uint8_t *dirty_map;     /* pages[i].dirty, as 0 or 1 */
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);
@@ -377,6 +400,10 @@ void    mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t mirror_addr);
 /* One page just became writable, so an epoch has to hold it again next time.
  * Called from the fault handler, which is why it only sets a bit. */
 void    mb_block_note_unheld(mb_block *b, size_t pi);
+/* One page's dirty bit, and the packed copy of it, together. */
+void    mb_block_note_dirty(mb_block *b, size_t pi, bool dirty);
+/* Do the packed maps say what the page array says? For tests. */
+bool    mb_block_maps_consistent(const mb_block *b);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

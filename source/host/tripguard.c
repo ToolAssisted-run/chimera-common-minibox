@@ -165,7 +165,7 @@ static bool trip(uintptr_t addr) {
 	 * both must run before the write is let through. */
 	mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
 	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
-	p->dirty = true;
+	mb_block_note_dirty(b, pi, true);
 	mb_range r = { page_start, MB_PAGESIZE };
 	if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
 	/* It is writable from here, so the next epoch has to hold it again. Only a
