@@ -793,7 +793,11 @@ size_t mb_block_page_len(const mb_block *b) { return b->npages; }
  * has to key them on this and not on the core's name and settings. */
 const uint8_t *mb_block_hash(const mb_block *b) { return b->hash; }
 
-uint8_t mb_block_page_info(const mb_block *b, size_t i) {
+uint8_t mb_block_page_info(mb_block *b, size_t i) {
+	/* A Windows stack reports nothing, so the answer is only true once this has
+	 * looked - and an introspection call that can be stale is worse than a page
+	 * compared. One page, not the whole set. */
+	get_stack_dirty_range(b, i, 1);
 	const mb_page *p = &b->pages[i];
 	uint8_t res = p->status; /* status bytes already match page_info's low bits */
 	if (p->dirty) res |= 0x80;

@@ -164,7 +164,7 @@ int  mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t star
 int  mb_block_seal(mb_block *b);
 
 size_t  mb_block_page_len(const mb_block *b);
-uint8_t mb_block_page_info(const mb_block *b, size_t index);
+uint8_t mb_block_page_info(mb_block *b, size_t index);
 const uint8_t *mb_block_hash(const mb_block *b);  /* 32 bytes; valid once sealed */
 
 /* Savestate (structure per docs/docs/MACHINE-SPEC.md section 6). Return 0 on success. */
