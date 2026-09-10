@@ -14,3 +14,8 @@ tests/conformance/run_guest
 tests/threads/guest_threads.wbx
 tests/threads/run_threads
 tests/**/*.o
+
+# Diagnostics a run writes where it stands (source/host/diag.c). One was
+# committed by accident, so every test run that trips a banner dirtied the
+# tree - and a stray "git add -A" would have published somebody local paths.
+minibox-diag.log
