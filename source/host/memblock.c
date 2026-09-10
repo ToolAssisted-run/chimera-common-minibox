@@ -204,10 +204,10 @@ static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 
 void mb_block_note_unheld(mb_block *b, size_t pi) { bits_set(b->unheld_bits, pi); }
 
-/* Membership of the stack set, which only Windows uses (mb_page_native_prot):
- * a page that stops being a stack gives its shadow back. */
 static void page_cool(mb_block *b, size_t i);
 
+/* Membership of the stack set, which only Windows uses (mb_page_native_prot):
+ * a page that stops being a stack gives its shadow back. */
 static void note_status(mb_block *b, size_t i, uint8_t status) {
 	/* an allocation that moves is a different page, whatever it held */
 	if (b->pages[i].hot && b->pages[i].status != status) page_cool(b, i);
@@ -223,7 +223,13 @@ static void note_status(mb_block *b, size_t i, uint8_t status) {
 #endif
 }
 
+/* A page made clean is held for the baseline's sake, so it cannot stay hot:
+ * a hot page never faults, and a clean one that never faults would be written
+ * without ever becoming dirty again - and every anchor after would omit it.
+ * madvise found this: it zeroes a page whose sealed image was zero, calls it
+ * clean, and left it hot. Enforced here, where every dirty bit is written. */
 static inline void set_dirty(mb_block *b, size_t i, bool dirty) {
+	if (!dirty && b->pages[i].hot) page_cool(b, i);
 	b->pages[i].dirty = dirty;
 	b->dirty_map[i] = dirty;
 }
@@ -1048,6 +1054,7 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 
 	uint8_t *statii = (uint8_t *)malloc(b->npages);
 	uint8_t *dirtii = (uint8_t *)malloc(b->npages);
+	if (!statii || !dirtii) { free(statii); free(dirtii); return -ENOMEM; }
 	if (rd(r, ud, statii, b->npages) || rd(r, ud, dirtii, b->npages)) { free(statii); free(dirtii); return -EIO; }
 
 	/* Proportional to what the load CHANGES, not to the arena.
@@ -1062,6 +1069,10 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	 * milliseconds an anchor, most of the anchor's cost. The packed maps make
 	 * that comparison a word at a time, so a run of eight such pages costs two
 	 * loads and nothing else. */
+	/* One exit, for the reason mb_block_delta_apply has one: a load that fails
+	 * half way still has to leave every page it touched protected as its state
+	 * now says, or writes to it go unrecorded. */
+	int rc = 0;
 	prot_run run = { 0, 0, false };
 	size_t i = 0;
 	while (i < b->npages) {
@@ -1076,19 +1087,23 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		if (dirtii[i] == 0 && b->dirty_map[i] == 0 && statii[i] == b->status_map[i]) { i++; continue; }
 		mb_page *p = &b->pages[i];
 		mb_prot prot_before = mb_page_native_prot(p);
+		/* A page backed here for the first time is mapped with no access until
+		 * it is refreshed (ensure_committed), whatever its protection is said
+		 * to be - so it is refreshed below whether or not that changed. */
+		const bool was_uncommitted = p->uncommitted;
 		if (!p->invisible) {
 			bool old_d = p->dirty, new_d = dirtii[i] != 0;
 			uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
 			if (old_d || new_d) ensure_committed(b, i, 1);
 			if (!old_d && new_d) {
 				mb_page_maybe_snapshot(p, maddr);
-				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { free(statii); free(dirtii); return -EIO; }
+				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { set_dirty(b, i, true); rc = -EIO; goto done; }
 			} else if (old_d && !new_d) {
 				if (p->snap_kind == MB_SNAP_ZERO) memset((void *)maddr, 0, MB_PAGESIZE);
 				else if (p->snap_kind == MB_SNAP_DATA) memcpy((void *)maddr, p->snap_data, MB_PAGESIZE);
-				else { free(statii); free(dirtii); fprintf(stderr, "miniBox: missing snapshot for dirty region\n"); return -EINVAL; }
+				else { fprintf(stderr, "miniBox: missing snapshot for dirty region\n"); rc = -EINVAL; goto done; }
 			} else if (old_d && new_d) {
-				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { free(statii); free(dirtii); return -EIO; }
+				if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) { rc = -EIO; goto done; }
 			}
 			set_dirty(b, i, new_d);
 			/* a hot page just rewritten keeps its shadow true; one made clean
@@ -1099,12 +1114,13 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 			}
 		}
 		note_status(b, i, statii[i]);
-		if (mb_page_native_prot(p) != prot_before) run_note(b, &run, i);
+		if (mb_page_native_prot(p) != prot_before || (was_uncommitted && !p->uncommitted)) run_note(b, &run, i);
 		i++;
 	}
+done:
 	run_close(b, &run);
 	free(statii); free(dirtii);
-	return 0;
+	return rc;
 }
 
 /* ---- epochs and deltas (see minibox_internal.h) ---- */
@@ -1486,11 +1502,18 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (rd(r, ud, &npages64, sizeof(npages64))) return -EIO;
 	if (npages64 != b->npages) return -EINVAL;  /* a delta of another machine */
 	if (rd(r, ud, &nstatus, sizeof(nstatus))) return -EIO;
+	/* A delta that fails half way leaves a machine nobody should keep - but it
+	 * must still be left SAFE: every page this got as far as touching has to
+	 * carry the protection its state now implies, or a page left writable that
+	 * should be watched takes writes nothing records, and the next delta is
+	 * short of them. The caller throws the machine away; until it does, the
+	 * tracker's word about it stays true. Hence the single exit. */
+	int rc = -EIO;
 	prot_run run = { 0, 0, false };
 	for (uint64_t k = 0; k < nstatus; k++) {
 		uint64_t idx = 0; uint8_t s = 0;
-		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) return -EIO;
-		if (idx >= b->npages) return -EINVAL;
+		if (rd(r, ud, &idx, sizeof(idx)) || rd(r, ud, &s, 1)) goto done;
+		if (idx >= b->npages) { rc = -EINVAL; goto done; }
 		mb_page *p = &b->pages[idx];
 		const mb_prot before = mb_page_native_prot(p);
 		note_status(b, (size_t)idx, s);
@@ -1498,13 +1521,14 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	}
 	run_close(b, &run);
 
-	if (rd(r, ud, &ndata, sizeof(ndata))) return -EIO;
+	if (rd(r, ud, &ndata, sizeof(ndata))) goto done;
 	for (uint64_t k = 0; k < ndata; k++) {
 		uint64_t idx = 0;
-		if (rd(r, ud, &idx, sizeof(idx))) return -EIO;
-		if (idx >= b->npages) return -EINVAL;
+		if (rd(r, ud, &idx, sizeof(idx))) goto done;
+		if (idx >= b->npages) { rc = -EINVAL; goto done; }
 		mb_page *p = &b->pages[idx];
 		const mb_prot before = mb_page_native_prot(p);
+		const bool was_uncommitted = p->uncommitted;   /* backed below: mapped with no access until refreshed */
 		const uintptr_t maddr = mirror_addr(b, b->addr.start + (idx << MB_PAGESHIFT));
 		ensure_committed(b, (size_t)idx, 1);
 		/* The baseline copy BEFORE the page is overwritten, as the fault handler
@@ -1514,12 +1538,21 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 		 * baseline, and every later return to a frame where the page was clean
 		 * would put those bytes back instead of the sealed ones. */
 		mb_page_maybe_snapshot(p, maddr);
-		if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) return -EIO;
+		if (rd(r, ud, (void *)maddr, MB_PAGESIZE)) {
+			/* the page holds whatever arrived before the stream ended, which is
+			 * not the baseline's - so it counts as written, and is protected as
+			 * such by the close below */
+			set_dirty(b, (size_t)idx, true);
+			if (mb_page_native_prot(p) != before || was_uncommitted) run_note(b, &run, (size_t)idx);
+			goto done;
+		}
 		/* the content is no longer the baseline's, so a full state must carry it */
 		set_dirty(b, (size_t)idx, true);
 		if (p->hot) memcpy(p->shadow, (const void *)maddr, MB_PAGESIZE);
-		if (mb_page_native_prot(p) != before) run_note(b, &run, (size_t)idx);
+		if (mb_page_native_prot(p) != before || was_uncommitted) run_note(b, &run, (size_t)idx);
 	}
+	rc = 0;
+done:
 	run_close(b, &run);
 
 	/* A delta moves the machine, so whatever epoch was open no longer describes
@@ -1527,5 +1560,5 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	 * touches only the pages it wrote, and none of them changes protection by
 	 * being forgotten: a written page had its hold lifted by the write. */
 	mb_block_epoch_clear(b);
-	return 0;
+	return rc;
 }

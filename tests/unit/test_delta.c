@@ -279,6 +279,120 @@ static void test_hot_page_survives_a_load(void) {
 	mb_block_free(b);
 }
 
+/* A delta that ends half way leaves a machine to throw away - but a SAFE one:
+ * every page it touched is protected as its state now says, so a later write
+ * to one of them still faults and still lands in the next delta. Left
+ * unprotected, those writes would go unrecorded and the frame after would be
+ * short of them, which is a desync a long way from its cause. */
+static void test_a_truncated_delta_leaves_pages_watched(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x3000)[0] = 0x11;
+	gp(b, 0x4000)[0] = 0x22;
+	gp(b, 0x5000)[0] = 0x33;
+	membuf fwd = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&fwd), 0);
+
+	/* the same delta, cut off inside its last page */
+	membuf cut = { 0 };
+	membuf_write((uintptr_t)&cut, fwd.buf, fwd.len - 2048);
+	CHECK(mb_block_delta_apply(b, membuf_read, (uintptr_t)&cut) != 0);
+
+	/* the machine is not to be trusted, but the tracker's word about it is:
+	 * writing every page must produce a delta naming every page */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x3000)[1] = 0xAA;
+	gp(b, 0x4000)[1] = 0xBB;
+	gp(b, 0x5000)[1] = 0xCC;
+	CHECK_EQ(mb_block_epoch_page_count(b), 3);
+	CHECK(mb_block_maps_consistent(b));
+
+	membuf_free(&fwd); membuf_free(&cut);
+	mb_block_free(b);
+}
+
+/* A delta that ends half way has already written PART of a page. That page no
+ * longer holds what the baseline holds, so it has to be called dirty - or the
+ * next whole state leaves it out, the load after that hands back the sealed
+ * bytes, and the machine quietly loses a page nobody wrote to since. */
+static void test_a_truncated_delta_dirties_what_it_wrote(void) {
+	const uintptr_t SIZE = 0x8000;
+	mb_block *b = sealed(SIZE);
+	mb_block *other = sealed_at(0x37000000000ull, SIZE);
+
+	/* a delta from a machine that wrote a page this one never has */
+	CHECK_EQ(mb_block_epoch_begin(other), 0);
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000) gp(other, i)[0] = 0x33;
+	membuf fwd = { 0 };
+	CHECK_EQ(mb_block_delta_save(other, true, membuf_write, (uintptr_t)&fwd), 0);
+
+	/* cut inside the last page it carries */
+	membuf cut = { 0 };
+	membuf_write((uintptr_t)&cut, fwd.buf, fwd.len - 2048);
+	CHECK(mb_block_delta_apply(b, membuf_read, (uintptr_t)&cut) != 0);
+
+	/* whatever it managed to write, it must own */
+	size_t changed = 0;
+	for (uintptr_t i = 0; i < SIZE; i += 0x1000) {
+		const size_t page = i >> MB_PAGESHIFT;
+		if (((const volatile uint8_t *)(b->addr.start + i))[0] != 0x33) continue;
+		changed++;
+		CHECK((mb_block_page_info(b, page) & 0x80) != 0);
+	}
+	CHECK(changed != 0);
+	CHECK(mb_block_maps_consistent(b));
+
+	membuf_free(&fwd); membuf_free(&cut);
+	mb_block_free(other);
+	mb_block_free(b);
+}
+
+/* The same for a state, and this is the one that bites: a load that ends half
+ * way has already put some pages BACK to their sealed content and called them
+ * clean. A clean page is watched - held read-only, so its next write faults and
+ * is recorded. If the load returns without applying that, the page stays mapped
+ * writable while the tracker calls it clean, and every later write to it is
+ * invisible: absent from the deltas, absent from the next state, and showing up
+ * as a desync a long way from here. */
+static void test_a_truncated_state_leaves_pages_watched(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	/* a state in which the LATER pages are dirty and the earlier ones are not */
+	for (uintptr_t i = 0x8000; i < SIZE; i += 0x1000) gp(b, i)[0] = (uint8_t)(i >> 12);
+	membuf whole = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&whole), 0);
+	/* then the earlier ones are written too, so loading that state has to put
+	 * them back to the baseline and hold them again */
+	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) gp(b, i)[0] = 0x5A;
+
+	/* cut inside the page data, which is after both maps: the load gets far
+	 * enough to clean the early pages and then fails */
+	membuf cut = { 0 };
+	membuf_write((uintptr_t)&cut, whole.buf, whole.len - 2048);
+	CHECK(mb_block_load_state(b, membuf_read, (uintptr_t)&cut) != 0);
+
+	/* The machine is not to be trusted, but the tracker's word about it is -
+	 * and that has to hold from the moment the load returns, not from the next
+	 * epoch. The caller is under no obligation to open one: a refused restore
+	 * leaves the session running, and a write in that window must still be seen
+	 * or the state after it will not carry the page. */
+	CHECK(mb_block_maps_consistent(b));
+	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) gp(b, i)[2] = 0x77;
+	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) {
+		CHECK((mb_block_page_info(b, i >> MB_PAGESHIFT) & 0x80) != 0);   /* dirty: the write was seen */
+	}
+
+	/* and the same again through an epoch, which is the ordinary path */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	size_t wrote = 0;
+	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) { gp(b, i)[3] = 0x78; wrote++; }
+	CHECK_EQ(mb_block_epoch_page_count(b), wrote);
+
+	membuf_free(&whole); membuf_free(&cut);
+	mb_block_free(b);
+}
+
 /* Backwards is not offered. A frame is reached by loading an anchor and
  * applying the deltas since it, and keeping the other direction possible cost a
  * page copy in the fault handler for every page every frame. Refused outright,
@@ -755,6 +869,9 @@ static void run_all(void) {
 	test_hot_page_still_reports_every_change();
 	test_hot_page_cools_and_is_exact();
 	test_hot_page_survives_a_load();
+	test_a_truncated_delta_leaves_pages_watched();
+	test_a_truncated_delta_dirties_what_it_wrote();
+	test_a_truncated_state_leaves_pages_watched();
 	test_reverse_delta_is_refused();
 	test_delta_chain_equals_the_run();
 	test_delta_carries_allocation();
