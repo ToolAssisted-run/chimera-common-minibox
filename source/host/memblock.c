@@ -43,13 +43,33 @@ static uint8_t prot_status(mb_prot prot) {
 		case MB_PROT_RX: return MB_ST_RX;
 		case MB_PROT_RWX: return MB_ST_RWX;
 		case MB_PROT_RWSTACK: return MB_ST_RWSTACK;
+		/* Never a status: it is how a clean RW page is PROTECTED on Windows,
+		 * asked for by mb_page_native_prot and understood only by the PAL. */
+		case MB_PROT_RWGUARD: return MB_ST_RW;
 	}
 	return MB_ST_NONE;
 }
 
 /* Effective host protection: clean writable pages map read-only so the first
  * write faults (dirty tracking). RWStack is R-until-written on Linux; on Windows
- * it is a guard page (RW|GUARD) when clean and plain RW once dirtied. */
+ * it is a guard page (RW|GUARD) when clean and plain RW once dirtied.
+ *
+ * On Windows a clean MB_ST_RW page is a guard page too, and that is not an
+ * optimisation - it is what makes the fault DELIVERABLE.
+ *
+ * A read-only page whose write faults is fine right up until the page is the
+ * one the stack pointer is in. Windows delivers an exception by pushing a
+ * context record onto the faulting thread's own stack, so a write fault on the
+ * stack cannot be reported: the kernel's own write fails too and the process
+ * dies with no handler having run, no diagnostic, and an access violation as
+ * its exit code. A guest that runs on memory it allocated itself does exactly
+ * this - ares gives every emulated component a coroutine stack out of malloc,
+ * and dies on its first frame, because sealing had just marked that page clean.
+ *
+ * A guard page has none of that problem: the kernel clears the guard bit BEFORE
+ * it raises the exception, so the page is writable by the time the context
+ * record goes onto it. The first touch still traps, which is all dirty tracking
+ * wants. veh_inner does the bookkeeping the write fault would have done. */
 mb_prot mb_page_native_prot(const mb_page *p) {
 	if (p->status == MB_ST_FREE) return MB_PROT_NONE;
 	/* An open epoch holds a page read-only until it is written, exactly as the
@@ -58,6 +78,7 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 	bool clean = !p->dirty || p->epoch_hold;
 #ifdef _WIN32
 	if (p->status == MB_ST_RWSTACK && p->dirty) return MB_PROT_RW;
+	if (p->status == MB_ST_RW && clean) return MB_PROT_RWGUARD;
 #endif
 	if (p->status == MB_ST_RW && clean) return MB_PROT_R;
 	if (p->status == MB_ST_RWX && clean) return MB_PROT_RX;

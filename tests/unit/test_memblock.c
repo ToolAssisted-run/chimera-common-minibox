@@ -162,6 +162,54 @@ static void test_page_info_encoding(void) {
 	mb_block_free(b);
 }
 
+/* A guest that uses ordinary memory as a stack.
+ *
+ * This is the shape that killed the ares core on Windows and nothing else: a
+ * coroutine library (libco, one stack per emulated component) takes its stacks
+ * from malloc, so they are plain MB_ST_RW pages. Sealing marks them clean, and
+ * the first push after that is a write fault on the page the stack pointer is
+ * IN.
+ *
+ * On Windows an exception is delivered by pushing a context record onto the
+ * faulting thread's own stack. If that page is merely read-only the kernel's
+ * write fails too, no handler runs, nothing is logged, and the process dies
+ * with an access violation. The fix is to protect clean writable pages with the
+ * guard bit instead, because the kernel clears it BEFORE it raises - see
+ * mb_page_native_prot.
+ *
+ * Linux has always survived this (the handler runs on a sigaltstack), so this
+ * test passes there either way; it is the Windows runner that it is for. */
+static void test_write_with_sp_in_a_clean_page(void) {
+	mb_block *b = fresh(0x10000);
+	mb_range r = { b->addr.start, 0x10000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RW, true), 0);
+
+	/* Everything below the stack page is already dirty, so the only page that
+	 * can fault is the one holding the stack pointer - which is the case being
+	 * tested, and keeps a faulting handler off a second clean page. */
+	for (size_t i = 0; i < 8; i++) gp(b, (i << 12) + 8)[0] = (uint8_t)i;
+
+	/* Page 8 is untouched, so it is clean and write-protected. Put the stack
+	 * pointer near its top and write through it. */
+	CHECK(!dirty(b, 8));
+	volatile uint8_t *sp = gp(b, 0x9000 - 64);
+	uint64_t got = 0;
+	__asm__ __volatile__(
+		"mov %%rsp, %%r11\n\t"
+		"mov %1, %%rsp\n\t"
+		"pushq $0x5a\n\t"
+		"popq %%rax\n\t"
+		"mov %%r11, %%rsp\n\t"
+		"mov %%rax, %0\n\t"
+		: "=r"(got)
+		: "r"(sp)
+		: "r11", "rax", "memory", "cc");
+
+	CHECK_EQ(got, 0x5aull);   /* the push and pop actually happened */
+	CHECK(dirty(b, 8));       /* and the write was tracked, not lost */
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	RUN(test_dirty_offset);
 	RUN(test_mmap_errors);
@@ -174,5 +222,6 @@ static void run_all(void) {
 	RUN(test_double_seal);
 	RUN(test_copy_from_external);
 	RUN(test_page_info_encoding);
+	RUN(test_write_with_sp_in_a_clean_page);
 }
 TEST_MAIN()

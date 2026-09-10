@@ -39,6 +39,7 @@ static uint32_t prot_to_native(mb_prot prot) {
 		case MB_PROT_RX:      return PAGE_EXECUTE_READ;
 		case MB_PROT_RWX:     return PAGE_EXECUTE_READWRITE;
 		case MB_PROT_RWSTACK: return PAGE_READWRITE | (guard_stacks() ? PAGE_GUARD : 0);
+		case MB_PROT_RWGUARD: return PAGE_READWRITE | PAGE_GUARD;
 	}
 	return PAGE_NOACCESS;
 }

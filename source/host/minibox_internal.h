@@ -50,7 +50,11 @@ static inline mb_range mb_layout_all(const mb_layout *l) {
 typedef struct { uintptr_t sbrk_size, sealed_size, invis_size, plain_size, mmap_size; } mb_layout_template;
 
 /* Guest-visible protection of an allocated page. */
-typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX, MB_PROT_RWSTACK } mb_prot;
+/* MB_PROT_RWGUARD is Windows-only and never a page's STATUS - it is what
+ * mb_page_native_prot asks for when a clean writable page must trap its
+ * first touch in a way the kernel can DELIVER. See memblock.c. */
+typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX, MB_PROT_RWSTACK,
+               MB_PROT_RWGUARD } mb_prot;
 
 /* ---- PAL (pal_linux.c / pal_win.c): thin wrappers over the OS. Ranges aligned. ---- */
 typedef struct {

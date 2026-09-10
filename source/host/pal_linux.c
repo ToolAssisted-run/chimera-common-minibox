@@ -22,6 +22,7 @@ static int prot_to_native(mb_prot prot) {
 		case MB_PROT_RX:      return PROT_READ | PROT_EXEC;
 		case MB_PROT_RWX:     return PROT_READ | PROT_WRITE | PROT_EXEC;
 		case MB_PROT_RWSTACK: return PROT_READ | PROT_WRITE; /* linux: RWStack resolved to R/RW before here */
+		case MB_PROT_RWGUARD: return PROT_READ; /* windows-only; never asked for here */
 	}
 	return PROT_NONE;
 }
