@@ -194,18 +194,24 @@ static inline void bits_none(mb_block *b, uint64_t *w) { memset(w, 0, b->nwords 
  * so the bitmap cannot drift from what the OS was actually told. */
 static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 	bool writable = prot == MB_PROT_RW || prot == MB_PROT_RWX || prot == MB_PROT_RWSTACK;
-	/* A Windows stack page is a guard page when clean, and its write clears the
-	 * guard before anything can see which page it was - so it is never held the
-	 * ordinary way and has to be visited by every epoch regardless. */
-	if (b->pages[i].status == MB_ST_RWSTACK) writable = true;
 	if (writable) bits_set(b->unheld_bits, i);
 	else bits_clr(b->unheld_bits, i);
 }
 
 void mb_block_note_unheld(mb_block *b, size_t pi) { bits_set(b->unheld_bits, pi); }
 
+/* Membership of the stack set, which only Windows uses (mb_page_native_prot):
+ * a page that stops being a stack gives its shadow back. */
 static void note_status(mb_block *b, size_t i, uint8_t status) {
 	b->pages[i].status = status;
+#ifdef _WIN32
+	if (status == MB_ST_RWSTACK) { bits_set(b->stack_bits, i); return; }
+	if (bits_get(b->stack_bits, i)) {
+		bits_clr(b->stack_bits, i);
+		snap_release(b->pages[i].stack_shadow);
+		b->pages[i].stack_shadow = NULL;
+	}
+#endif
 }
 
 /* The epoch's half of the same fault: this page has been written, so the frame
@@ -245,10 +251,11 @@ mb_block *mb_block_new(mb_range addr) {
 	b->epoch_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->stat_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->unheld_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
+	b->stack_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
 	b->epoch_status = (uint8_t *)calloc(b->npages ? b->npages : 1, 1);
-	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->epoch_status) {
+	if (!b->pages || !b->epoch_bits || !b->stat_bits || !b->unheld_bits || !b->stack_bits || !b->epoch_status) {
 		free(b->pages); free(b->epoch_bits); free(b->stat_bits);
-		free(b->unheld_bits); free(b->epoch_status); free(b);
+		free(b->unheld_bits); free(b->stack_bits); free(b->epoch_status); free(b);
 		return NULL;
 	}
 	b->addr = addr;
@@ -339,11 +346,13 @@ void mb_block_free(mb_block *b) {
 	mb_pal_close_handle(b->handle);
 	for (size_t i = 0; i < b->npages; i++) {
 		snap_release(b->pages[i].snap_data);
+		snap_release(b->pages[i].stack_shadow);
 	}
 	free(b->epoch_status);
 	free(b->epoch_bits);
 	free(b->stat_bits);
 	free(b->unheld_bits);
+	free(b->stack_bits);
 	free(b->pages);
 	free(b);
 }
@@ -431,14 +440,119 @@ static void set_protections(mb_block *b, size_t pstart, size_t pcount, uint8_t s
 	for (size_t i = pstart; i < pstart + pcount; i++) note_status(b, i, status);
 	refresh_range(b, pstart, pcount);
 #ifdef _WIN32
-	/* A Windows stack page is never clean - see mb_page_native_prot - so its
-	 * baseline is taken now, while the content still IS the baseline, and it
-	 * counts as written from here on. */
+	/* A Windows stack reports nothing, so what it did is found by comparing it
+	 * with what it held - and that has to be kept now, while the content still
+	 * IS the baseline. See get_stack_dirty. */
 	if (status == MB_ST_RWSTACK)
-		for (size_t i = pstart; i < pstart + pcount; i++) {
+		for (size_t i = pstart; i < pstart + pcount; i++)
 			mb_page_maybe_snapshot(&b->pages[i], mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
-			b->pages[i].dirty = true;
+#endif
+}
+
+/* ---- Windows: a stack, read rather than watched ----------------------------
+ *
+ * Every other page reports its own first write, by faulting. A stack cannot -
+ * see mb_page_native_prot - so what a stack did is found by looking at it.
+ *
+ * The alternative was to call a stack written whether or not it was, which is
+ * correct and costs everything: ares gives a Game Boy nineteen coroutines a
+ * stack of their own, 2.6MB of them, and all of it went into every delta. Seven
+ * hundred frames of history was 268MB where Linux made 110MB, and capturing a
+ * frame cost 74% of the run where Linux paid 20%. Almost none of those pages had
+ * changed. Reading a few megabytes is nothing beside writing them.
+ *
+ * Two comparisons, against two baselines. `dirty` means "differs from the
+ * sealed image", which is the snapshot taken when the page became a stack.
+ * `epoch_dirty` means "changed since the last frame was described", which is
+ * the shadow. Both are exact, and both are more honest than a fault bit, which
+ * stays set when a page is written and then put back. */
+#ifdef _WIN32
+static bool stack_page_is_baseline(const mb_page *p, const void *live) {
+	if (p->snap_kind == MB_SNAP_DATA) return memcmp(live, p->snap_data, MB_PAGESIZE) == 0;
+	if (p->snap_kind == MB_SNAP_ZERO) {
+		const uint64_t *w = (const uint64_t *)live;
+		for (size_t k = 0; k < MB_PAGESIZE / sizeof(uint64_t); k++) if (w[k]) return false;
+		return true;
+	}
+	return false;  /* no baseline to be equal to */
+}
+#endif
+
+/* What every stack differs from the baseline in. Must run before anything that
+ * READS a page's dirtiness - a savestate, a seal - and before anything that
+ * changes a stack page's status, since a page that stops being a stack has to
+ * carry the truth out with it. The range form is for those last: a guest
+ * allocates constantly and none of it needs the whole set compared. No-op on
+ * Linux, where a stack faults like everything else. */
+#ifdef _WIN32
+static void stack_dirty_page(mb_block *b, size_t i) {
+	mb_page *p = &b->pages[i];
+	if (p->invisible || p->uncommitted) return;
+	p->dirty = !stack_page_is_baseline(
+		p, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
+}
+#endif
+
+static void get_stack_dirty_range(mb_block *b, size_t ps, size_t pcount) {
+#ifdef _WIN32
+	if (!b->swapped_in) return;
+	for (size_t i = ps; i < ps + pcount; i++)
+		if (bits_get(b->stack_bits, i)) stack_dirty_page(b, i);
+#else
+	(void)b; (void)ps; (void)pcount;
+#endif
+}
+
+static void get_stack_dirty(mb_block *b) {
+#ifdef _WIN32
+	if (!b->swapped_in) return;
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->stack_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			stack_dirty_page(b, i);
 		}
+	}
+#else
+	(void)b;
+#endif
+}
+
+/* And what each of them did since the last frame was described, which is what
+ * this one owes. The shadow is only rewritten where it differs, so a stack page
+ * nobody touched costs one comparison and no copying at all - and most of a
+ * coroutine stack is never touched.
+ *
+ * Being a frame behind is the failure this can have, and it is the safe one: a
+ * load, or an epoch abandoned without being saved, leaves a shadow describing
+ * an older moment, and the page goes into one delta that did not need it. A
+ * delta says what a page HOLDS at the end of the frame, so carrying one page
+ * too many is waste and never wrong. */
+static void get_stack_epoch(mb_block *b) {
+#ifdef _WIN32
+	if (!b->swapped_in || !b->epoch_active) return;
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->stack_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			mb_page *p = &b->pages[i];
+			if (!epoch_tracks(p) || p->uncommitted) continue;
+			const void *live = (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+			/* No shadow means nothing has ever compared this page - it was
+			 * mapped since - so everything in it is owed. */
+			if (p->stack_shadow && memcmp(live, p->stack_shadow, MB_PAGESIZE) == 0) continue;
+			if (!p->stack_shadow) p->stack_shadow = snap_alloc();
+			if (p->stack_shadow) memcpy(p->stack_shadow, live, MB_PAGESIZE);
+			if (p->epoch_dirty) continue;
+			p->epoch_dirty = true;
+			bits_set(b->epoch_bits, i);
+			b->epoch_ndirty++;
+		}
+	}
+#else
+	(void)b;
 #endif
 }
 
@@ -546,6 +660,7 @@ mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena,
 int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
+	get_stack_dirty_range(b, ps, pcount);
 	for (size_t i = ps; i < ps + pcount; i++)
 		if (b->pages[i].status == MB_ST_FREE) return -ENOMEM;
 	set_protections(b, ps, pcount, prot_status(prot));
@@ -571,6 +686,7 @@ static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) 
 static int munmap_impl(mb_block *b, mb_range addr, bool advise_only) {
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
+	get_stack_dirty_range(b, ps, pcount);
 	for (size_t i = ps; i < ps + pcount; i++)
 		if (b->pages[i].status == MB_ST_FREE) return -EINVAL;
 	free_pages(b, ps, pcount, advise_only);
@@ -630,6 +746,7 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 
 int mb_block_seal(mb_block *b) {
 	if (b->sealed) { fprintf(stderr, "miniBox: already sealed\n"); return -EINVAL; }
+	get_stack_dirty(b);
 	/* the baseline is about to become the live image, so any epoch measured
 	 * against the old one is meaningless */
 	mb_block_epoch_clear(b);
@@ -640,12 +757,11 @@ int mb_block_seal(mb_block *b) {
 			b->pages[i].snap_data = NULL;
 			b->pages[i].snap_kind = MB_SNAP_NONE; /* live memory is the baseline */
 #ifdef _WIN32
-			/* except a Windows stack, which is never clean: it keeps a baseline
-			 * of its own and goes on counting as written (as in set_protections) */
-			if (b->pages[i].status == MB_ST_RWSTACK) {
+			/* except a Windows stack, which keeps a baseline of its own: nothing
+			 * will report its writes, so they are found by comparing against it
+			 * (as in set_protections) */
+			if (b->pages[i].status == MB_ST_RWSTACK)
 				mb_page_maybe_snapshot(&b->pages[i], mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
-				b->pages[i].dirty = true;
-			}
 #endif
 		}
 	}
@@ -704,6 +820,7 @@ static int rd(mb_read_cb r, uintptr_t ud, void *data, uintptr_t n) {
 
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	get_stack_dirty(b);
 	if (wr(w, ud, MAGIC, sizeof(MAGIC) - 1)) return -EIO;
 	if (wr(w, ud, b->hash, 32)) return -EIO;
 	if (wr(w, ud, &b->addr, sizeof(b->addr))) return -EIO;
@@ -732,6 +849,7 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	get_stack_dirty(b);
 	/* the load replaces the machine, so an open epoch no longer describes it */
 	mb_block_epoch_clear(b);
 	char magic[sizeof(MAGIC) - 1];
@@ -877,27 +995,6 @@ int mb_block_epoch_begin(mb_block *b) {
 			m &= m - 1;
 			mb_page *p = &b->pages[i];
 			if (epoch_tracks(p)) {
-#ifdef _WIN32
-				/* A Windows stack cannot be held at all: protecting it is what
-				 * kills the process (mb_page_native_prot), so a write to it is
-				 * never seen. Taken eagerly instead - always in the delta,
-				 * whether or not the frame touched it. Stacks are usually
-				 * invisible and so never reach here at all. */
-				if (p->status == MB_ST_RWSTACK) {
-					if (!p->epoch_dirty) {
-						p->epoch_dirty = true;
-						bits_set(b->epoch_bits, i);
-						b->epoch_ndirty++;
-					}
-					/* and it is STILL unheld. The bit was cleared for the whole
-					 * word above, and the `continue` skips the refresh that
-					 * would put it back - so without this a stack page is taken
-					 * eagerly by one epoch and then never looked at again, and
-					 * everything the guest pushes after that frame is lost. */
-					bits_set(b->unheld_bits, i);
-					continue;
-				}
-#endif
 				p->epoch_hold = true;
 			}
 			/* maximal runs, so the syscalls are as few as the pages allow */
@@ -914,6 +1011,7 @@ size_t mb_block_epoch_page_count(const mb_block *b) { return b->epoch_ndirty; }
 
 int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) {
 	if (!b->epoch_active) return -EINVAL;
+	get_stack_epoch(b);
 
 	/* What the allocation map did, so applying a delta lands on the same shape
 	 * of machine and not merely the same bytes. */

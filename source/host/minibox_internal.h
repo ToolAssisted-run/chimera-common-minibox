@@ -103,6 +103,10 @@ typedef struct {
 	 * so nothing ever asked. */
 	bool epoch_hold;
 	bool epoch_dirty;
+	/* Windows stacks only (see mb_page_native_prot): the page as the epoch
+	 * found it, because a write to a stack cannot be seen there and has to be
+	 * discovered by comparing bytes. NULL everywhere else. */
+	uint8_t *stack_shadow;
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
@@ -137,6 +141,7 @@ typedef struct mb_block {
 	uint64_t *epoch_bits;   /* pages written during this epoch */
 	uint64_t *stat_bits;    /* pages whose status changed during this epoch */
 	uint64_t *unheld_bits;  /* pages mapped writable now: what an epoch must hold */
+	uint64_t *stack_bits;   /* pages that are stacks: Windows compares these by hand */
 	size_t epoch_ndirty;    /* set bits in epoch_bits */
 	size_t epoch_nstat;     /* set bits in stat_bits */
 	uint8_t *epoch_status;  /* what a stat_bits page's status WAS, npages bytes */

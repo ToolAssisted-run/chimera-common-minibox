@@ -133,10 +133,15 @@ saved point bit-exactly. How:
   dispatchable, but a guard bit can also be cleared with no exception delivered,
   and then the write is invisible AND the page still says clean - measured, and
   it corrupts a history. So on Windows an RWStack page is mapped PAGE_READWRITE
-  and is NEVER CLEAN: its baseline is snapshotted when it is allocated and again
-  at seal, it counts as dirty from that moment, and every savestate and delta
-  carries it. States are bigger and nothing else changes. On Linux, RWStack is
-  just R-until-written and goes through the normal handler.
+  and nothing reports its writes; they are found by READING it. Its baseline is
+  snapshotted when it is allocated and again at seal, and a copy (the shadow) is
+  kept of what it held when the last delta was written. `dirty` is a comparison
+  against the first, done before anything reads it (a savestate, a seal, a status
+  change); the epoch's set is a comparison against the second, done when a delta
+  is saved, which also refreshes the shadow where it differs. Both are exact, and
+  both are stricter than a fault bit, which stays set when a page is written and
+  then put back. On Linux, RWStack is just R-until-written and goes through the
+  normal handler.
 - A guest therefore has to SAY where its stacks are, with MAP_STACK. One that
   runs on memory it merely allocated dies on Windows on its first push.
 
