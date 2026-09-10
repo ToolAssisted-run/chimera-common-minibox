@@ -7,6 +7,8 @@
 #include <emulibc.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,7 +33,28 @@ static uint32_t read_seed(void) {
 	return v;
 }
 
+/* A guest handing the host a path it must not follow.
+ *
+ * A guest may be broken, may be hostile, or may simply have a bug - mia calls
+ * open(NULL) when it is hunting for a database it has not got - and none of
+ * those may take the host down. Before this was guarded the host dereferenced
+ * address zero inside its own libc and the process died with no diagnostic at
+ * all: the sandbox killed by the thing it contains.
+ *
+ * Returns 1 when every one of them was refused and the guest is still here. */
+static int bad_paths_are_refused(void) {
+	if (open(NULL, O_RDONLY) >= 0) return 0;
+	/* Not a pointer at all, and one just past the end of everything the guest
+	 * owns - the host must not read either. */
+	if (open((const char *)(uintptr_t)8, O_RDONLY) >= 0) return 0;
+	if (open((const char *)~(uintptr_t)0, O_RDONLY) >= 0) return 0;
+	struct stat st;
+	if (stat(NULL, &st) >= 0) return 0;
+	return 1;
+}
+
 ECL_EXPORT int Init(void) {
+	if (!bad_paths_are_refused()) return 0;
 	g_table = (uint32_t *)alloc_sealed(256 * sizeof(uint32_t));
 	if (!g_table) return 0;
 	uint32_t seed = read_seed();

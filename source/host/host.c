@@ -81,6 +81,35 @@ static int trace_syscalls(void) {
 	return on;
 }
 
+/* A pointer the guest handed over, checked before the host follows it.
+ *
+ * Nothing here used to check. A guest that called open(NULL) - and mia does,
+ * hunting for a database it has not got - made the host dereference address
+ * zero inside libc, and the process died with no diagnostic at all: the sandbox
+ * killed by the thing it is supposed to contain. A guest may be broken, may be
+ * hostile, and may be neither and simply have a bug; none of those may take the
+ * host down.
+ *
+ * The whole arena is one range, so "is this the guest's" is one comparison. */
+static bool guest_owns(mb_host *h, uintptr_t addr, uintptr_t len)
+{
+	if (addr == 0 || len == 0) return false;
+	mb_range all = mb_layout_all(&h->layout);
+	if (addr < all.start || addr >= mb_range_end(all)) return false;
+	return len <= mb_range_end(all) - addr;
+}
+
+/* A NUL-terminated string in guest memory, or NULL. The scan stops at the end
+ * of the arena, so an unterminated string cannot walk the host off the end. */
+static const char *guest_str(mb_host *h, uintptr_t addr)
+{
+	if (!guest_owns(h, addr, 1)) return NULL;
+	uintptr_t end = mb_range_end(mb_layout_all(&h->layout));
+	for (uintptr_t p = addr; p < end; p++)
+		if (*(const char *)p == 0) return (const char *)addr;
+	return NULL;
+}
+
 static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp);
 
@@ -231,7 +260,8 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			else res = old;
 			h->program_break = res; return sok((mb_sword)res);
 		}
-		case NR_stat:  { mb_sword r = mb_fs_stat_name(h->fs, (const char *)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_stat:  { const char *p = guest_str(h, a1); if (!p || !guest_owns(h, a2, 1)) return serr(EFAULT);
+		                 mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_fstat: { mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ioctl: return sok(0);
 		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
@@ -250,7 +280,8 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			}
 			return sok(total);
 		}
-		case NR_open:  { mb_sword r = mb_fs_open(h->fs, (const char *)a1, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_open:  { const char *p = guest_str(h, a1); if (!p) return serr(EFAULT);
+		                 mb_sword r = mb_fs_open(h->fs, p, (int)a2); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_sysinfo: {
 			/* fixed, plausible, deterministic: 1GB total, half free, no swap.
 			 * (struct sysinfo is 112 bytes of longs; fill what matters.) */
@@ -282,12 +313,14 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * reach the flat namespace through AT_FDCWD; a real dirfd has no
 			 * meaning here. */
 			if ((int)a1 != -100) return serr(EBADF);
-			mb_sword r = mb_fs_open(h->fs, (const char *)a2, (int)a3);
+			const char *p = guest_str(h, a2); if (!p) return serr(EFAULT);
+			mb_sword r = mb_fs_open(h->fs, p, (int)a3);
 			return r < 0 ? serr((int)-r) : sok(r);
 		}
 		case NR_newfstatat: {
 			if ((int)a1 != -100) return serr(EBADF);
-			mb_sword r = mb_fs_stat_name(h->fs, (const char *)a2, (void *)a3);
+			const char *p = guest_str(h, a2); if (!p || !guest_owns(h, a3, 1)) return serr(EFAULT);
+			mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a3);
 			return r < 0 ? serr((int)-r) : sok(0);
 		}
 		case NR_close: { mb_sword r = mb_fs_close(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
