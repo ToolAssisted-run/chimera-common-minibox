@@ -1261,6 +1261,34 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 		}
 	}
 	heat_written_pages(b);
+	static int trace_delta = -1;
+	if (trace_delta < 0) trace_delta = getenv("MB_TRACE_DELTA") != NULL;
+	if (trace_delta) {
+		/* What a frame's delta is MADE of, which is the difference between a
+		 * machine that writes a lot and a guest whose allocator churns. */
+		size_t zero = 0, moved = 0, freed = 0, hot = 0, total = 0;
+		for (size_t bw = 0; bw < b->nwords; bw++) {
+			uint64_t m = b->epoch_bits[bw];
+			while (m) {
+				size_t i = (bw << 6) + (size_t)bits_first(m);
+				m &= m - 1;
+				total++;
+				if (bits_get(b->stat_bits, i)) {
+					moved++;
+					if (b->pages[i].status == MB_ST_FREE) freed++;
+				}
+				if (b->pages[i].hot) hot++;
+				const uint64_t *p = (const uint64_t *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+				size_t k = 0;
+				while (k < MB_PAGESIZE / 8 && p[k] == 0) k++;
+				if (k == MB_PAGESIZE / 8) zero++;
+			}
+		}
+		fprintf(stderr, "[delta] %zu pages (%zu KB): %zu all-zero, %zu whose allocation moved"
+			" (%zu now free), %zu hot\n",
+			total, total * 4, zero, moved, freed, hot);
+		fflush(stderr);
+	}
 	return 0;
 }
 
