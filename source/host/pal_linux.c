@@ -22,7 +22,6 @@ static int prot_to_native(mb_prot prot) {
 		case MB_PROT_RX:      return PROT_READ | PROT_EXEC;
 		case MB_PROT_RWX:     return PROT_READ | PROT_WRITE | PROT_EXEC;
 		case MB_PROT_RWSTACK: return PROT_READ | PROT_WRITE; /* linux: RWStack resolved to R/RW before here */
-		case MB_PROT_RWGUARD: return PROT_READ; /* windows-only; never asked for here */
 	}
 	return PROT_NONE;
 }
@@ -70,8 +69,4 @@ int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return mprotect((void *)addr.start, addr.size, prot_to_native(prot));
 }
 
-/* Linux: RWStack uses the fault handler, so no guard-page sweep is needed. */
-int mb_pal_get_stack_dirty(uintptr_t start, uintptr_t *out_size, bool *out_dirty) {
-	(void)start; *out_size = MB_PAGESIZE; *out_dirty = true; return 0;
-}
 #endif

@@ -127,13 +127,18 @@ saved point bit-exactly. How:
   containing the fault address, snapshots the pre-write page content if no
   snapshot is stored yet, marks the page dirty, and reprotects it to real
   writable. A fault on a non-writable page is re-thrown (not handled).
-- On Windows, stack pages (RWStack) cannot use the fault handler (NT cannot
-  dispatch an exception when [rsp] is unwritable), so they map PAGE_READWRITE |
-  PAGE_GUARD; a guard trip is caught and returns continue-execution without
-  taking the lock; dirtiness is recovered lazily by scanning VirtualQuery for
-  cleared guard bits (`get_stack_dirty`), and RWStack snapshots are pre-captured
-  at allocation and at seal. On Linux, RWStack is just R-until-written and goes
-  through the normal handler; get_stack_dirty is a no-op.
+- On Windows, stack pages (RWStack) cannot use the fault handler at all: NT
+  cannot dispatch an exception when [rsp] is unwritable, so a clean stack page
+  kills the process instead of reporting itself. A guard page would be
+  dispatchable, but a guard bit can also be cleared with no exception delivered,
+  and then the write is invisible AND the page still says clean - measured, and
+  it corrupts a history. So on Windows an RWStack page is mapped PAGE_READWRITE
+  and is NEVER CLEAN: its baseline is snapshotted when it is allocated and again
+  at seal, it counts as dirty from that moment, and every savestate and delta
+  carries it. States are bigger and nothing else changes. On Linux, RWStack is
+  just R-until-written and goes through the normal handler.
+- A guest therefore has to SAY where its stacks are, with MAP_STACK. One that
+  runs on memory it merely allocated dies on Windows on its first push.
 
 A `Snapshot` is a page's pre-change baseline content: None (the live memory IS
 the baseline - a later write triggers snapshotting the pre-write bytes),
@@ -148,9 +153,9 @@ A one-shot operation after core init, before any savestate. Steps, in order:
    (emulibc mprotects the guest's own sealed heap to read-only).
 2. ELF seal: mprotect to R every section whose name contains `.rel.ro`, or
    starts with `.got`, or equals `.init_array`/`.fini_array`/`.tbss`/`.sealed`.
-3. Memory block seal: get_stack_dirty; for every dirty non-invisible page, clear
-   dirty and set its snapshot to None (the live image becomes the baseline;
-   Windows additionally pre-snapshots RWStack pages). Refresh protections (now
+3. Memory block seal: for every dirty non-invisible page, clear dirty and set
+   its snapshot to None (the live image becomes the baseline; on Windows an
+   RWStack page instead keeps a snapshot and stays dirty). Refresh protections (now
    all writable pages are mapped R/RX). Compute the block hash: SHA-256 of the
    block address range followed by, per page, a tag byte 1 (None), 2
    (ZeroFilled), or the 4096 snapshot bytes (Data). Mark sealed.

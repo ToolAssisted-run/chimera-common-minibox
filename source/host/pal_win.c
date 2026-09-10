@@ -8,29 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* MB_STACK_GUARD=0 takes the guard bit off clean stack pages.
- *
- * A clean stack page is PAGE_GUARD here and merely read-only on Linux, and the
- * guard bit is what makes stack dirtiness free: the first write trips it and
- * the kernel clears it, so get_stack_dirty can read the answer back later.
- * The cost is that the page is a trap for anything that writes to the stack
- * WITHOUT the process being able to take an exception - and delivering an
- * exception is exactly that, because the kernel pushes the context record onto
- * the faulting thread's own stack. A guest that faults often (a dirty-page trip
- * per page of a large memset) with a stack pointer close to a clean page dies
- * with no handler ever running.
- *
- * Without the guard, stack pages read back as dirty always: states carry more
- * bytes and nothing else changes. */
-static bool guard_stacks(void) {
-	static int cached = -1;
-	if (cached < 0) {
-		const char *v = getenv("MB_STACK_GUARD");
-		cached = (v != NULL && v[0] == '0') ? 0 : 1;
-	}
-	return cached != 0;
-}
-
 static uint32_t prot_to_native(mb_prot prot) {
 	switch (prot) {
 		case MB_PROT_NONE:    return PAGE_NOACCESS;
@@ -38,8 +15,7 @@ static uint32_t prot_to_native(mb_prot prot) {
 		case MB_PROT_RW:      return PAGE_READWRITE;
 		case MB_PROT_RX:      return PAGE_EXECUTE_READ;
 		case MB_PROT_RWX:     return PAGE_EXECUTE_READWRITE;
-		case MB_PROT_RWSTACK: return PAGE_READWRITE | (guard_stacks() ? PAGE_GUARD : 0);
-		case MB_PROT_RWGUARD: return PAGE_READWRITE | PAGE_GUARD;
+		case MB_PROT_RWSTACK: return PAGE_READWRITE;
 	}
 	return PAGE_NOACCESS;
 }
@@ -120,13 +96,4 @@ int mb_pal_commit(mb_range addr, mb_prot prot) {
 	return -1;
 }
 
-/* Query a region for RWStack dirtiness: the guard bit is cleared once the page
- * has been written (the guard trip auto-clears it). */
-int mb_pal_get_stack_dirty(uintptr_t start, uintptr_t *out_size, bool *out_dirty) {
-	MEMORY_BASIC_INFORMATION mbi;
-	if (VirtualQuery((void *)start, &mbi, sizeof(mbi)) != sizeof(mbi)) return -1;
-	*out_size = (uintptr_t)mbi.RegionSize;
-	*out_dirty = (mbi.Protect & PAGE_GUARD) == 0;
-	return 0;
-}
 #endif

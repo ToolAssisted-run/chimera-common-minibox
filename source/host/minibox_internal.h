@@ -50,11 +50,8 @@ static inline mb_range mb_layout_all(const mb_layout *l) {
 typedef struct { uintptr_t sbrk_size, sealed_size, invis_size, plain_size, mmap_size; } mb_layout_template;
 
 /* Guest-visible protection of an allocated page. */
-/* MB_PROT_RWGUARD is Windows-only and never a page's STATUS - it is what
- * mb_page_native_prot asks for when a clean writable page must trap its
- * first touch in a way the kernel can DELIVER. See memblock.c. */
-typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX, MB_PROT_RWSTACK,
-               MB_PROT_RWGUARD } mb_prot;
+typedef enum { MB_PROT_NONE, MB_PROT_R, MB_PROT_RW, MB_PROT_RX, MB_PROT_RWX,
+               MB_PROT_RWSTACK } mb_prot;
 
 /* ---- PAL (pal_linux.c / pal_win.c): thin wrappers over the OS. Ranges aligned. ---- */
 typedef struct {
@@ -73,11 +70,6 @@ int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
 /* Lazy blocks (handle.lazy): back a range of a reserved section with the given
  * protection. On Linux nothing is ever lazy and this is mprotect. */
 int      mb_pal_commit(mb_range addr, mb_prot prot);           /* 0 ok */
-/* Windows only (no-op elsewhere): query one region's guard-page dirtiness for
- * RWStack tracking. Returns the region size in *out_size and whether it's dirty
- * (guard bit cleared). Returns 0 on success. */
-int      mb_pal_get_stack_dirty(uintptr_t start, uintptr_t *out_size, bool *out_dirty);
-
 /* ---- sha256.c ---- */
 typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t fill; } mb_sha256;
 void mb_sha256_init(mb_sha256 *c);
@@ -148,12 +140,6 @@ typedef struct mb_block {
 	size_t epoch_ndirty;    /* set bits in epoch_bits */
 	size_t epoch_nstat;     /* set bits in stat_bits */
 	uint8_t *epoch_status;  /* what a stat_bits page's status WAS, npages bytes */
-
-	/* The page range that has ever been a stack, or hi < lo for none. Windows
-	 * recovers stack dirtiness by asking the OS about each one, and without
-	 * this that ask is a walk of the whole arena on every frame. A range that
-	 * is wider than the truth costs a little time and is never wrong. */
-	size_t stack_lo, stack_hi;
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);

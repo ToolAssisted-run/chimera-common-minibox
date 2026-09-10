@@ -162,36 +162,34 @@ static void test_page_info_encoding(void) {
 	mb_block_free(b);
 }
 
-/* A guest that uses ordinary memory as a stack.
+/* A guest that runs on a stack it declared.
  *
  * This is the shape that killed the ares core on Windows and nothing else: a
- * coroutine library (libco, one stack per emulated component) takes its stacks
- * from malloc, so they are plain MB_ST_RW pages. Sealing marks them clean, and
- * the first push after that is a write fault on the page the stack pointer is
- * IN.
+ * coroutine library (libco, one stack per emulated component) hands out stacks,
+ * and the first push onto a freshly sealed one is a write fault on the page the
+ * stack pointer is IN.
  *
  * On Windows an exception is delivered by pushing a context record onto the
  * faulting thread's own stack. If that page is merely read-only the kernel's
  * write fails too, no handler runs, nothing is logged, and the process dies
- * with an access violation. The fix is to protect clean writable pages with the
- * guard bit instead, because the kernel clears it BEFORE it raises - see
- * mb_page_native_prot.
- *
- * Linux has always survived this (the handler runs on a sigaltstack), so this
- * test passes there either way; it is the Windows runner that it is for. */
-static void test_write_with_sp_in_a_clean_page(void) {
+ * with an access violation. So on Windows a stack is never protected and never
+ * clean - it is written to a savestate whether or not anybody touched it. That
+ * is the whole reason MB_PROT_RWSTACK exists, and why a guest has to ask for a
+ * stack with MAP_STACK rather than use whatever memory it happens to have; see
+ * mb_page_native_prot. Linux takes the ordinary fault and needs none of it. */
+static void test_write_with_sp_in_a_declared_stack(void) {
 	mb_block *b = fresh(0x10000);
 	mb_range r = { b->addr.start, 0x10000 };
 	CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RW, true), 0);
+	mb_range stack = { b->addr.start + 0x8000, 0x1000 };
+	CHECK_EQ(mb_block_mprotect(b, stack, MB_PROT_RWSTACK), 0);
 
 	/* Everything below the stack page is already dirty, so the only page that
 	 * can fault is the one holding the stack pointer - which is the case being
 	 * tested, and keeps a faulting handler off a second clean page. */
 	for (size_t i = 0; i < 8; i++) gp(b, (i << 12) + 8)[0] = (uint8_t)i;
 
-	/* Page 8 is untouched, so it is clean and write-protected. Put the stack
-	 * pointer near its top and write through it. */
-	CHECK(!dirty(b, 8));
+	/* Put the stack pointer near the top of the stack page and write through it. */
 	volatile uint8_t *sp = gp(b, 0x9000 - 64);
 	uint64_t got = 0;
 	__asm__ __volatile__(
@@ -206,7 +204,7 @@ static void test_write_with_sp_in_a_clean_page(void) {
 		: "r11", "rax", "memory", "cc");
 
 	CHECK_EQ(got, 0x5aull);   /* the push and pop actually happened */
-	CHECK(dirty(b, 8));       /* and the write was tracked, not lost */
+	CHECK(dirty(b, 8));       /* and the write is in the state, not lost */
 	mb_block_free(b);
 }
 
@@ -222,6 +220,6 @@ static void run_all(void) {
 	RUN(test_double_seal);
 	RUN(test_copy_from_external);
 	RUN(test_page_info_encoding);
-	RUN(test_write_with_sp_in_a_clean_page);
+	RUN(test_write_with_sp_in_a_declared_stack);
 }
 TEST_MAIN()

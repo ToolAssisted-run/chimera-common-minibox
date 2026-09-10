@@ -148,16 +148,6 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	return g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
 }
 
-/* The block and page an address belongs to, or NULL. */
-static mb_page *page_of(uintptr_t addr, mb_block **out_block) {
-	for (int i = 0; i < g_nblocks; i++) {
-		if (!mb_range_contains(g_blocks[i]->addr, addr)) continue;
-		if (out_block) *out_block = g_blocks[i];
-		return &g_blocks[i]->pages[(addr - g_blocks[i]->addr.start) >> MB_PAGESHIFT];
-	}
-	return NULL;
-}
-
 /* Shared: handle a write fault at addr. Returns true if handled. */
 static bool trip(uintptr_t addr) {
 	mb_block *b = NULL;
@@ -334,45 +324,10 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
 	if (code == STATUS_GUARD_PAGE_VIOLATION) {
-		uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
-		mb_page *p = page_of(fault, NULL);
-
-		/* Not one of ours, or an RWStack page: leave it alone. An RWStack page's
-		 * dirtiness is recovered lazily via get_stack_dirty - the kernel has
-		 * already cleared the guard bit - and this returns without taking any
-		 * lock, because the handler's own stack may be growing into another
-		 * guard page, which would deadlock. */
-		if (p == NULL || p->status == MB_ST_RWSTACK) return EXCEPTION_CONTINUE_EXECUTION;
-
-		/* A clean MB_ST_RW page. The kernel has just cleared the guard bit,
-		 * which means the page is WRITABLE from this instant - so doing nothing
-		 * would let every later write through untracked, and a savestate would
-		 * be missing them. The bookkeeping has to happen here, now.
-		 *
-		 * ExceptionInformation[0]: 0 read, 1 write, 8 execute. */
-		bool write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
-
-		/* A read of a clean page leaves it clean, and it wants its read-only
-		 * protection back so that later reads are free and a later write still
-		 * faults. Unless the page is the one the stack is in: there a later
-		 * write fault could not be delivered, which is the whole reason this
-		 * page was a guard page, so it is dirtied now instead. A stack page
-		 * about to be read is about to be written. */
-		uintptr_t rsp = (uintptr_t)ep->ContextRecord->Rsp;
-		uintptr_t page = fault & ~(uintptr_t)MB_PAGEMASK;
-		bool is_stack = rsp >= page - MB_PAGESIZE && rsp < page + 2 * MB_PAGESIZE;
-
-		if (write || is_stack) {
-			if (!trip(fault)) {
-				/* Nothing claimed it and the guard is gone: put the page back
-				 * as it was, or the next write is invisible. */
-				mb_range r = { page, MB_PAGESIZE };
-				mb_pal_protect(r, mb_page_native_prot(p));
-			}
-		} else {
-			mb_range r = { page, MB_PAGESIZE };
-			if (mb_pal_protect(r, MB_PROT_R) != 0) { __builtin_trap(); abort(); }
-		}
+		/* No page of a block is a guard page - see mb_page_native_prot - so
+		 * this is the host's own stack growing, and the kernel has already done
+		 * the work by clearing the bit. Returned without taking any lock,
+		 * because the stack that is growing may be this handler's. */
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	if (code != STATUS_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
