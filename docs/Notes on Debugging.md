@@ -139,3 +139,29 @@ line reports a GUEST address, so
 `objdump -d --start-address=<rip> --stop-address=<rip+16> core.wbx` on the
 packaged core names the exact instruction. That is usually faster than any
 debugger, and it works from a log the user mailed in.
+
+## A fault the handler never gets to report
+
+A guest fault normally ends in a diagnosis: `tripguard` says what address was
+asked for, which block owns it and what state its page is in, to stderr and to
+`minibox-diag.log`. Two ways that diagnosis never arrives, and both look
+identical from outside - `Segmentation fault`, no file, nothing.
+
+**A fault inside the fault handler.** `sa_mask` is `sigfillset`, so SIGSEGV is
+blocked while the handler runs; a second one is force-delivered with the default
+action and the process is gone before it can say a word. The handler now
+notices, and prints both faults with `write(2)` before letting the process die
+the way it would have. The usual cause is the handler calling something that is
+not async-signal-safe - **stdio is the classic one**: a core whose own fault
+callback used `fprintf` to explain that it was declining the fault killed the
+host on that line, because musl's file lock reads a thread pointer that, inside
+the handler, is not the guest's.
+
+**A fault the kernel could not deliver at all.** Then no handler runs and there
+is nothing to print. `MB_FAULT_TRAIL=<path>` is for that case: every fault
+leaves four words - address, rip, rsp, direction - in a ring in that file
+BEFORE anything else happens, so the last entries are where the process was when
+it died. Three stores when on, nothing when off. Decode it as little-endian
+`u64`s: `[0]` is the fault count, then 64 slots of four.
+
+Linux only; on Windows the vectored handler reports the same things itself.

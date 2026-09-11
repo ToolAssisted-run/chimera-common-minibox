@@ -178,6 +178,9 @@ static bool trip(uintptr_t addr) {
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
 #include <ucontext.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 static struct sigaction g_old_sa;
 
 static void handler_inner(int sig, siginfo_t *info, void *ucontext);
@@ -222,11 +225,101 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 }
 
 
+/* A fault INSIDE the fault handler, which is how this used to die in silence.
+ *
+ * sa_mask is sigfillset, so SIGSEGV is blocked while the handler runs; a second
+ * one is then force-delivered with the default action and the process is gone
+ * before a line of diagnosis reaches anyone - no banner, no minibox-diag.log,
+ * nothing but "Segmentation fault". Both addresses are exactly what a person
+ * needs, so they are said here, with write(2) and a hand-rolled formatter
+ * because nothing in stdio is safe on this path.
+ *
+ * Then the handler is put back to SIG_DFL and the inner fault is allowed to
+ * happen again, so the process still dies the way it would have (core file
+ * included) rather than being papered over. */
+static __thread int g_fault_depth;
+static __thread uintptr_t g_outer_fault, g_outer_rip;
+
+/* The last faults, in a file, for the crash that leaves nothing behind.
+ *
+ * A fault the kernel cannot deliver - SIGSEGV already blocked, or a signal
+ * frame that will not fit - kills the process before any handler runs, so the
+ * evidence has to have been written BEFORE the fault that matters. Set
+ * MB_FAULT_TRAIL to a path and every fault leaves four words in a ring there;
+ * read it after the process is gone and the last entries are where it was.
+ * Off unless asked for, and three stores when on. */
+#define MB_TRAIL_SLOTS 64
+static volatile uint64_t *g_trail;  /* [0] = count, then 4 words per slot */
+
+static void trail_open(void) {
+	const char *path = getenv("MB_FAULT_TRAIL");
+	if (path == NULL || *path == '\0') return;
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	const size_t bytes = (1 + MB_TRAIL_SLOTS * 4) * sizeof(uint64_t);
+	if (ftruncate(fd, (off_t)bytes) == 0) {
+		void *m = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (m != MAP_FAILED) g_trail = (volatile uint64_t *)m;
+	}
+	close(fd);
+}
+
+static volatile uint64_t *g_trail_slot;
+
+static void trail_add(uintptr_t fault, uintptr_t rip, uintptr_t rsp, int write) {
+	if (g_trail == NULL) return;
+	uint64_t n = g_trail[0]++;
+	volatile uint64_t *slot = g_trail + 1 + (n % MB_TRAIL_SLOTS) * 4;
+	slot[0] = fault;
+	slot[1] = rip;
+	slot[2] = rsp;
+	slot[3] = (uint64_t)write;
+	g_trail_slot = slot;
+}
+
+/* How far the handler got before it stopped being alive to say so. */
+static void trail_stage(unsigned stage) {
+	if (g_trail_slot != NULL) g_trail_slot[3] = (g_trail_slot[3] & 0xff) | ((uint64_t)stage << 8);
+}
+
+static void sigsafe_report_nested(uintptr_t inner_fault, uintptr_t inner_rip) {
+	static const char hex[] = "0123456789abcdef";
+	char buf[192];
+	size_t n = 0;
+	const char *lead = "miniBox: a fault INSIDE the fault handler; the host cannot survive it.\n  outer ";
+	for (const char *p = lead; *p; p++) buf[n++] = *p;
+	const uintptr_t v[4] = { g_outer_fault, g_outer_rip, inner_fault, inner_rip };
+	for (int i = 0; i < 4; i++) {
+		const char *label = (i == 0 || i == 2) ? "addr=0x" : " rip=0x";
+		for (const char *p = label; *p; p++) buf[n++] = *p;
+		for (int sh = 60; sh >= 0; sh -= 4) buf[n++] = hex[(v[i] >> sh) & 0xf];
+		if (i == 1) { const char *s2 = "\n  inner "; for (const char *p = s2; *p; p++) buf[n++] = *p; }
+	}
+	buf[n++] = '\n';
+	ssize_t ignored = write(2, buf, n);
+	(void)ignored;
+}
+
 static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
-	bool rethrow = !(write && trip(fault)) && !ask_guest(fault, write);
+	if (g_fault_depth > 0) {
+		sigsafe_report_nested(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+		signal(SIGSEGV, SIG_DFL);
+		return;  /* the instruction runs again and the default action takes it */
+	}
+	g_fault_depth++;
+	g_outer_fault = fault;
+	g_outer_rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	trail_add(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP],
+	          (uintptr_t)uc->uc_mcontext.gregs[REG_RSP], write ? 1 : 0);
+	trail_stage(1);
+	bool tripped = write && trip(fault);
+	trail_stage(2);
+	bool asked = tripped ? false : ask_guest(fault, write);
+	trail_stage(3);
+	bool rethrow = !tripped && !asked;
 	if (rethrow) {
 		/* Mirror the Windows path: say what was asked for and whether any block
 		 * owns the address before the process dies with nothing to debug. */
@@ -246,6 +339,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
 	}
+	g_fault_depth--;
 	if (rethrow) {
 		if (g_old_sa.sa_flags & SA_SIGINFO)
 			g_old_sa.sa_sigaction(sig, info, ucontext);
@@ -278,6 +372,7 @@ void mb_tripguard_ensure_altstack(void) {
 }
 
 static void initialize(void) {
+	trail_open();
 	mb_tripguard_ensure_altstack();
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
