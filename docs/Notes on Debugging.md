@@ -125,14 +125,25 @@ Two hazards worth writing down, both of which cost real time:
   the guest. A `%fs` bug reproduced under wine is probably wine's. Test on real
   Windows or not at all.
 
-* **The base does not survive a Windows fault.** An exception is delivered by
-  the kernel, and the user-mode FS base does not come back with the thread: the
-  guest resumes with `%fs` at 0 and dies at its next thread-local read, far from
-  the fault that broke it. The handlers therefore decide "is this guest code"
-  from the faulting rip rather than from `rdfsbase()`, and reinstall the recorded
-  base on the way out - a write of the value already there on a host that kept
-  it. `MB_DROP_FS_ON_FAULT=1` simulates the loss on a host that does not have
-  the bug, which is the only way to exercise the repair off Windows.
+* **Windows does not keep a user-mode FS base at all.** Not across a fault -
+  across anything. Measured there with a five-line program: `wrfsbase`, then
+  plain arithmetic with no fault, no syscall and no yield. The base survived
+  `SwitchToThread`, was gone after `Sleep(1)`, and was gone after 47 ms and 16
+  million iterations of pure computation - one scheduler quantum. Windows
+  restores `%fs` for an x64 user thread believing the answer is always 0.
+
+  So the loss has no event to hang a repair on, and a guest that reads a thread
+  local often dies within a second of starting. The Windows handler therefore
+  repairs on the way IN: guest code that faulted while `%fs` held anything but
+  its thread pointer gets the pointer back and the instruction retried, which is
+  safe because it faulted before it had any effect. A fault that is really the
+  guest's own returns immediately with `%fs` correct and is handled normally,
+  which bounds the retry to one pass. The way out still restores too.
+
+  `MB_DROP_FS_ON_FAULT=1` simulates the way-OUT loss on a host that does not
+  have the bug. It deliberately does not drive the way-in retry: it forces its
+  answer unconditionally, and a forced answer there would retry for ever. That
+  path can only be exercised on Windows.
 
 Reading a Windows fault report: the `[veh] unhandled fault: addr=... rip=...`
 line reports a GUEST address, so

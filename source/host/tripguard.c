@@ -116,8 +116,8 @@ static void mb_restore_guest_fs(uintptr_t at_fault) {
 		if (!reported) {   /* once: this path runs thousands of times a second */
 			reported = true;
 			mb_wrfsbase(mb_guest_ctx->host_fs);
-			fprintf(stderr, "miniBox: the OS drops the guest %%fs across a fault; "
-			                "reinstalling it on the way out\n");
+			fprintf(stderr, "miniBox: the OS does not keep the guest %%fs (it is "
+			                "lost at a context switch, not at a fault); reinstalling it\n");
 			fflush(stderr);
 		}
 	}
@@ -389,25 +389,49 @@ static void initialize(void) {
 
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 
-/* Windows loses the guest's %fs across a fault.
+/* Windows does not keep a user-mode FS base at all, and not merely across a
+ * fault. That is worth stating precisely, because the weaker version of it was
+ * believed here for a while and the repair built on it cannot work.
  *
- * An exception here is delivered by the kernel, and the user-mode FS base does
- * not survive that round trip: the handler is entered, and the guest resumed,
- * with %fs back at 0. Nothing notices until the guest's next thread-local read,
- * which is why this took a real game to find - the small test movies are AVM1
- * and never reach the thread locals AVM2 verification keeps.
+ * Measured on Windows 11 with a five-line program: wrfsbase, then plain
+ * computation - no fault, no syscall, no yield of any kind. The base survived
+ * an explicit SwitchToThread, was gone after Sleep(1), and was gone after 47 ms
+ * and 16 million iterations of arithmetic, which is one scheduler quantum.
+ * Windows restores %fs for an x64 user thread the way it restores the rest of
+ * the register file, except that it believes the answer is always 0.
  *
- * So on Windows there is nothing to swap on the way IN. The host's %fs there is
- * 0, nobody's; host code reaches its thread locals through the TEB on %gs and
- * does not care what %fs holds. All that is needed is to put the guest's back
- * before resuming a guest instruction - which is a no-op on any OS that kept
- * it, and the whole fix on this one. */
+ * So the loss has no event to hang a repair on. The base is not dropped BY the
+ * fault; it was already gone, at whatever instruction the scheduler picked, and
+ * the fault being handled here is usually the guest's next thread-local read
+ * arriving at a small negative address. A guest that reads one often dies
+ * within a second: Ruffle's in-guest Mesa reads %fs:-0x30 (_glapi_tls_Dispatch)
+ * on every GL call, and faulted at 0xffffffffffffffd0.
+ *
+ * The repair therefore happens HERE, on the way IN, rather than only on the way
+ * out: if guest code faulted while %fs held anything but the guest's thread
+ * pointer, put the pointer back and retry the instruction. It faulted before it
+ * had any architectural effect, so retrying it is exactly right. A fault that is
+ * genuinely the guest's own arrives back immediately with %fs already correct,
+ * this test is false the second time, and it is handled below as it always was -
+ * which is what bounds the retry to one pass.
+ *
+ * The way OUT still restores as well, for the fault that does drop the base and
+ * for the OS that keeps it, where the write is a no-op. */
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
 	const bool guest_rip = mb_fs_swap && mb_guest_ctx
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
+	/* The real register, not drop_fs_for_test's pretend one: that hook forces
+	 * the answer unconditionally, and a forced answer here would re-fault into
+	 * the same retry for ever. The cost is that this path is exercised on
+	 * Windows only, which is also the only place it can happen. */
+	if (guest_rip && fs_at_fault != mb_guest_ctx->thread_area
+	    && fs_at_fault != mb_early_tp) {
+		mb_restore_guest_fs(fs_at_fault);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
 	LONG r = veh_inner(ep);
 	if (guest_rip && r == EXCEPTION_CONTINUE_EXECUTION) mb_restore_guest_fs(fs_at_fault);
 	return r;
