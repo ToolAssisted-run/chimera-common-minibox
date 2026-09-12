@@ -35,7 +35,7 @@ enum {
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
-	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
+	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000
 };
@@ -382,6 +382,19 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
 			return r < 0 ? serr((int)-r) : sok(r);
 		}
+		case NR_sched_setaffinity:
+			/* Taken and ignored. Guest threads are green threads sharing one host
+			 * thread, so there is nothing here to pin - and the affinity of the
+			 * thread they actually run on belongs to the host, not to them.
+			 *
+			 * Mesa is what brought this here: it reads the mask above, gets the
+			 * honest "one CPU", and then asks to be pinned to it during thread
+			 * setup. Refusing by not implementing it is not a refusal, it is an
+			 * abort - the guest dies mid-frame with "unimplemented syscall 203"
+			 * and every test in a core that links Mesa fails at once. Saying yes
+			 * costs nothing and changes nothing the guest can observe: the mask
+			 * it reads back is the same one CPU either way. */
+			return sok(0);
 		case NR_sched_getaffinity: {
 			/* one CPU, honestly: pools and hardware_concurrency stay deterministic.
 			 * musl's sysconf(_SC_NPROCESSORS_*) issues this syscall directly, so a

@@ -4,6 +4,9 @@
  * memory, plus a sealed constant table, an invisible scratch buffer, a guest
  * heap allocation, a mounted-file read, and a host callback - so it exercises
  * every phase-1 mechanism. */
+/* for syscall(): musl declares it only under _GNU_SOURCE, and this file is
+ * compiled -std=c11 */
+#define _GNU_SOURCE
 #include <emulibc.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +14,8 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 /* Savestated state (plain globals -> .bss / savestated memory). */
 static uint64_t g_acc;
@@ -78,6 +83,21 @@ ECL_EXPORT int Init(void) {
 		if (big[0] != 0xA5 || big[big_size - 1] != 0xA5) return 0;
 		free(big);
 	}
+	/* The CPU mask, both ways round, by raw syscall so this asks the host exactly
+	 * what a real guest asks it. Reading it has always worked; SETTING it was
+	 * missing, and a missing syscall is not a refusal the caller can handle - the
+	 * host aborts the guest where it stands. Mesa asks for both during thread
+	 * setup, so from the day a core linked Mesa this killed it mid-frame, with
+	 * "unimplemented syscall 203" and a core dump, intermittently enough to look
+	 * like flaky CI. Nothing here checks WHICH cpus come back: the host is
+	 * entitled to say "one", and does. */
+	{
+		unsigned char mask[128];
+		const long got = syscall(SYS_sched_getaffinity, 0, sizeof(mask), mask);
+		if (got <= 0) return 0;
+		if (syscall(SYS_sched_setaffinity, 0, (size_t)got, mask) != 0) return 0;
+	}
+
 	g_acc = seed;
 	g_step = 0;
 	fprintf(stderr, "conformance guest: Init done (seed=%08x)\n", seed);
