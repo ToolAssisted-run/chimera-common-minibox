@@ -174,6 +174,29 @@ static bool trip(uintptr_t addr) {
 	return true;
 }
 
+/* The faulting instruction and the registers that made its address.
+ *
+ * A fault inside the sandbox names no module - the guest is mapped memory, not
+ * a loaded image - so an address and an rip are all the operating system's own
+ * report contains, and generated code has no symbols to look up. The bytes are
+ * worth more than the address: the crash that made this exist was a nop at the
+ * faulting rip, which is impossible, and that was the clue - a stray relocation
+ * had rewritten one byte of it into "add %bl,(%rdi)", a store to the first byte
+ * of the machine's execution table. Reading that from a log took minutes; a
+ * debugger had already cost a day.
+ *
+ * Nothing here allocates or locks: it runs in a fault handler. Sixteen bytes is
+ * more than the longest x86 instruction, and if the code page itself is gone the
+ * read faults again, which the nested-fault path already reports. */
+static void say_code_and_regs(const unsigned char *ip, long rax, long rcx, long rdx,
+                              long rsi, long rdi, long r8, long r9, long r10) {
+	mb_diag(" code:");
+	for (int i = 0; i < 16; i++) mb_diag(" %02x", ip[i]);
+	mb_diag("\n rax=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p r9=%p r10=%p\n",
+	        (void *)rax, (void *)rcx, (void *)rdx, (void *)rsi,
+	        (void *)rdi, (void *)r8, (void *)r9, (void *)r10);
+}
+
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
@@ -338,6 +361,11 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
+		say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
+		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RCX],
+		                  uc->uc_mcontext.gregs[REG_RDX], uc->uc_mcontext.gregs[REG_RSI],
+		                  uc->uc_mcontext.gregs[REG_RDI], uc->uc_mcontext.gregs[REG_R8],
+		                  uc->uc_mcontext.gregs[REG_R9], uc->uc_mcontext.gregs[REG_R10]);
 	}
 	g_fault_depth--;
 	if (rethrow) {
@@ -479,6 +507,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
+		say_code_and_regs((const unsigned char *)ep->ContextRecord->Rip,
+		                  (long)ep->ContextRecord->Rax, (long)ep->ContextRecord->Rcx,
+		                  (long)ep->ContextRecord->Rdx, (long)ep->ContextRecord->Rsi,
+		                  (long)ep->ContextRecord->Rdi, (long)ep->ContextRecord->R8,
+		                  (long)ep->ContextRecord->R9, (long)ep->ContextRecord->R10);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
