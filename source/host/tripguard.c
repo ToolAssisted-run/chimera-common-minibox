@@ -165,6 +165,10 @@ static bool trip(uintptr_t addr) {
 	 * both must run before the write is let through. */
 	mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
 	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
+	/* And a state being taken in the background wants the same bytes: this is
+	 * the last moment they exist. One atomic exchange when no state is being
+	 * taken, which is almost always. */
+	mb_block_plan_capture(b, pi);
 	mb_block_note_dirty(b, pi, true);
 	mb_range r = { page_start, MB_PAGESIZE };
 	if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }

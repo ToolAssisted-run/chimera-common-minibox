@@ -116,6 +116,17 @@ typedef struct {
 	 * mb_page_native_prot). What it did is discovered by comparing bytes. NULL
 	 * for everything else. */
 	uint8_t *shadow;
+	/* ---- a planned whole-machine save (see mb_block_state_plan) ----
+	 *
+	 * hold says this page is part of a state being filled in the background
+	 * and has not been copied yet: it is write-protected like an epoch's hold,
+	 * and whoever gets there first - the copier, or the fault the guest's next
+	 * write raises - copies it and clears this. It is claimed with an atomic
+	 * exchange because those two are different threads, and it is the ONLY
+	 * thing in this struct that is. slot says where in the state's buffer the
+	 * page goes, so the handler can copy one page without knowing the plan. */
+	unsigned char plan_hold;
+	uint32_t plan_slot;
 } mb_page;
 
 /* status byte encoding (also what page_info reports, minus dirty/invis bits) */
@@ -168,6 +179,25 @@ typedef struct mb_block {
 	 * time over twenty. Written wherever status or dirty is, and nowhere else. */
 	uint8_t *status_map;    /* pages[i].status */
 	uint8_t *dirty_map;     /* pages[i].dirty, as 0 or 1 */
+
+	/* ---- a state being filled while the machine runs ----
+	 *
+	 * Taking a whole machine is the largest stall the history has: 95 to 98% of
+	 * it is the COPY, which measured 40 to 180 ms for a 257 MB machine and 150
+	 * to 700 for a gigabyte one, once every anchor. None of that copy needs the
+	 * machine to stand still - it needs the BYTES to stand still - so the pages
+	 * are held read-only and the copy happens wherever there is a thread for
+	 * it; a guest write to a page nobody has copied yet faults, and the handler
+	 * copies that one page before letting the write through. That is the same
+	 * mechanism the baseline snapshot has used since the beginning, pointed at
+	 * a different buffer.
+	 *
+	 * plan_dest belongs to the CALLER and must outlive the plan. */
+	bool plan_active;
+	uint8_t *plan_dest;
+	size_t plan_data_at;    /* where page data starts in plan_dest */
+	size_t plan_count;      /* pages in the plan */
+	size_t *plan_list;      /* their indices, ascending */
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);
@@ -395,6 +425,24 @@ mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
 void    mb_page_maybe_snapshot(mb_page *p, uintptr_t mirror_addr);
+/* The plan's half of a write fault: this page is about to change, so if a
+ * planned state still owes it, copy it first. Two words and a page copy, and
+ * only while a plan is open. */
+void    mb_block_plan_capture(mb_block *b, size_t pi);
+
+/* ---- a whole machine, taken while it runs (see memblock.c) ----
+ *
+ * state_size says what the state will weigh; state_plan writes everything but
+ * the page data into a buffer of that size, holds the pages the data will come
+ * from and returns where the data starts; plan_fill copies a range of those
+ * pages on any thread; plan_finish copies whatever is left and gives the pages
+ * their ordinary protection back. Between plan and finish the machine may run:
+ * a write to a page nobody has copied yet is copied by the fault handler. */
+size_t  mb_block_state_size(mb_block *b);
+size_t  mb_block_state_plan(mb_block *b, uint8_t *dest);
+size_t  mb_block_plan_fill(mb_block *b, size_t from, size_t to);
+size_t  mb_block_plan_count(const mb_block *b);
+int     mb_block_plan_finish(mb_block *b);
 void    mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t mirror_addr);
 
 /* One page just became writable, so an epoch has to hold it again next time.

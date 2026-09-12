@@ -80,6 +80,12 @@ static uint8_t prot_status(mb_prot prot) {
  * that; it asks for them with MAP_STACK now. */
 mb_prot mb_page_native_prot(const mb_page *p) {
 	if (p->status == MB_ST_FREE) return MB_PROT_NONE;
+	/* A page a planned state still owes is held whatever else it is - a hot
+	 * page included. Hot means "written every frame, so a hold buys a fault
+	 * every frame", which is the right trade for an epoch and the wrong one
+	 * here: the bytes of a state have to stand still until they are copied,
+	 * and that is one fault, once, per page. */
+	if (p->plan_hold) return status_prot(p->status) == MB_PROT_RWX ? MB_PROT_RX : MB_PROT_R;
 	/* A hot page is never held: it is written every frame, so the fault a
 	 * hold buys would come every frame too. It is compared instead (page_heat). */
 	if (p->hot) return status_prot(p->status);
@@ -1017,8 +1023,169 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	return 0;
 }
 
+/* ---- a whole machine, taken while it runs --------------------------------
+ *
+ * mb_block_save_state writes the machine through a callback, and 95 to 98% of
+ * what that costs is the page copy: 40 to 180 ms for a 257 MB machine, 150 to
+ * 700 for a gigabyte one, measured, once per anchor. The walk that decides
+ * WHICH pages is 2 to 8 ms of it.
+ *
+ * The copy does not need the machine to stand still, it needs the BYTES to
+ * stand still, and this file has held bytes still since the beginning: a page
+ * held read-only faults on its first write, and the handler runs before the
+ * write lands. So a planned state protects the pages it is going to copy and
+ * hands the list to whoever has a thread going spare; a guest write to a page
+ * that has not been copied yet copies that one page in the handler and carries
+ * on. Whoever gets there first wins the page with one atomic exchange - there
+ * is no lock anywhere in this, which matters because one of the two racers is
+ * a signal handler.
+ *
+ * Holding the pages costs one mprotect per RUN of them, which is what makes
+ * this worth doing at all: a 256 MB machine measured 0.76 ms held in one call
+ * and 1.08 ms held a megabyte at a time, against 40 to 180 to copy it.
+ */
+
+/* Whether a page may be held read-only until somebody copies it.
+ *
+ * Everything may, except a guest stack on Windows: a fault delivered on the
+ * stack's own page has nowhere to build its exception frame, and the machine
+ * dies where it stands rather than faulting (miniBox 9f1c533, and the ares
+ * crash that found it). Those pages are copied at plan time instead - there are
+ * a few hundred of them against tens of thousands that can wait. */
+static bool plan_can_hold(const mb_page *p) {
+#ifdef _WIN32
+	if (p->status == MB_ST_RWSTACK) return false;
+#endif
+	return p->status == MB_ST_RW || p->status == MB_ST_RWX || p->status == MB_ST_RWSTACK;
+}
+
+/* What mb_block_save_state would write, to the byte. */
+size_t mb_block_state_size(mb_block *b) {
+	if (!b->sealed) return 0;
+	get_stack_dirty(b);
+	size_t n = sizeof(MAGIC) - 1 + 32 + sizeof(b->addr) + b->npages * 2;
+	for (size_t i = 0; i < b->npages; i++) {
+		if (!b->pages[i].invisible && b->pages[i].dirty) n += MB_PAGESIZE;
+	}
+	return n;
+}
+
+/* Writes everything but the page data into `dest`, holds the pages the data
+ * will come from, and records where each one goes. Returns the offset page data
+ * starts at, or 0 on failure. */
+size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
+	if (!b->sealed || b->plan_active || dest == NULL) return 0;
+	get_stack_dirty(b);
+
+	size_t count = 0;
+	for (size_t i = 0; i < b->npages; i++) {
+		if (!b->pages[i].invisible && b->pages[i].dirty) count++;
+	}
+	b->plan_list = (size_t *)calloc(count ? count : 1, sizeof(size_t));
+	if (!b->plan_list) return 0;
+
+	size_t at = 0;
+	memcpy(dest + at, MAGIC, sizeof(MAGIC) - 1); at += sizeof(MAGIC) - 1;
+	memcpy(dest + at, b->hash, 32); at += 32;
+	memcpy(dest + at, &b->addr, sizeof(b->addr)); at += sizeof(b->addr);
+	memcpy(dest + at, b->status_map, b->npages); at += b->npages;
+	memcpy(dest + at, b->dirty_map, b->npages); at += b->npages;
+
+	b->plan_dest = dest;
+	b->plan_data_at = at;
+	b->plan_count = 0;
+	b->plan_active = true;
+
+	/* Hold every page the state will carry. A page already held for an epoch
+	 * or a baseline is held for this too - one fault serves all three - and a
+	 * HOT page, which is never held for an epoch because it is written every
+	 * frame, is held for this one: its bytes have to stand still exactly like
+	 * everything else's, and it gets its heat back the moment the plan ends. */
+	size_t run_start = (size_t)-1, run_last = 0;
+	for (size_t i = 0; i < b->npages; i++) {
+		if (b->pages[i].invisible || !b->pages[i].dirty) continue;
+		mb_page *p = &b->pages[i];
+		p->plan_slot = (uint32_t)b->plan_count;
+		b->plan_list[b->plan_count++] = i;
+		ensure_committed(b, i, 1);
+		if (!plan_can_hold(p)) {
+			/* A page that cannot be held has to be copied now, while nothing
+			 * is running: there are a few hundred of them (two guest stacks)
+			 * against tens of thousands that can wait. */
+			memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
+			       (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE);
+			continue;
+		}
+		__atomic_store_n(&p->plan_hold, 1, __ATOMIC_RELEASE);
+		if (run_start == (size_t)-1) { run_start = run_last = i; }
+		else if (i == run_last + 1) { run_last = i; }
+		else { refresh_range(b, run_start, run_last - run_start + 1); run_start = run_last = i; }
+	}
+	if (run_start != (size_t)-1) refresh_range(b, run_start, run_last - run_start + 1);
+	return at;
+}
+
+/* The fault handler's half: this page is about to be written, so if the plan
+ * still owes it, it is copied now. */
+void mb_block_plan_capture(mb_block *b, size_t pi) {
+	if (!b->plan_active) return;
+	mb_page *p = &b->pages[pi];
+	/* whoever takes the hold owns the copy; the loser does nothing */
+	if (!__atomic_exchange_n(&p->plan_hold, 0, __ATOMIC_ACQ_REL)) return;
+	memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
+	       (const void *)mirror_addr(b, b->addr.start + (pi << MB_PAGESHIFT)), MB_PAGESIZE);
+}
+
+/* The copier's half: pages [from, to) of the plan, whichever of them nobody has
+ * taken yet. Safe on any thread; returns how many it actually copied. */
+size_t mb_block_plan_fill(mb_block *b, size_t from, size_t to) {
+	if (!b->plan_active) return 0;
+	if (to > b->plan_count) to = b->plan_count;
+	size_t done = 0;
+	for (size_t k = from; k < to; k++) {
+		const size_t pi = b->plan_list[k];
+		mb_page *p = &b->pages[pi];
+		if (!__atomic_exchange_n(&p->plan_hold, 0, __ATOMIC_ACQ_REL)) continue;
+		memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
+		       (const void *)mirror_addr(b, b->addr.start + (pi << MB_PAGESHIFT)), MB_PAGESIZE);
+		done++;
+	}
+	return done;
+}
+
+size_t mb_block_plan_count(const mb_block *b) { return b->plan_active ? b->plan_count : 0; }
+
+/* Copies whatever is left, ends the plan, and gives the pages their ordinary
+ * protection back. After this the buffer is a state and the machine is as it
+ * was, minus the holds. */
+int mb_block_plan_finish(mb_block *b) {
+	if (!b->plan_active) return -EINVAL;
+	mb_block_plan_fill(b, 0, b->plan_count);
+	b->plan_active = false;
+	b->plan_dest = NULL;
+
+	size_t run_start = (size_t)-1, run_last = 0;
+	for (size_t k = 0; k < b->plan_count; k++) {
+		const size_t i = b->plan_list[k];
+		if (run_start == (size_t)-1) { run_start = run_last = i; }
+		else if (i == run_last + 1) { run_last = i; }
+		else { refresh_range(b, run_start, run_last - run_start + 1); run_start = run_last = i; }
+	}
+	if (run_start != (size_t)-1) refresh_range(b, run_start, run_last - run_start + 1);
+
+	free(b->plan_list);
+	b->plan_list = NULL;
+	b->plan_count = 0;
+	b->plan_data_at = 0;
+	return 0;
+}
+
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	/* A load replaces the machine the plan is describing, so the plan is
+	 * finished first - the caller is meant to have done that, and doing it here
+	 * as well is the difference between a stale state and a corrupt one. */
+	if (b->plan_active) mb_block_plan_finish(b);
 	get_stack_dirty(b);
 	/* the load replaces the machine, so an open epoch no longer describes it */
 	mb_block_epoch_clear(b);

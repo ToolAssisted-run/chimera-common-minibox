@@ -26,6 +26,11 @@ size_t    mb_host_page_len(mb_host *h);
 const uint8_t *mb_host_hash(mb_host *h);
 uint8_t   mb_host_page_info(mb_host *h, size_t i);
 int       mb_host_save_state(mb_host *h, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
+size_t    mb_host_state_size(mb_host *h);
+size_t    mb_host_state_plan(mb_host *h, uint8_t *dest, size_t size);
+size_t    mb_host_state_pages(mb_host *h);
+size_t    mb_host_state_fill(mb_host *h, size_t from, size_t to);
+int       mb_host_state_finish(mb_host *h);
 int       mb_host_load_state(mb_host *h, mb_read_callback r, uintptr_t ud, char *errbuf, size_t errlen);
 int       mb_host_epoch_begin(mb_host *h, char *errbuf, size_t errlen);
 int       mb_host_delta_save(mb_host *h, bool forward, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
@@ -124,6 +129,43 @@ void wbx_unmount_file(mb_host *obj, const char *name, mb_write_callback cb, uint
 void wbx_save_state(mb_host *obj, mb_write_callback cb, uintptr_t userdata, mb_return *ret) {
 	char e[256]; e[0] = 0;
 	if (mb_host_save_state(obj, cb, userdata, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
+}
+
+/* ---- a whole machine, taken while it runs (docs/state-manager.md) ----
+ *
+ * The copy is 95 to 98% of what a state costs and none of it needs the machine
+ * to stand still, only the bytes: the pages are held read-only and filled by
+ * whoever has a thread going spare, and a guest write to a page nobody has
+ * copied yet is copied by the fault handler before the write lands.
+ *
+ *   size  -> what the state will weigh; 0 if it cannot be planned
+ *   plan  -> writes the surround into the caller's buffer and holds the pages
+ *   pages -> how many pages the plan has
+ *   fill  -> copies pages [from, to); safe on any thread, returns how many
+ *   finish-> copies the rest and lifts the holds
+ *
+ * The buffer belongs to the caller and must outlive the plan. */
+void wbx_state_size(mb_host *obj, mb_return *ret) {
+	ok(ret, (uintptr_t)mb_host_state_size(obj));
+}
+
+void wbx_state_plan(mb_host *obj, uint8_t *dest, uint64_t size, mb_return *ret) {
+	const size_t n = mb_host_state_plan(obj, dest, (size_t)size);
+	if (n == 0) { err(ret, "the machine could not be planned for a state"); return; }
+	ok(ret, (uintptr_t)n);
+}
+
+void wbx_state_pages(mb_host *obj, mb_return *ret) {
+	ok(ret, (uintptr_t)mb_host_state_pages(obj));
+}
+
+void wbx_state_fill(mb_host *obj, uint64_t from, uint64_t to, mb_return *ret) {
+	ok(ret, (uintptr_t)mb_host_state_fill(obj, (size_t)from, (size_t)to));
+}
+
+void wbx_state_finish(mb_host *obj, mb_return *ret) {
+	if (mb_host_state_finish(obj) != 0) { err(ret, "no state was being taken"); return; }
 	ok(ret, 0);
 }
 

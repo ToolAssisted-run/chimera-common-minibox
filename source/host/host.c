@@ -27,6 +27,10 @@ struct mb_host {
 	uintptr_t epoch_brk;
 	uint8_t *epoch_threads;
 	size_t epoch_threads_len;
+	/* everything a planned state carries except the pages: written when the
+	 * state is asked for, because it describes that moment (mb_host_state_size) */
+	uint8_t *plan_head; size_t plan_head_len;
+	uint8_t *plan_tail; size_t plan_tail_len;
 };
 
 /* ---- syscall numbers (x86-64) ---- */
@@ -537,6 +541,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 void mb_host_destroy(mb_host *h) {
 	if (!h) return;
 	if (h->active) mb_block_deactivate(h->block);
+	free(h->plan_head); free(h->plan_tail);
 	mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf);
 	mb_thunks_free(h->thunks); mb_threads_free(h->threads); free(h->image); free(h);
 }
@@ -647,6 +652,108 @@ int mb_host_save_state(mb_host *h, mb_write_cb w, uintptr_t ud, char *errbuf, si
 done:
 	if (!was_active) mb_host_deactivate(h);
 	if (rc) snprintf(errbuf, errlen, "save_state write failed");
+	return rc;
+}
+
+/* ---- a whole machine, taken while it runs --------------------------------
+ *
+ * mb_host_save_state writes the machine through a callback and waits for it.
+ * Almost all of what that costs is the page copy - 40 to 180 ms for a 257 MB
+ * machine, once per anchor, on the thread that runs the emulator. The pages can
+ * be copied later, and elsewhere, if they are held still meanwhile: see
+ * mb_block_state_plan.
+ *
+ * Everything AROUND the pages is small and has to describe the machine at the
+ * moment the state was asked for, so it is written now, into the caller's
+ * buffer, and the pages are what arrives late.
+ *
+ *   size  = mb_host_state_size(h)          what it will weigh
+ *   plan  = mb_host_state_plan(h, dest)    the surround, and the pages held
+ *   fill  = mb_host_state_fill(h, a, b)    a range of pages, on any thread
+ *   done  = mb_host_state_finish(h)        the rest, and the holds lifted
+ *
+ * The buffer belongs to the caller and must outlive the plan. Between plan and
+ * finish the guest may run; a write to a page nobody has copied yet is copied
+ * by the fault handler before the write lands.
+ */
+
+typedef struct { uint8_t *p; size_t cap, n; } mb_memsink;
+
+static int32_t memsink_write(uintptr_t ud, const uint8_t *data, uintptr_t size) {
+	mb_memsink *s = (mb_memsink *)ud;
+	if (s->n + size > s->cap) return -1;
+	memcpy(s->p + s->n, data, size);
+	s->n += size;
+	return 0;
+}
+
+/* The surround, into h->plan_head and h->plan_tail, so that both the size and
+ * the plan agree to the byte about what goes where. */
+static int host_state_surround(mb_host *h) {
+	free(h->plan_head); h->plan_head = NULL; h->plan_head_len = 0;
+	free(h->plan_tail); h->plan_tail = NULL; h->plan_tail_len = 0;
+
+	/* generous: the surround is magic strings, a pointer, a hash and the thread
+	 * records, none of which is near this */
+	const size_t room = 1u << 20;
+	h->plan_head = (uint8_t *)malloc(room);
+	h->plan_tail = (uint8_t *)malloc(room);
+	if (!h->plan_head || !h->plan_tail) return -1;
+
+	mb_memsink head = { h->plan_head, room, 0 };
+	if (w_all(memsink_write, (uintptr_t)&head, SAVE_START, sizeof(SAVE_START) - 1)) return -1;
+	if (w_all(memsink_write, (uintptr_t)&head, "FileSystem", 10)) return -1;
+	if (w_all(memsink_write, (uintptr_t)&head, "FileSystemEnd", 13)) return -1;
+	if (w_all(memsink_write, (uintptr_t)&head, &h->program_break, sizeof(h->program_break))) return -1;
+	if (w_all(memsink_write, (uintptr_t)&head, "ElfLoader", 9)) return -1;
+	if (w_all(memsink_write, (uintptr_t)&head, mb_elf_hash(h->elf), 32)) return -1;
+	h->plan_head_len = head.n;
+
+	mb_memsink tail = { h->plan_tail, room, 0 };
+	if (mb_threads_save(h->threads, &h->context, memsink_write, (uintptr_t)&tail) != 0) return -1;
+	if (w_all(memsink_write, (uintptr_t)&tail, SAVE_END, sizeof(SAVE_END) - 1)) return -1;
+	h->plan_tail_len = tail.n;
+	return 0;
+}
+
+size_t mb_host_state_size(mb_host *h) {
+	if (!h->sealed) return 0;
+	bool was_active = h->active; mb_host_activate(h);
+	size_t total = 0;
+	if (host_state_surround(h) == 0) {
+		const size_t block = mb_block_state_size(h->block);
+		if (block != 0) total = h->plan_head_len + block + h->plan_tail_len;
+	}
+	if (!was_active) mb_host_deactivate(h);
+	return total;
+}
+
+size_t mb_host_state_plan(mb_host *h, uint8_t *dest, size_t size) {
+	if (!h->sealed || dest == NULL || h->plan_head == NULL) return 0;
+	bool was_active = h->active; mb_host_activate(h);
+	size_t total = 0;
+	const size_t block = mb_block_state_size(h->block);
+	if (block != 0 && h->plan_head_len + block + h->plan_tail_len <= size) {
+		memcpy(dest, h->plan_head, h->plan_head_len);
+		if (mb_block_state_plan(h->block, dest + h->plan_head_len) != 0) {
+			memcpy(dest + h->plan_head_len + block, h->plan_tail, h->plan_tail_len);
+			total = h->plan_head_len + block + h->plan_tail_len;
+		}
+	}
+	if (!was_active) mb_host_deactivate(h);
+	return total;
+}
+
+size_t mb_host_state_pages(mb_host *h) { return mb_block_plan_count(h->block); }
+
+size_t mb_host_state_fill(mb_host *h, size_t from, size_t to) {
+	return mb_block_plan_fill(h->block, from, to);
+}
+
+int mb_host_state_finish(mb_host *h) {
+	bool was_active = h->active; mb_host_activate(h);
+	const int rc = mb_block_plan_finish(h->block);
+	if (!was_active) mb_host_deactivate(h);
 	return rc;
 }
 
