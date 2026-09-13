@@ -3,6 +3,11 @@
  * SIGSEGV fault handler on Linux. */
 #include "minibox_internal.h"
 #include "test_util.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#else
+#include <windows.h>
+#endif
 #include <errno.h>
 
 /* helpers */
@@ -220,7 +225,38 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 	mb_block_free(b);
 }
 
+/* A freed block gives its memory back - the MIRROR view included.
+ *
+ * The mirror is a view of the block's section, and it was released the way an
+ * anonymous mapping is. On Windows that call cannot release a view and failed
+ * silently, so every freed block left its whole mirror mapped; a frontend that
+ * rebooted a core a few dozen times could no longer create a block at all. */
+static void test_free_releases_the_mirror(void) {
+	for (int round = 0; round < 3; round++) {
+		mb_range a = { 0x36f00000000ull, 0x100000 };
+		mb_block *b = mb_block_new(a);
+		CHECK(b != NULL);
+		if (!b) return;
+		uintptr_t mirror = b->mirror.start;
+		size_t size = b->mirror.size;
+		mb_block_activate(b);
+		mb_block_free(b);
+#ifdef _WIN32
+		MEMORY_BASIC_INFORMATION mbi;
+		CHECK_EQ(VirtualQuery((void *)mirror, &mbi, sizeof mbi), sizeof mbi);
+		CHECK_EQ(mbi.State, (DWORD)MEM_FREE);
+#else
+		/* msync answers ENOMEM for a range that is not mapped */
+		errno = 0;
+		CHECK_EQ(msync((void *)mirror, size, MS_ASYNC), -1);
+		CHECK_EQ(errno, ENOMEM);
+#endif
+		(void)size;
+	}
+}
+
 static void run_all(void) {
+	test_free_releases_the_mirror();
 	RUN(test_dirty_offset);
 	RUN(test_mmap_errors);
 	RUN(test_mmap_movable_bestfit);

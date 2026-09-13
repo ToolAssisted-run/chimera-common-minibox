@@ -494,7 +494,14 @@ void mb_block_free(mb_block *b) {
 		mb_pal_unmap_handle(b->addr);
 		b->swapped_in = false;
 	}
-	mb_pal_unmap_anon(b->mirror);
+	/* The mirror is a VIEW of the block's section (mb_pal_map_handle), so it is
+	 * unmapped as one. It used to go through unmap_anon, which on Windows is
+	 * VirtualFree - and VirtualFree cannot release a mapped view: it failed,
+	 * silently, every time, so each core reboot left a whole arena's view (and
+	 * with it the section and its commit) behind until, a few dozen reboots in,
+	 * the next block could not be created at all ("failed to create memory
+	 * block"). munmap takes either kind, which is why Linux never showed it. */
+	mb_pal_unmap_handle(b->mirror);
 	mb_pal_close_handle(b->handle);
 	for (size_t i = 0; i < b->npages; i++) {
 		snap_release(b->pages[i].snap_data);
