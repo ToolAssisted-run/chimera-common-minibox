@@ -192,13 +192,39 @@ static bool trip(uintptr_t addr) {
  * Nothing here allocates or locks: it runs in a fault handler. Sixteen bytes is
  * more than the longest x86 instruction, and if the code page itself is gone the
  * read faults again, which the nested-fault path already reports. */
-static void say_code_and_regs(const unsigned char *ip, long rax, long rcx, long rdx,
-                              long rsi, long rdi, long r8, long r9, long r10) {
+#ifdef _WIN32
+#include <windows.h>   /* VirtualQuery; include-guarded, the platform half includes it too */
+#endif
+static void say_code_and_regs(const unsigned char *ip, long rsp, long rbp, long rax, long rbx,
+                              long rcx, long rdx, long rsi, long rdi, long r8, long r9,
+                              long r10, long r11, long r12, long r13, long r14, long r15) {
+	/* Registers FIRST: they cannot fault. The bytes can - a jump into garbage
+	 * leaves rip at 0x2 or 0xf5, and reading there from inside this handler is
+	 * a second fault that ends the report before it has said anything useful
+	 * (issue #64 printed "code:" and died). */
+	/* all of them: the one a bad address came from is never the one guessed
+	 * (issue #64's read of 0x2b was 0x28 past an r15 this used to leave out) */
+	mb_diag(" rip=%p rsp=%p rbp=%p\n rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n"
+	        " r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+	        (void *)ip, (void *)rsp, (void *)rbp, (void *)rax, (void *)rbx, (void *)rcx,
+	        (void *)rdx, (void *)rsi, (void *)rdi, (void *)r8, (void *)r9, (void *)r10,
+	        (void *)r11, (void *)r12, (void *)r13, (void *)r14, (void *)r15);
+	if ((uintptr_t)ip < 0x10000) {
+		mb_diag(" code: (rip is in the null region, nothing to read)\n");
+		return;
+	}
+#ifdef _WIN32
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery(ip, &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT
+	    || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
+	    || (uintptr_t)ip + 16 > (uintptr_t)mbi.BaseAddress + mbi.RegionSize) {
+		mb_diag(" code: (rip is not readable memory)\n");
+		return;
+	}
+#endif
 	mb_diag(" code:");
 	for (int i = 0; i < 16; i++) mb_diag(" %02x", ip[i]);
-	mb_diag("\n rax=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p r9=%p r10=%p\n",
-	        (void *)rax, (void *)rcx, (void *)rdx, (void *)rsi,
-	        (void *)rdi, (void *)r8, (void *)r9, (void *)r10);
+	mb_diag("\n");
 }
 
 #ifndef _WIN32
@@ -366,10 +392,14 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
 		say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
-		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RCX],
-		                  uc->uc_mcontext.gregs[REG_RDX], uc->uc_mcontext.gregs[REG_RSI],
-		                  uc->uc_mcontext.gregs[REG_RDI], uc->uc_mcontext.gregs[REG_R8],
-		                  uc->uc_mcontext.gregs[REG_R9], uc->uc_mcontext.gregs[REG_R10]);
+		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
+		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
+		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
+		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
+		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
+		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
+		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
+		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
 	}
 	g_fault_depth--;
 	if (rethrow) {
@@ -511,11 +541,12 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
-		say_code_and_regs((const unsigned char *)ep->ContextRecord->Rip,
-		                  (long)ep->ContextRecord->Rax, (long)ep->ContextRecord->Rcx,
-		                  (long)ep->ContextRecord->Rdx, (long)ep->ContextRecord->Rsi,
-		                  (long)ep->ContextRecord->Rdi, (long)ep->ContextRecord->R8,
-		                  (long)ep->ContextRecord->R9, (long)ep->ContextRecord->R10);
+		const CONTEXT *c = ep->ContextRecord;
+		say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
+		                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
+		                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
+		                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
+		                  (long)c->R14, (long)c->R15);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

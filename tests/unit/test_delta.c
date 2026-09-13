@@ -279,6 +279,112 @@ static void test_hot_page_survives_a_load(void) {
 	mb_block_free(b);
 }
 
+/* The same for a STACK page, which on Windows is compared rather than faulted
+ * (memblock.c, "a stack, read rather than watched"): a load or a delta must
+ * leave its shadow describing what was loaded. Left stale, a guest that writes
+ * the page back into the bytes it held on the old timeline - which a replay
+ * after a seek back does, exactly - is called unchanged, the frame's delta
+ * leaves the page out, and a later restore pairs a stack from one moment with a
+ * heap from another. ares met that as a coroutine resumed at its entry point
+ * after the heap had already struck it from the thread list (ThreadNotFound).
+ * On Linux a stack faults like any page, so this passes there either way; it is
+ * the Windows build that it guards. */
+static void test_stack_page_survives_a_load(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	mb_range stack = { b->addr.start + 0x6000, 0x1000 };
+	CHECK_EQ(mb_block_mprotect(b, stack, MB_PROT_RWSTACK), 0);
+	membuf anchor = { 0 };
+	for (int f = 0; f < 4; f++) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		gp(b, 0x6000)[0] = (uint8_t)(f + 1);
+		membuf d = { 0 };
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+		membuf_free(&d);
+		if (f == 1) CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+	}
+	/* back to f1: the page holds 2, and on Windows its shadow still says 4 */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(gp(b, 0x6000)[0], 2);
+	/* the replay writes what the old timeline held: that is a change */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 4;
+	membuf d = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	/* and the delta, applied over the loaded state, lands it */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d), 0);
+	CHECK_EQ(gp(b, 0x6000)[0], 4);
+
+	/* the same after a DELTA moves the machine rather than a load: apply the
+	 * frame, go back, and write the applied bytes again */
+	membuf e = { 0 };
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 9;
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&e), 0);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	d.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d), 0);   /* now 4, shadow was 9 */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 9;
+	membuf g = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&g), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+
+	membuf_free(&d); membuf_free(&e); membuf_free(&g); membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A frame captured as a whole STATE rather than a delta must not leave a stack
+ * page's shadow describing the delta before it. The history takes an anchor
+ * every so often and deltas after it; if the stack's shadow still holds the
+ * bytes from the last delta BEFORE the anchor, a page that returns to those
+ * bytes in the frame after the anchor is called unchanged, and anchor + delta
+ * restores it wrong. Windows only, like the test above. */
+static void test_stack_page_after_an_anchor(void) {
+	const uintptr_t SIZE = 0x20000;
+	mb_block *b = sealed(SIZE);
+	mb_range stack = { b->addr.start + 0x6000, 0x1000 };
+	CHECK_EQ(mb_block_mprotect(b, stack, MB_PROT_RWSTACK), 0);
+
+	/* frame 1: a delta, so the shadow holds 7 */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 7;
+	membuf d1 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d1), 0);
+
+	/* frame 2: written, then captured as an ANCHOR - no delta for this frame */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 8;
+	membuf anchor = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&anchor), 0);
+
+	/* frame 3: back to 7, which is what the stale shadow holds - but it is a
+	 * change from the anchor's 8, so the delta must carry it */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	gp(b, 0x6000)[0] = 7;
+	membuf d3 = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d3), 0);
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+
+	/* and anchor + delta is frame 3 */
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(gp(b, 0x6000)[0], 8);
+	d3.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d3), 0);
+	CHECK_EQ(gp(b, 0x6000)[0], 7);
+
+	membuf_free(&d1); membuf_free(&d3); membuf_free(&anchor);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 /* A delta that ends half way leaves a machine to throw away - but a SAFE one:
  * every page it touched is protected as its state now says, so a later write
  * to one of them still faults and still lands in the next delta. Left
@@ -869,6 +975,8 @@ static void run_all(void) {
 	test_hot_page_still_reports_every_change();
 	test_hot_page_cools_and_is_exact();
 	test_hot_page_survives_a_load();
+	test_stack_page_survives_a_load();
+	test_stack_page_after_an_anchor();
 	test_a_truncated_delta_leaves_pages_watched();
 	test_a_truncated_delta_dirties_what_it_wrote();
 	test_a_truncated_state_leaves_pages_watched();

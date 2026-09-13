@@ -695,16 +695,49 @@ static void get_stack_dirty(mb_block *b) {
 #endif
 }
 
-/* And what each of them did since the last frame was described, which is what
- * this one owes. The shadow is only rewritten where it differs, so a stack page
- * nobody touched costs one comparison and no copying at all - and most of a
- * coroutine stack is never touched.
+/* Every stack page's shadow is what it held when the epoch OPENED - exactly
+ * as a hot page's is (mb_block_epoch_begin) - so the comparison when the
+ * delta is saved is the end of the frame against its start and nothing else.
  *
- * Being a frame behind is the failure this can have, and it is the safe one: a
- * load, or an epoch abandoned without being saved, leaves a shadow describing
- * an older moment, and the page goes into one delta that did not need it. A
- * delta says what a page HOLDS at the end of the frame, so carrying one page
- * too many is waste and never wrong. */
+ * It used to be only what the page held when the last DELTA was written, on the
+ * reasoning that a stale shadow is a frame behind and a frame behind costs a
+ * page too many, never a page too few. That is wrong whenever the stale bytes
+ * EQUAL the new ones, and determinism makes that common rather than rare: a
+ * frame captured as an anchor, a state loaded, a delta applied, an epoch given
+ * up - each leaves the shadow describing an earlier moment, and a stack that
+ * returns to that moment's bytes is called unchanged. The delta leaves out a
+ * page that changed, and the next restore pairs a stack from one moment with a
+ * heap from another. ares met it on Windows as a coroutine resumed at its entry
+ * point after the heap had struck it from the thread list (ThreadNotFound), and
+ * as jumps into data (issue #64); test_delta pins both shapes.
+ *
+ * Compared before it is copied, so a stack page nobody touched costs one
+ * comparison here as it does at the end of the frame. No-op on Linux, where a
+ * stack faults like everything else. */
+static void stack_shadows_describe_now(mb_block *b) {
+#ifdef _WIN32
+	if (!b->swapped_in) return;
+	for (size_t w = 0; w < b->nwords; w++) {
+		uint64_t m = b->stack_bits[w];
+		while (m) {
+			size_t i = (w << 6) + (size_t)bits_first(m);
+			m &= m - 1;
+			mb_page *p = &b->pages[i];
+			if (!p->shadow || p->invisible || p->uncommitted) continue;
+			const void *live = (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+			if (memcmp(live, p->shadow, MB_PAGESIZE) != 0) memcpy(p->shadow, live, MB_PAGESIZE);
+		}
+	}
+#else
+	(void)b;
+#endif
+}
+
+/* And what each of them did since the epoch opened, which is what this delta
+ * owes. The shadow was set when the epoch opened (stack_shadows_describe_now),
+ * so this is the end of the frame against its start. It is rewritten only where
+ * it differs, so a stack page nobody touched costs one comparison and no
+ * copying at all - and most of a coroutine stack is never touched. */
 static void get_stack_epoch(mb_block *b) {
 #ifdef _WIN32
 	if (!b->swapped_in || !b->epoch_active) return;
@@ -1348,6 +1381,8 @@ int mb_block_epoch_begin(mb_block *b) {
 	epoch_forget(b);
 	b->epoch_active = true;   /* before the refresh below: it reads the holds */
 	b->epoch_no++;
+	/* the stacks as this epoch finds them, on Windows, for the same reason */
+	stack_shadows_describe_now(b);
 	/* the hot pages as this epoch finds them, for the comparison at its end */
 	for (size_t w = 0; w < b->nwords; w++) {
 		uint64_t m = b->hot_bits[w];

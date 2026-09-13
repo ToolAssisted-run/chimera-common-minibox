@@ -140,8 +140,13 @@ saved point bit-exactly. How:
   change); the epoch's set is a comparison against the second, done when a delta
   is saved, which also refreshes the shadow where it differs. Both are exact, and
   both are stricter than a fault bit, which stays set when a page is written and
-  then put back. On Linux, RWStack is just R-until-written and goes through the
-  normal handler.
+  then put back. The shadow is set when an epoch OPENS, as a hot page's is, so
+  the epoch's comparison is the end of the frame against its start whatever
+  happened in between - an anchor, a load, a delta apply, an epoch given up. A
+  shadow left describing an older moment is NOT merely a frame behind: a stack
+  that returns to that moment's bytes (a replay after a seek back does, exactly)
+  is called unchanged, and the delta omits a page that changed. On Linux,
+  RWStack is just R-until-written and goes through the normal handler.
 - A guest therefore has to SAY where its stacks are, with MAP_STACK. One that
   runs on memory it merely allocated dies on Windows on its first push.
 
