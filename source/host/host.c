@@ -446,16 +446,27 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				default: return serr(ENOSYS);
 			}
 		}
-		default:
+		default: {
 			/* flush before trapping: an illegal instruction takes the process down
 			 * without running atexit, and a redirected stderr would lose the one
-			 * line that explains the crash */
-			mb_diag_banner("unimplemented syscall");
+			 * line that explains the crash.
+			 *
+			 * tkill(self, SIGABRT) - syscall 200, signal 6 - is not a guest asking
+			 * for something missing: it is musl's abort(), which is what a Rust
+			 * panic, a failed allocation or a failed assertion ends in. The guest
+			 * has already said why on its stderr, so that is printed with it. */
+			const bool aborted = nr == 200 && a2 == 6;
+			mb_diag_banner(aborted ? "the guest aborted" : "unimplemented syscall");
 			mb_diag("miniBox: unimplemented syscall %llu (%llx, %llx, %llx)\n",
 			        (unsigned long long)nr, (unsigned long long)a1,
 			        (unsigned long long)a2, (unsigned long long)a3);
-			mb_diag("  the guest asked the host for something it does not provide; it cannot continue.\n");
+			if (aborted)
+				mb_diag("  that is tkill(SIGABRT): the guest called abort() - a panic, a failed allocation or an assertion.\n");
+			else
+				mb_diag("  the guest asked the host for something it does not provide; it cannot continue.\n");
+			mb_host_diag_guest_output(h);
 			__builtin_trap();
+		}
 			return serr(ENOSYS);
 	}
 }
@@ -536,6 +547,18 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	mb_call_guest_simple(mb_elf_entry(h->elf), &h->context);  /* _start */
 	mb_block_deactivate(h->block); h->active = false;
 	return h;
+}
+
+/* What the guest last wrote to stdout/stderr, into the diagnostic log. Only for
+ * paths about to end the process: it writes a file. The buffer is static because
+ * this can run inside a fault handler on a stack with little room to spare. */
+void mb_host_diag_guest_output(mb_host *h) {
+	if (h == NULL || h->fs == NULL) return;
+	static char tail[16 * 1024];
+	size_t n = mb_fs_sysout_tail(h->fs, tail, sizeof tail);
+	if (n == 0) { mb_diag("  (the guest wrote nothing to stdout or stderr)\n"); return; }
+	mb_diag("--- the guest's last %u bytes of stdout/stderr, oldest first ---\n%.*s\n--- end of guest output ---\n",
+	        (unsigned)n, (int)n, tail);
 }
 
 void mb_host_destroy(mb_host *h) {

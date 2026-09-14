@@ -118,4 +118,13 @@ ECL_EXPORT uint32_t Step(uint32_t input) {
 ECL_EXPORT uint64_t GetAcc(void) { return g_acc; }
 ECL_EXPORT uint32_t GetStep(void) { return g_step; }
 
+/* Dies the way a panicking or out-of-memory guest dies: says something on its
+ * stderr, then abort() - which musl turns into tkill(self, SIGABRT). The host
+ * must put both into its diagnostic log, since a GUI process has no stderr to
+ * show either (run_guest --abort-child). */
+ECL_EXPORT void Abort(void) {
+	fprintf(stderr, "conformance guest: these are my last words\n");
+	abort();
+}
+
 int main(void) { return 0; }

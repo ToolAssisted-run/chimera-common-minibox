@@ -149,6 +149,39 @@ static void test_stdout_write(void) {
  * memory would, through every path a guest has: read, seek, stat, and reading
  * twice at once. If those ever diverge, a project would draw a different
  * machine depending on how its disc happened to be mounted. */
+/* The guest's last console output, for the fatal paths: newest bytes kept, in
+ * order, across a wrap, and a short window still gets the newest. */
+static void test_sysout_tail(void) {
+	mb_fs *fs = mb_fs_new();
+	char out[64 * 1024];
+	CHECK_EQ(mb_fs_sysout_tail(fs, out, sizeof out), 0);   /* nothing said yet */
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"hello ", 6), 6);
+	CHECK_EQ(mb_fs_write(fs, 1, (const uint8_t *)"world", 5), 5);
+	size_t n = mb_fs_sysout_tail(fs, out, sizeof out);
+	CHECK_EQ(n, 11);
+	CHECK(memcmp(out, "hello world", 11) == 0);
+
+	static char big[40000];
+	for (size_t i = 0; i < sizeof big; i++) big[i] = (char)('a' + (i % 26));
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)big, 7000), 7000);            /* wraps */
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)big + 7000, 33000), 33000);   /* larger than the ring */
+	n = mb_fs_sysout_tail(fs, out, sizeof out);
+	CHECK_EQ(n, 16 * 1024);
+	CHECK(memcmp(out, big + sizeof big - n, n) == 0);
+
+	CHECK_EQ(mb_fs_write(fs, 2, (const uint8_t *)"!", 1), 1);   /* one past a full ring */
+	n = mb_fs_sysout_tail(fs, out, sizeof out);
+	CHECK_EQ(n, 16 * 1024);
+	CHECK_EQ(out[n - 1], '!');
+	CHECK(memcmp(out, big + sizeof big - (n - 1), n - 1) == 0);
+
+	n = mb_fs_sysout_tail(fs, out, 10);   /* a short window keeps the newest */
+	CHECK_EQ(n, 10);
+	CHECK(memcmp(out, big + sizeof big - 9, 9) == 0);
+	CHECK_EQ(out[9], '!');
+	mb_fs_free(fs);
+}
+
 static void test_host_file(void) {
 	static const char text[] = "0123456789abcdefghij";
 	const size_t len = sizeof(text) - 1;
@@ -249,6 +282,7 @@ static void run_all(void) {
 	RUN(test_rw_write_grow);
 	RUN(test_fd_semantics);
 	RUN(test_mount_errors);
+	RUN(test_sysout_tail);
 	RUN(test_stdout_write);
 	RUN(test_host_file);
 }

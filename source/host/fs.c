@@ -71,6 +71,16 @@ struct mb_fs {
 	 * rather than merely tidy. One buffer for the whole filesystem, because
 	 * there is one thread and a read finishes before the next begins. */
 	uint8_t bounce[64 * 1024];
+	/* The last of what the guest said on stdout and stderr, kept for the
+	 * moment it dies. A guest's own last words - a Rust panic's "panicked at",
+	 * an allocation that failed - go to a stderr that a GUI process does not
+	 * have, so they are lost exactly when they are the whole diagnosis. A ring
+	 * of the newest bytes costs a memcpy per write and is read only by the
+	 * fatal paths (mb_host_diag_guest_output). Host memory, so no savestate
+	 * carries it and it cannot change the machine. */
+	char sysout_tail[16 * 1024];
+	size_t tail_at;      /* where the next byte goes */
+	bool tail_wrapped;   /* the ring is full: the oldest byte is at tail_at */
 };
 
 /* 64-bit seek and tell, spelled for each host.
@@ -258,11 +268,48 @@ mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 	return (mb_sword)take;
 }
 
+static void sysout_remember(mb_fs *fs, const uint8_t *buf, size_t n) {
+	const size_t cap = sizeof fs->sysout_tail;
+	if (n >= cap) {   /* more than the ring holds: only its end survives */
+		memcpy(fs->sysout_tail, buf + (n - cap), cap);
+		fs->tail_at = 0;
+		fs->tail_wrapped = true;
+		return;
+	}
+	size_t first = cap - fs->tail_at;
+	if (first > n) first = n;
+	memcpy(fs->sysout_tail + fs->tail_at, buf, first);
+	if (n > first) {
+		memcpy(fs->sysout_tail, buf + first, n - first);
+		fs->tail_at = n - first;
+		fs->tail_wrapped = true;
+	} else {
+		fs->tail_at += first;
+		if (fs->tail_at == cap) { fs->tail_at = 0; fs->tail_wrapped = true; }
+	}
+}
+
+/* The newest bytes the guest wrote to stdout/stderr, oldest first, at most
+ * `cap` of them. */
+size_t mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap) {
+	const size_t size = sizeof fs->sysout_tail;
+	const size_t have = fs->tail_wrapped ? size : fs->tail_at;
+	const size_t take = have < cap ? have : cap;
+	const size_t oldest = fs->tail_wrapped ? fs->tail_at : 0;
+	const size_t skip = have - take;   /* a short window keeps the NEWEST */
+	for (size_t i = 0; i < take; i++) out[i] = fs->sysout_tail[(oldest + skip + i) % size];
+	return take;
+}
+
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -ENOENT;
 	mounted_file *f = &fs->files[h->file];
-	if (f->kind == F_SYSOUT) { fwrite(buf, 1, n, f->sysout); return (mb_sword)n; } /* host errors swallowed */
+	if (f->kind == F_SYSOUT) {
+		fwrite(buf, 1, n, f->sysout);   /* host errors swallowed */
+		sysout_remember(fs, buf, n);
+		return (mb_sword)n;
+	}
 	if (f->kind == F_EMPTY || !f->writable) return -EBADF;
 	size_t newpos = h->pos + n;
 	if (newpos > f->cap) { f->cap = newpos; f->data = realloc(f->data, f->cap); }

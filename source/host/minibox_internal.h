@@ -421,6 +421,7 @@ mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *kstat);
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *kstat);
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
+size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap); /* newest console bytes, oldest first */
 
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);
@@ -462,5 +463,8 @@ void    mb_diag(const char *fmt, ...);
 /// JSON describing what built this library (see diag.c). Exported as wbx_build_info.
 const char *mb_build_info(void);
 void    mb_diag_banner(const char *what);
+/* the guest's last stdout/stderr, into the diagnostic log; for fatal paths */
+typedef struct mb_host mb_host;
+void    mb_host_diag_guest_output(mb_host *h);
 
 #endif

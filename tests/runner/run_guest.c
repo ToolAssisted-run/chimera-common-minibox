@@ -1,9 +1,12 @@
+#define _GNU_SOURCE   /* setenv/unsetenv for the abort check; this file is built -std=c11 */
 /* End-to-end + corner-case system test: loads guest.wbx through the miniBox C
  * host and exercises the whole phase-1 stack - ELF load, __wbxsysinfo, guest
  * execution via the interop trampolines, guest syscalls (stderr, brk, a mounted
  * file read), sealed/invisible memory, a guest->host callback, savestate
  * round-trip + determinism, and the error/poison paths. */
 #include "minibox.h"
+#include <stdbool.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,7 +98,52 @@ static void seal_and_activate(mb_host *h) {
  * stopped right after guest init" no matter where it really stopped. */
 #define STAGE(...) do { fprintf(stderr, "[stage] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 
+/* The child half of the abort check: make a host, let the guest abort. It does
+ * not come back - the host's trap takes this process down, which is the point. */
+static int abort_child(const char *guest) {
+	mb_return r;
+	mb_host *h = make_host(guest, 0xABCD);
+	wbx_activate_host(h, &r);
+	typedef void (MB_GUEST_ABI *abort_fn)(void);
+	((abort_fn)proc(h, "Abort"))();
+	printf("run_guest --abort-child: the guest's abort() returned\n");
+	return 3;
+}
+
+/* A guest that aborts must leave its reason in the diagnostic log: the trap's
+ * own banner naming the abort, and what the guest last wrote to stderr. Run in a
+ * child, since the abort ends the process that runs it. */
+static int guest_abort_is_reported(const char *self, const char *guest) {
+#ifdef _WIN32
+	(void)self; (void)guest;
+	printf("run_guest: abort report not checked on Windows (a crashing child raises Windows Error Reporting)\n");
+	return 1;
+#else
+	const char *dir = getenv("TMPDIR");
+	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
+	char log[512], cmd[2048];
+	snprintf(log, sizeof log, "%s/run_guest_abort_%ld.log", dir, (long)time(NULL));
+	remove(log);
+	setenv("MINIBOX_LOG", log, 1);
+	snprintf(cmd, sizeof cmd, "'%s' --abort-child '%s' >/dev/null 2>&1", self, guest);
+	int status = system(cmd);
+	unsetenv("MINIBOX_LOG");
+	static char text[64 * 1024];
+	size_t n = 0;
+	FILE *f = fopen(log, "rb");
+	if (f != NULL) { n = fread(text, 1, sizeof text - 1, f); fclose(f); }
+	text[n] = '\0';
+	remove(log);
+	const bool died = status != 0;
+	const bool named = strstr(text, "the guest aborted") != NULL;
+	const bool words = strstr(text, "conformance guest: these are my last words") != NULL;
+	printf("run_guest: abort child died=%d, log names the abort=%d, log has the guest's words=%d\n", died, named, words);
+	return died && named && words;
+#endif
+}
+
 int main(int argc, char **argv) {
+	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
 	const char *path = argc > 1 ? argv[1] : "guest.wbx";
 	mb_return r;
 
@@ -205,6 +253,10 @@ int main(int argc, char **argv) {
 	wbx_destroy_host(hc, &r);
 
 	free(state.buf); free(junk.buf);
+
+	/* ---- a guest that aborts says why, in the diagnostic log ---- */
+	STAGE("checking that a guest abort is reported with its last words");
+	CHECK(guest_abort_is_reported(argv[0], path));
 
 	if (fails == 0) printf("run_guest: all checks passed\n");
 	else printf("run_guest: %d checks FAILED\n", fails);

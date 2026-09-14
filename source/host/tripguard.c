@@ -400,6 +400,8 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
 		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
 		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+		if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
+			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
 	}
 	g_fault_depth--;
 	if (rethrow) {
@@ -511,6 +513,32 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		 * because the stack that is growing may be this handler's. */
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
+	if (code == STATUS_PRIVILEGED_INSTRUCTION || code == STATUS_ILLEGAL_INSTRUCTION) {
+		/* A hlt or ud2 at a GUEST address is the guest stopping itself on purpose:
+		 * musl's a_crash() is a hlt, and it is what the allocator runs when its
+		 * own consistency check finds a corrupted heap. That kills the process
+		 * with no access violation, so the report below never saw it and the
+		 * log stayed silent about exactly the crash it was built for. Nothing is
+		 * handled here - the process still dies - it is only said first. */
+		uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+		bool in_guest = false;
+		for (int i = 0; i < g_nblocks; i++)
+			if (mb_range_contains(g_blocks[i]->addr, rip)) { in_guest = true; break; }
+		if (in_guest) {
+			const CONTEXT *c = ep->ContextRecord;
+			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
+			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
+			        code == STATUS_PRIVILEGED_INSTRUCTION ? "privileged instruction" : "illegal instruction", (void *)rip);
+			say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
+			                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
+			                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
+			                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
+			                  (long)c->R14, (long)c->R15);
+			if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
+				mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 	if (code != STATUS_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
 	/* ExceptionInformation[0]: 0 read, 1 write, 8 DEP */
 	bool write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
@@ -547,6 +575,8 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
 		                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
 		                  (long)c->R14, (long)c->R15);
+		if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
+			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

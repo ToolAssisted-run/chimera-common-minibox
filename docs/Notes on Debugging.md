@@ -176,3 +176,26 @@ it died. Three stores when on, nothing when off. Decode it as little-endian
 `u64`s: `[0]` is the fault count, then 64 slots of four.
 
 Linux only; on Windows the vectored handler reports the same things itself.
+
+## What the guest said last
+
+A guest that aborts has usually already said why - a Rust panic prints
+"panicked at", a failed allocation names its size - but it said it on a stderr
+that a GUI process does not have, so the reason was lost at exactly the moment it
+was the whole diagnosis. miniBox now keeps the newest 16 KB the guest wrote to
+stdout and stderr, in host memory and never in a savestate, and every path about
+to end the process writes that tail into `minibox-diag.log` after its own
+report: the unimplemented-syscall trap, and the unhandled-fault reports on both
+hosts.
+
+Two deaths are named for what they are. `tkill(self, SIGABRT)` - syscall 200
+with signal 6 - is musl's `abort()`, the end of a panic, a failed allocation or
+an assertion, so it is reported as "the guest aborted" rather than as a missing
+syscall. And on Windows, a `hlt` or `ud2` at a guest address is reported with its
+registers and the guest's output: musl's `a_crash()` is a `hlt`, and it is what
+the allocator runs when it finds its heap corrupt. The vectored handler used to
+look only at access violations, so that crash died without a word in the log.
+
+`run_guest` checks the first of these end to end on Linux: the conformance guest
+writes a line to stderr and aborts in a child process, and the log must name the
+abort and carry the line.
