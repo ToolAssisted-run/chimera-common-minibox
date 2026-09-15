@@ -887,6 +887,10 @@ int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
 static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only) {
 	for (size_t i = ps; i < ps + pcount; i++) {
 		uintptr_t maddr = mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+		/* the zeroing below goes through the mirror and never faults, so a state
+		 * being taken in the background would keep the zeros - munmap and
+		 * MADV_DONTNEED are how malloc gives memory back */
+		mb_block_plan_capture(b, i);
 		mb_page_maybe_snapshot(&b->pages[i], maddr);
 		/* before the memset below, not after: an open epoch's pre-image of this
 		 * page is what it held while the guest still had it */
@@ -952,8 +956,9 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 	mb_range e = mb_range_align_expand(r);
 	size_t pcount, ps = validate(b, e, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
-	for (size_t i = ps; i < ps + pcount; i++) { set_dirty(b, i, true); page_cool(b, i); }
 	ensure_committed(b, ps, pcount);
+	/* a write through the mirror: no fault tells a pending plan, so tell it */
+	for (size_t i = ps; i < ps + pcount; i++) { mb_block_plan_capture(b, i); set_dirty(b, i, true); page_cool(b, i); }
 	memcpy((void *)mirror_addr(b, start), src, len);
 	return 0;
 }
@@ -1165,15 +1170,50 @@ size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
 	return at;
 }
 
-/* The fault handler's half: this page is about to be written, so if the plan
- * still owes it, it is copied now. */
-void mb_block_plan_capture(mb_block *b, size_t pi) {
-	if (!b->plan_active) return;
-	mb_page *p = &b->pages[pi];
-	/* whoever takes the hold owns the copy; the loser does nothing */
-	if (!__atomic_exchange_n(&p->plan_hold, 0, __ATOMIC_ACQ_REL)) return;
+/* Who copies a held page, and when it is safe to change it.
+ *
+ * plan_hold is 1 while the plan still owes the page, 2 while somebody is COPYING
+ * it, and 0 once the copy is done. Whoever moves it from 1 to 2 owns the copy.
+ * It used to be a plain exchange from 1 to 0 - taken, then copied - and the
+ * loser did nothing. The loser is the fault handler about to let a write
+ * through, or a host write through the mirror, and "nothing" meant the write
+ * landed while the winner was still halfway through its memcpy of that very
+ * page: the state kept a page that was half the moment it was asked for and
+ * half later. A background anchor came out torn that way often enough to
+ * restore a heap whose malloc headers and free lists disagreed (chimera issue
+ * #68: two restores of one stored frame differed by 4.7 MB, and a game crashed
+ * inside malloc minutes later). So a writer that finds the page being copied
+ * waits - the copy is one page, microseconds - and only then changes it.
+ *
+ * Lock-free because one side is a signal handler; the wait is a pause loop. */
+static void plan_copy_page(mb_block *b, mb_page *p, size_t pi) {
 	memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
 	       (const void *)mirror_addr(b, b->addr.start + (pi << MB_PAGESHIFT)), MB_PAGESIZE);
+}
+
+static bool plan_take(mb_block *b, size_t pi, bool wait) {
+	mb_page *p = &b->pages[pi];
+	for (;;) {
+		unsigned char held = 1;
+		if (__atomic_compare_exchange_n(&p->plan_hold, &held, 2, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			plan_copy_page(b, p, pi);
+			__atomic_store_n(&p->plan_hold, 0, __ATOMIC_RELEASE);
+			return true;
+		}
+		/* 0: nothing owed. 2: somebody else is copying it right now */
+		if (held == 0 || !wait) return false;
+#if defined(__x86_64__) || defined(__i386__)
+		__builtin_ia32_pause();
+#endif
+	}
+}
+
+/* The fault handler's half, and every host write's: this page is about to
+ * change, so if the plan still owes it, it is copied first - and if somebody is
+ * copying it already, that copy is waited out before the change is allowed. */
+void mb_block_plan_capture(mb_block *b, size_t pi) {
+	if (!b->plan_active) return;
+	plan_take(b, pi, true);
 }
 
 /* The copier's half: pages [from, to) of the plan, whichever of them nobody has
@@ -1183,12 +1223,8 @@ size_t mb_block_plan_fill(mb_block *b, size_t from, size_t to) {
 	if (to > b->plan_count) to = b->plan_count;
 	size_t done = 0;
 	for (size_t k = from; k < to; k++) {
-		const size_t pi = b->plan_list[k];
-		mb_page *p = &b->pages[pi];
-		if (!__atomic_exchange_n(&p->plan_hold, 0, __ATOMIC_ACQ_REL)) continue;
-		memcpy(b->plan_dest + b->plan_data_at + (size_t)p->plan_slot * MB_PAGESIZE,
-		       (const void *)mirror_addr(b, b->addr.start + (pi << MB_PAGESHIFT)), MB_PAGESIZE);
-		done++;
+		/* a page somebody else is copying is theirs; the finish below waits for it */
+		if (plan_take(b, b->plan_list[k], false)) done++;
 	}
 	return done;
 }
@@ -1200,7 +1236,9 @@ size_t mb_block_plan_count(const mb_block *b) { return b->plan_active ? b->plan_
  * was, minus the holds. */
 int mb_block_plan_finish(mb_block *b) {
 	if (!b->plan_active) return -EINVAL;
-	mb_block_plan_fill(b, 0, b->plan_count);
+	/* every page copied, including one another thread was still copying: the
+	 * buffer is the caller's the moment this returns */
+	for (size_t k = 0; k < b->plan_count; k++) plan_take(b, b->plan_list[k], true);
 	b->plan_active = false;
 	b->plan_dest = NULL;
 

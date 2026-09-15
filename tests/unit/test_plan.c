@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* nanosleep: this file is compiled -std=c11 */
 /* A whole machine taken WHILE IT RUNS, and the one property that matters:
  * the bytes are the bytes of the moment it was asked for.
  *
@@ -208,12 +209,142 @@ static void test_an_epoch_across_a_plan(void) {
 	mb_block_free(b);
 }
 
+/* Memory given back while a state is being taken. munmap and MADV_DONTNEED zero
+ * pages through the mirror, which never faults, so nothing told the plan: the
+ * state kept the zeros instead of what malloc had there (chimera issue #68). */
+static void test_an_unmap_during_a_plan(void) {
+	for (int advise = 0; advise < 2; advise++) {
+		mb_block *b = running(0x80000);
+		membuf before = {0};
+		CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&before), 0);
+		const size_t size = mb_block_state_size(b);
+		uint8_t *dest = (uint8_t *)calloc(1, size);
+		CHECK(dest != NULL);
+		CHECK(mb_block_state_plan(b, dest) != 0);
+
+		mb_range r = { b->addr.start + 0x10000, 0x8000 };
+		if (advise) CHECK_EQ(mb_block_madvise_dontneed(b, r), 0);
+		else CHECK_EQ(mb_block_munmap(b, r), 0);
+		CHECK_EQ(mb_block_plan_finish(b), 0);
+
+		CHECK_EQ(memcmp(dest, before.buf, size), 0);
+		free(dest);
+		membuf_free(&before);
+		CHECK(mb_block_maps_consistent(b));
+		mb_block_free(b);
+	}
+}
+
+/* The host writing into the machine while a state is being taken - the same
+ * mirror, the same silence. */
+static void test_an_external_copy_during_a_plan(void) {
+	mb_block *b = running(0x80000);
+	membuf before = {0};
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&before), 0);
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+
+	uint8_t junk[0x3000];
+	memset(junk, 0xD7, sizeof junk);
+	CHECK_EQ(mb_block_copy_from_external(b, junk, b->addr.start + 0x1800, sizeof junk), 0);
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+
+	CHECK_EQ(memcmp(dest, before.buf, size), 0);
+	CHECK_EQ(gp(b, 0x2000)[0], 0xD7);
+	free(dest);
+	membuf_free(&before);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* An older state loaded while a newer one is still being taken: the load
+ * rewrites the machine through the mirror, and the newer state must still be
+ * the machine it was asked for, not the one being loaded. */
+static void test_a_load_during_a_plan(void) {
+	mb_block *b = running(0x80000);
+	membuf older = {0};
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&older), 0);
+	for (uintptr_t i = 0; i < 0x60000; i += MB_PAGESIZE) gp(b, i)[1] = (uint8_t)(0x30 + (i >> 12));
+
+	membuf newer = {0};
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&newer), 0);
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+
+	older.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&older), 0);
+	/* the load finishes the plan itself before it rewrites anything */
+	CHECK_EQ(mb_block_plan_count(b), 0);
+
+	CHECK_EQ(memcmp(dest, newer.buf, size), 0);
+	free(dest);
+	membuf_free(&older);
+	membuf_free(&newer);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* The race itself, made to happen: a page somebody is already copying (held at
+ * 2). A writer used to take the hold and change the page at once, in the middle
+ * of that copy. It has to wait until the copy is done - so the thread standing
+ * in for the copier says it has finished BEFORE it lets go, and the writer must
+ * see that when it returns. */
+struct releaser { mb_block *b; size_t pi; volatile int started; volatile int finished; };
+
+#ifdef _WIN32
+static void test_sleep_ms(int ms) { Sleep((DWORD)ms); }
+#else
+#include <time.h>
+static void test_sleep_ms(int ms) { struct timespec ts = { ms / 1000, (long)ms % 1000 * 1000000L }; nanosleep(&ts, NULL); }
+#endif
+
+MB_TEST_THREAD_FN(release_thread, ud) {
+	struct releaser *r = (struct releaser *)ud;
+	r->started = 1;
+	test_sleep_ms(60);
+	r->finished = 1;
+	r->b->pages[r->pi].plan_hold = 0;   /* the copy that was in progress is done */
+	return NULL;
+}
+
+static void test_a_writer_waits_out_a_copy(void) {
+	mb_block *b = running(0x80000);
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+
+	const size_t pi = b->plan_list[0];
+	b->pages[pi].plan_hold = 2;         /* somebody else is copying it */
+	struct releaser r = { b, pi, 0, 0 };
+	mb_test_thread t;
+	CHECK_EQ(mb_test_start(&t, release_thread, &r), 0);
+	while (!r.started) { }
+
+	mb_block_plan_capture(b, pi);       /* a writer about to change the page */
+	CHECK(r.finished);                  /* it did not return while the copy was in progress */
+	CHECK_EQ(mb_test_join(t), 0);
+
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+	free(dest);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	RUN(test_plan_matches_save);
 	RUN(test_writes_during_a_plan);
 	RUN(test_filled_by_a_thread);
 	RUN(test_a_planned_state_loads);
 	RUN(test_an_epoch_across_a_plan);
+	RUN(test_an_unmap_during_a_plan);
+	RUN(test_an_external_copy_during_a_plan);
+	RUN(test_a_load_during_a_plan);
+	RUN(test_a_writer_waits_out_a_copy);
 }
 
 TEST_MAIN()
