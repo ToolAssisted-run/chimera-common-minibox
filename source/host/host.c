@@ -41,6 +41,7 @@ enum {
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
+	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000
 };
 
@@ -367,6 +368,16 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				default: return serr(EINVAL);
 			}
 		}
+		case NR_sync:
+			/* Nothing to flush: the machine's files live in host memory. RPCS3's
+			 * save-data path calls sync() after writing a save (cellSaveData, the
+			 * non-Windows branch), so until this was answered every PS3 game died
+			 * the first time it saved - Dark Souls at "Making SAVE DATA", with
+			 * "unimplemented syscall 162" (chimera issue #75). sync(2) cannot fail. */
+			return sok(0);
+		case NR_fsync: case NR_fdatasync: case NR_syncfs:
+			/* the same, for one descriptor: it is flushed if it is open at all */
+			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_rt_sigprocmask: return sok(0);
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));

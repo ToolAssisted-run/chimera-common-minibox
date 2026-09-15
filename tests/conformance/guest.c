@@ -97,6 +97,17 @@ ECL_EXPORT int Init(void) {
 		if (got <= 0) return 0;
 		if (syscall(SYS_sched_setaffinity, 0, (size_t)got, mask) != 0) return 0;
 	}
+	/* Flushing, the same way round: raw syscalls, because a missing one killed
+	 * RPCS3 on its first save ("unimplemented syscall 162", chimera #75). There
+	 * is nothing to flush in a machine whose files are memory, so the only thing
+	 * that may differ is a descriptor that is not open. */
+	{
+		if (syscall(SYS_sync) != 0) return 0;
+		if (syscall(SYS_fsync, 2) != 0) return 0;
+		if (syscall(SYS_fdatasync, 2) != 0) return 0;
+		if (syscall(SYS_syncfs, 2) != 0) return 0;
+		if (syscall(SYS_fsync, 999) != -1) return 0;
+	}
 
 	g_acc = seed;
 	g_step = 0;

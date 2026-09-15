@@ -364,6 +364,12 @@ mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *ks) {
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *ks) {
 	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return stat_file(&fs->files[h->file], (kstat *)ks);
 }
+/* fsync/fdatasync/syncfs: there is nothing to flush - a mounted file lives in
+ * host memory, and what reaches a host file is written when it is unmounted -
+ * so the only answer that can differ is whether the descriptor is open. */
+mb_sword mb_fs_sync_fd(mb_fs *fs, int fd) {
+	return handle_by_fd(fs, fd) ? 0 : -EBADF;
+}
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size) {
 	mounted_file *f = by_name(fs, name);
 	if (!f) return -ENOENT;

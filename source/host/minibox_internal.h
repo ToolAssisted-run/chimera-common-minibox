@@ -421,6 +421,7 @@ mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *kstat);
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *kstat);
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
+mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
 size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap); /* newest console bytes, oldest first */
 
 /* Internal helpers shared with tripguard (memblock.c). */
