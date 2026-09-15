@@ -210,9 +210,9 @@ static bool trip(uintptr_t addr) {
 #ifdef _WIN32
 #include <windows.h>   /* VirtualQuery; include-guarded, the platform half includes it too */
 #endif
-static void say_code_and_regs(const unsigned char *ip, long rsp, long rbp, long rax, long rbx,
-                              long rcx, long rdx, long rsi, long rdi, long r8, long r9,
-                              long r10, long r11, long r12, long r13, long r14, long r15) {
+static void say_code_and_regs(const unsigned char *ip, uintptr_t rsp, uintptr_t rbp, uintptr_t rax, uintptr_t rbx,
+                              uintptr_t rcx, uintptr_t rdx, uintptr_t rsi, uintptr_t rdi, uintptr_t r8, uintptr_t r9,
+                              uintptr_t r10, uintptr_t r11, uintptr_t r12, uintptr_t r13, uintptr_t r14, uintptr_t r15) {
 	/* Registers FIRST: they cannot fault. The bytes can - a jump into garbage
 	 * leaves rip at 0x2 or 0xf5, and reading there from inside this handler is
 	 * a second fault that ends the report before it has said anything useful
@@ -394,11 +394,26 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		mb_block *owner = NULL;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
-		mb_diag_banner("unhandled fault");
-		mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
-		        (void *)fault, write ? "write" : "read/exec",
-		        (void *)uc->uc_mcontext.gregs[REG_RIP],
-		        owner ? "inside a registered block" : "OUTSIDE every registered block");
+		/* A fault in HOST code is not the guest's, and it is not necessarily the
+		 * end: it goes on to whoever had the signal before - a runtime turns such
+		 * faults into exceptions all day. Only a guest's own fault is one miniBox
+		 * can call unhandled (issue #82 read a handled exception as four crashes). */
+		const bool guest_code = code_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+		const bool handler_follows = (g_old_sa.sa_flags & SA_SIGINFO)
+			|| (g_old_sa.sa_handler != SIG_DFL && g_old_sa.sa_handler != SIG_IGN);
+		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
+		if (guest_code)
+			mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
+			        (void *)fault, write ? "write" : "read/exec",
+			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        owner ? "inside a registered block" : "OUTSIDE every registered block");
+		else
+			mb_diag("[tripguard] fault in host code, passed on %s: addr=%p %s rip=%p, %s",
+			        handler_follows ? "to the handler that was there before (it may well be handled)"
+			                        : "to the default action (the process ends)",
+			        (void *)fault, write ? "write" : "read/exec",
+			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        owner ? "inside a registered block" : "outside every registered block");
 		if (owner) {
 			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
 			mb_diag(" (page %zu status=%u dirty=%u invisible=%u)",
@@ -430,8 +445,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
 				rethrow = false;
 			}
-		} else if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
-			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
+		}
 	}
 	g_fault_depth--;
 	if (rethrow) {
@@ -605,11 +619,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
 			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
 			        code == STATUS_PRIVILEGED_INSTRUCTION ? "privileged instruction" : "illegal instruction", (void *)rip);
-			say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
-			                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
-			                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
-			                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
-			                  (long)c->R14, (long)c->R15);
+			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
+			                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
+			                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
+			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
+			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
 			if (guest_can_die_here(rip)
 			    && mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_PRIVILEGED_INSTRUCTION
 			           ? "the core stopped itself after finding its own memory corrupt (a halt at %p)"
@@ -626,11 +640,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		if (guest_can_die_here(rip)) {
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner("the guest divided by zero");
-			say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
-			                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
-			                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
-			                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
-			                  (long)c->R14, (long)c->R15);
+			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
+			                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
+			                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
+			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
+			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
 			if (mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_INTEGER_DIVIDE_BY_ZERO
 			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
@@ -647,22 +661,34 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	if (write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
 	if (ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
 
-	/* About to become an unhandled access violation, i.e. an instant process
-	 * death with nothing to debug. Say what was asked for and whether any block
-	 * owns the address - the difference between "the guest touched something it
+	/* Not miniBox's to handle. Say what was asked for and whether any block owns
+	 * the address - the difference between "the guest touched something it
 	 * should not have" and "dirty-page tracking did not recognise its own
-	 * memory" is the whole diagnosis. */
+	 * memory" is the whole diagnosis.
+	 *
+	 * Only a fault in the GUEST's code is one miniBox can call unhandled. A
+	 * vectored handler runs first, so a fault in host code still goes on to the
+	 * process's own exception handlers, which catch such things routinely - the
+	 * CLR turns them into NullReferenceException, and re-raises through
+	 * KernelBase, so one handled exception used to be logged as two "unhandled"
+	 * faults (issue #82). If nobody handles it, the crash note says so. */
 	{
 		mb_block *owner = NULL;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
-		mb_diag_banner("unhandled fault");
-		mb_diag("[veh] unhandled fault: addr=%p access=%s rip=%p, %s",
-		        (void *)fault,
-		        ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read"
-		          : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute",
-		        (void *)ep->ContextRecord->Rip,
-		        owner ? "inside a registered block" : "OUTSIDE every registered block");
+		const bool guest_code = code_in_guest((uintptr_t)ep->ContextRecord->Rip);
+		const char *access = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read"
+		        : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute";
+		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
+		if (guest_code)
+			mb_diag("[veh] unhandled fault: addr=%p access=%s rip=%p, %s",
+			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
+			        owner ? "inside a registered block" : "OUTSIDE every registered block");
+		else
+			mb_diag("[veh] fault in host code, passed on to the process's exception handlers (it may well be handled):"
+			        " addr=%p access=%s rip=%p, %s",
+			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
+			        owner ? "inside a registered block" : "outside every registered block");
 		if (owner) {
 			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
 			mb_diag(" (page %zu status=%u dirty=%u invisible=%u)",
@@ -671,11 +697,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
 		const CONTEXT *c = ep->ContextRecord;
-		say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
-		                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
-		                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
-		                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
-		                  (long)c->R14, (long)c->R15);
+		say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
+		                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
+		                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
+		                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
+		                  (uintptr_t)c->R14, (uintptr_t)c->R15);
 		const uintptr_t rip = (uintptr_t)c->Rip;
 		if (guest_can_die_here(rip)) {
 			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
@@ -684,8 +710,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
-		} else if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
-			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
+		}
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

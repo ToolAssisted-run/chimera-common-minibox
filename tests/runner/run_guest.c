@@ -124,6 +124,58 @@ static int abort_child(const char *guest) {
 	return r.data == 1 ? 0 : 3;
 }
 
+#ifndef _WIN32
+#include <setjmp.h>
+#include <signal.h>
+/* The child half of the host-fault check: a SIGSEGV handler of the process's
+ * own is installed FIRST, the way a runtime's is (Mono turns such faults into
+ * exceptions), then a host is made - which puts tripguard in front of it - and
+ * host code reads through a null pointer. tripguard must pass it on; the
+ * process's handler recovers; the child exits 0. */
+static sigjmp_buf g_host_fault_env;
+static void host_fault_handler(int sig) { (void)sig; siglongjmp(g_host_fault_env, 1); }
+static int host_fault_child(const char *guest) {
+	mb_return r;
+	signal(SIGSEGV, host_fault_handler);
+	mb_host *h = make_host(guest, 0xABCD);
+	wbx_activate_host(h, &r);
+	if (sigsetjmp(g_host_fault_env, 1) == 0) {
+		volatile uintptr_t nowhere = 0x20;
+		volatile uint32_t v = *(volatile uint32_t *)nowhere;
+		(void)v;
+		return 3;   /* the read did not fault */
+	}
+	return 0;       /* it faulted, was passed on, and this process handled it */
+}
+
+/* A fault in HOST code is not the guest's, and miniBox cannot know whether the
+ * process will handle it - so the log must say it was passed on, not call it
+ * unhandled (issue #82: a handled exception read as four crashes). */
+static int host_fault_is_reported_as_passed_on(const char *self, const char *guest) {
+	const char *dir = getenv("TMPDIR");
+	if (dir == NULL || dir[0] == '\0') dir = "/tmp";
+	char log[512], cmd[2048];
+	snprintf(log, sizeof log, "%s/run_guest_hostfault_%ld.log", dir, (long)time(NULL));
+	remove(log);
+	setenv("MINIBOX_LOG", log, 1);
+	snprintf(cmd, sizeof cmd, "'%s' --host-fault-child '%s' >/dev/null 2>&1", self, guest);
+	int status = system(cmd);
+	unsetenv("MINIBOX_LOG");
+	static char text[64 * 1024];
+	size_t n = 0;
+	FILE *f = fopen(log, "rb");
+	if (f != NULL) { n = fread(text, 1, sizeof text - 1, f); fclose(f); }
+	text[n] = '\0';
+	remove(log);
+	const bool survived = status == 0;
+	const bool passed_on = strstr(text, "fault in host code, passed on") != NULL;
+	const bool not_unhandled = strstr(text, "unhandled fault") == NULL;
+	printf("run_guest: host fault child survived=%d, log says passed on=%d, log avoids \"unhandled\"=%d\n",
+	       survived, passed_on, not_unhandled);
+	return survived && passed_on && not_unhandled;
+}
+#endif
+
 /* A guest that aborts must leave its reason in the diagnostic log: the death
  * named as an abort, and what the guest last wrote to stderr. */
 static int guest_abort_is_reported(const char *self, const char *guest) {
@@ -229,6 +281,9 @@ static void guest_deaths_are_survived(const char *path) {
 
 int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
+#ifndef _WIN32
+	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
+#endif
 	const char *path = argc > 1 ? argv[1] : "guest.wbx";
 	mb_return r;
 
@@ -365,6 +420,12 @@ int main(int argc, char **argv) {
 
 	/* ---- a guest that dies does not take the host with it ---- */
 	guest_deaths_are_survived(path);
+
+#ifndef _WIN32
+	/* ---- a fault in host code is passed on, and said to be ---- */
+	STAGE("checking that a host fault is reported as passed on, not unhandled");
+	CHECK(host_fault_is_reported_as_passed_on(argv[0], path));
+#endif
 
 	/* ---- a guest that aborts says why, in the diagnostic log ---- */
 	STAGE("checking that a guest abort is reported with its last words");
