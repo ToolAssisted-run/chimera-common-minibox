@@ -127,4 +127,27 @@ ECL_EXPORT void Abort(void) {
 	abort();
 }
 
+/* What the guest finds in r10 where the host hands control back: on entering an
+ * export, and straight after a syscall returns. The host must leave nothing of
+ * its own there - it used to leave &mb_host.context, which a guest that spills a
+ * scratch register carried into its savestates (run_guest checks both read 0).
+ * Assembly, because a compiler owns r10 at every other point. brk(0) is the
+ * syscall: it only reads, and the host always implements it. */
+__asm__(
+	".text\n"
+	".globl EntryR10\n.type EntryR10,@function\n"
+	"EntryR10:\n"
+	"\tmov %r10, %rax\n"
+	"\tret\n"
+	".globl SyscallR10\n.type SyscallR10,@function\n"
+	"SyscallR10:\n"
+	"\tpush %rbx\n"
+	"\txor %edi, %edi\n"
+	"\tmov $12, %eax\n"
+	"\tmovabs $0x35f00000080, %r10\n"
+	"\tcall *%r10\n"
+	"\tmov %r10, %rax\n"
+	"\tpop %rbx\n"
+	"\tret\n");
+
 int main(void) { return 0; }
