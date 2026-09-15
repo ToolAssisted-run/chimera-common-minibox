@@ -188,14 +188,35 @@ to end the process writes that tail into `minibox-diag.log` after its own
 report: the unimplemented-syscall trap, and the unhandled-fault reports on both
 hosts.
 
-Two deaths are named for what they are. `tkill(self, SIGABRT)` - syscall 200
-with signal 6 - is musl's `abort()`, the end of a panic, a failed allocation or
-an assertion, so it is reported as "the guest aborted" rather than as a missing
-syscall. And on Windows, a `hlt` or `ud2` at a guest address is reported with its
-registers and the guest's output: musl's `a_crash()` is a `hlt`, and it is what
-the allocator runs when it finds its heap corrupt. The vectored handler used to
-look only at access violations, so that crash died without a word in the log.
+A guest that dies no longer takes the process with it (see "A guest that dies",
+below), but what it said still matters: the death's one-line reason quotes what
+the dying CALL wrote - output from earlier calls is not why this one died - and
+the full tail still goes to the log.
 
-`run_guest` checks the first of these end to end on Linux: the conformance guest
-writes a line to stderr and aborts in a child process, and the log must name the
-abort and carry the line.
+## A guest that dies
+
+A guest dies in ways that are nothing to do with the host: `abort()` (which musl
+turns into `tkill(self, SIGABRT)`, syscall 200 - a Rust panic, a failed
+allocation, an assertion), a `hlt` from musl's `a_crash()` when its heap check
+fails, a wild pointer, `ud2`, a division by zero, `exit()`, a deadlock, or a
+syscall the host does not provide. Each used to be a trap that ended the
+frontend.
+
+Every exported call now enters the guest through `guarded.S`, which leaves an
+escape record on the host stack. A death is recorded (`mb_host_guest_death`),
+the machine is marked dead, and control returns to that record - from host C
+through `mb_guarded_escape_now`, or from a fault handler (SIGSEGV, SIGILL, SIGFPE
+on Linux; the vectored handler on Windows) by rewriting the interrupted context.
+The call returns 0. Every later call into the machine returns 0 and runs
+nothing, until `wbx_load_state` revives it. `wbx_get_death` says whether it is
+dead and why.
+
+Still fatal: a fault in HOST code, a fault inside the fault handler, and a death
+outside a guarded call (the guest's `_start`, a seal), where there is nothing to
+return to. Those end the process as before, with their report in the log.
+
+`run_guest` kills one host eight ways in turn (the conformance guest's `Abort`,
+`Halt`, `Ud2`, `DivideByZero`, `WildWrite`, `ExitNow`, `UnknownSyscall`,
+`Deadlock`) and checks each returns, names itself, refuses the next call, and
+comes back exactly as saved after a state load - on Linux, under UBSan, and on
+Windows.
