@@ -700,6 +700,11 @@ void mb_host_diag_guest_output(mb_host *h) {
 
 void mb_host_destroy(mb_host *h) {
 	if (!h) return;
+	/* The fault handlers read the active context through mb_guest_ctx, and every
+	 * guest call sets it. A host that is gone must not be what they read: a second
+	 * machine opened in the same process took its first fault against this one's
+	 * freed context and wrote whatever was left there into the host's %fs. */
+	if (mb_guest_ctx == &h->context) mb_guest_ctx = NULL;
 	if (h->active) mb_block_deactivate(h->block);
 	free(h->plan_head); free(h->plan_tail);
 	mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf);

@@ -165,6 +165,9 @@ bool mb_fsbase_ok(void) {
 
 uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c) {
 	call_guest_simple_fn f = (call_guest_simple_fn)CALL_GUEST_SIMPLE_ADDR;
+	/* the context the fault handlers judge a fault against is the one running
+	 * now - for every guest, as the entry thunks set it */
+	mb_guest_ctx = c;
 #ifdef MB_HAVE_FSBASE
 	/* Guest code may use %fs-direct TLS (Rust does); give it its own thread
 	 * pointer and put the host's %fs back afterwards. On the very first entry
