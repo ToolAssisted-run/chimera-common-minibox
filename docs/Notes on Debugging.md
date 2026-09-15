@@ -220,3 +220,25 @@ return to. Those end the process as before, with their report in the log.
 `Deadlock`) and checks each returns, names itself, refuses the next call, and
 comes back exactly as saved after a state load - on Linux, under UBSan, and on
 Windows.
+
+## Two seals that disagree
+
+A state carries the hash of the sealed baseline it was made against, and a load
+refuses a state whose hash is not the block's ("state hash mismatch ... made by
+another machine"). When one core, one configuration and one host refuse each
+other's states across two processes, the two seals differ somewhere - and the
+hash alone does not say where.
+
+`MB_SEAL_DUMP=<file>` appends, at every seal, what the hash was taken over: for
+each page its address, status and snapshot kind, and the page's bytes when it
+kept a DATA snapshot. Seal twice, in two processes, and compare the files page by
+page.
+
+That is how issue #80 was found. PPSSPP's states were refused in every new
+process on Windows and never on Linux. Of 341,677 pages the two dumps differed
+in 2, both `MB_ST_RWSTACK` pages holding timer readings the boot had left below
+the stack pointer. A Windows stack page written before the seal keeps a snapshot
+(nothing reports its writes, so they are found by comparison), and the hash used
+to take those bytes. It now takes such a page by its tag, as on Linux.
+`test_stack_leftovers_are_not_identity` holds that line, and only the Windows run
+can fail it.

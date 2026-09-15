@@ -146,6 +146,42 @@ static void test_foreign_state_refused(void) {
 	mb_block_free(b);
 }
 
+/* What a stack holds when the machine is sealed is not part of which machine it
+ * is. Two boots of one core leave different leftovers below the stack pointer -
+ * PPSSPP's are timer readings - and on Windows a stack page written before the
+ * seal keeps a snapshot (to find its later writes), which the machine hash used
+ * to take the bytes of. So a state saved in one session was refused in the next
+ * (issue #80). On Linux such a page carries no snapshot, so this passes there
+ * either way; the cross-built Windows run is the one that holds the line. */
+static void test_stack_leftovers_are_not_identity(void) {
+	mb_block *a = mb_block_new((mb_range){ 0x36f00000000ull, 0x10000 });
+	mb_block_activate(a);
+	CHECK_EQ(mb_block_mmap_fixed(a, (mb_range){ 0x36f00000000ull, 0x8000 }, MB_PROT_RW, true), 0);
+	CHECK_EQ(mb_block_mmap_fixed(a, (mb_range){ 0x36f00008000ull, 0x8000 }, MB_PROT_RWSTACK, true), 0);
+	for (int i = 0; i < 0x8000; i++) gp(a, i)[0] = (uint8_t)(i * 5 + 9);
+	for (int i = 0x8000; i < 0x10000; i++) gp(a, i)[0] = (uint8_t)(i * 3 + 1);   /* one boot's leftovers */
+	CHECK_EQ(mb_block_seal(a), 0);
+	gp(a, 0x0010)[0] = 0xAA;
+	membuf st = {0};
+	CHECK_EQ(mb_block_save_state(a, membuf_write, (uintptr_t)&st), 0);
+	mb_block_free(a);
+
+	mb_block *b = mb_block_new((mb_range){ 0x36f00000000ull, 0x10000 });
+	mb_block_activate(b);
+	CHECK_EQ(mb_block_mmap_fixed(b, (mb_range){ 0x36f00000000ull, 0x8000 }, MB_PROT_RW, true), 0);
+	CHECK_EQ(mb_block_mmap_fixed(b, (mb_range){ 0x36f00008000ull, 0x8000 }, MB_PROT_RWSTACK, true), 0);
+	for (int i = 0; i < 0x8000; i++) gp(b, i)[0] = (uint8_t)(i * 5 + 9);          /* the same machine */
+	for (int i = 0x8000; i < 0x10000; i++) gp(b, i)[0] = (uint8_t)(i * 7 + 4);   /* another boot's leftovers */
+	CHECK_EQ(mb_block_seal(b), 0);
+
+	st.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&st), 0);
+	CHECK_EQ(gp(b, 0x0010)[0], 0xAA);
+	membuf_free(&st);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	RUN(test_revert_after_save);
 	RUN(test_invisible_excluded);
@@ -153,5 +189,6 @@ static void run_all(void) {
 	RUN(test_repeated_roundtrip);
 	RUN(test_save_before_seal);
 	RUN(test_foreign_state_refused);
+	RUN(test_stack_leftovers_are_not_identity);
 }
 TEST_MAIN()

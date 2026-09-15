@@ -998,10 +998,39 @@ int mb_block_seal(mb_block *b) {
 		switch (b->pages[i].snap_kind) {
 			case MB_SNAP_NONE: tag = 1; mb_sha256_update(&sh, &tag, sizeof(tag)); break;
 			case MB_SNAP_ZERO: tag = 2; mb_sha256_update(&sh, &tag, sizeof(tag)); break;
-			case MB_SNAP_DATA: mb_sha256_update(&sh, b->pages[i].snap_data, MB_PAGESIZE); break;
+			case MB_SNAP_DATA:
+				/* A Windows stack's snapshot is there to find its writes (above),
+				 * not to name the machine. What sits in it at seal is whatever the
+				 * boot left below the stack pointer - PPSSPP's is timer readings,
+				 * different in every process - and hashing it made a state saved
+				 * in one session refused in the next (issue #80). Such a page is
+				 * hashed as the live-baseline page it is on every other host. */
+				if (b->pages[i].status == MB_ST_RWSTACK) {
+					tag = 1; mb_sha256_update(&sh, &tag, sizeof(tag));
+				} else {
+					mb_sha256_update(&sh, b->pages[i].snap_data, MB_PAGESIZE);
+				}
+				break;
 		}
 	}
 	mb_sha256_final(&sh, b->hash);
+
+	/* MB_SEAL_DUMP=<file>: what the hash above was taken over, page by page -
+	 * address, status and snapshot kind, and the bytes of a DATA page - appended,
+	 * so two seals that disagree can be compared. A diagnostic; off unless set. */
+	const char *seal_dump = getenv("MB_SEAL_DUMP");
+	if (seal_dump != NULL && *seal_dump) {
+		FILE *df = fopen(seal_dump, "ab");
+		if (df != NULL) {
+			for (size_t i = 0; i < b->npages; i++) {
+				uint64_t rec[3] = { (uint64_t)(b->addr.start + (i << MB_PAGESHIFT)),
+				                    (uint64_t)b->pages[i].status, (uint64_t)b->pages[i].snap_kind };
+				fwrite(rec, sizeof(rec), 1, df);
+				if (b->pages[i].snap_kind == MB_SNAP_DATA) fwrite(b->pages[i].snap_data, MB_PAGESIZE, 1, df);
+			}
+			fclose(df);
+		}
+	}
 	return 0;
 }
 
