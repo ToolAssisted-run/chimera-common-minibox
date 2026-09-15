@@ -98,21 +98,22 @@ static void seal_and_activate(mb_host *h) {
  * stopped right after guest init" no matter where it really stopped. */
 #define STAGE(...) do { fprintf(stderr, "[stage] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 
-/* The child half of the abort check: make a host, let the guest abort. It does
- * not come back - the host's trap takes this process down, which is the point. */
+/* The child half of the abort check: make a host, let the guest abort. The call
+ * comes back - the machine is dead, the process is not - and the child says so
+ * by its exit status. A child still, so that MINIBOX_LOG names a fresh file. */
 static int abort_child(const char *guest) {
 	mb_return r;
 	mb_host *h = make_host(guest, 0xABCD);
 	wbx_activate_host(h, &r);
 	typedef void (MB_GUEST_ABI *abort_fn)(void);
 	((abort_fn)proc(h, "Abort"))();
-	printf("run_guest --abort-child: the guest's abort() returned\n");
-	return 3;
+	char why[256];
+	wbx_get_death(h, why, sizeof why, &r);
+	return r.data == 1 ? 0 : 3;
 }
 
-/* A guest that aborts must leave its reason in the diagnostic log: the trap's
- * own banner naming the abort, and what the guest last wrote to stderr. Run in a
- * child, since the abort ends the process that runs it. */
+/* A guest that aborts must leave its reason in the diagnostic log: the death
+ * named as an abort, and what the guest last wrote to stderr. */
 static int guest_abort_is_reported(const char *self, const char *guest) {
 #ifdef _WIN32
 	(void)self; (void)guest;
@@ -134,12 +135,78 @@ static int guest_abort_is_reported(const char *self, const char *guest) {
 	if (f != NULL) { n = fread(text, 1, sizeof text - 1, f); fclose(f); }
 	text[n] = '\0';
 	remove(log);
-	const bool died = status != 0;
-	const bool named = strstr(text, "the guest aborted") != NULL;
+	const bool survived = status == 0;
+	const bool named = strstr(text, "the core aborted") != NULL;
 	const bool words = strstr(text, "conformance guest: these are my last words") != NULL;
-	printf("run_guest: abort child died=%d, log names the abort=%d, log has the guest's words=%d\n", died, named, words);
-	return died && named && words;
+	printf("run_guest: abort child survived=%d, log names the abort=%d, log has the guest's words=%d\n", survived, named, words);
+	return survived && named && words;
 #endif
+}
+
+/* A guest that dies - in every way the conformance guest knows - hands control
+ * back. The call returns; the machine says why; every later call is refused and
+ * runs nothing; and a state load brings back exactly the machine that was saved,
+ * which the step after it proves. One host, killed and revived again and again. */
+static void guest_deaths_are_survived(const char *path) {
+	typedef void (MB_GUEST_ABI *void_fn)(void);
+	typedef uint32_t (MB_GUEST_ABI *alive_fn)(void);
+	mb_return r;
+	mb_host *h = make_host(path, 0xABCD);
+	wbx_activate_host(h, &r);
+	((setcb_fn)proc(h, "SetLogCallback"))(0);
+	CHECK(((init_fn)proc(h, "Init"))() == 1);
+	seal_and_activate(h);
+	alive_fn Alive = (alive_fn)proc(h, "Alive");
+	step_fn Step = (step_fn)proc(h, "Step");
+	CHECK(Alive() == 0xA11FE);
+
+	membuf state = {0};
+	wbx_deactivate_host(h, &r);
+	wbx_save_state(h, mem_write, (uintptr_t)&state, &r);
+	CHECK(!r.error_message[0]);
+	wbx_activate_host(h, &r);
+	const uint32_t expected = Step(0x5555);   /* what the saved machine does next */
+
+	static const struct { const char *name; const char *says; } deaths[] = {
+		{ "Abort", "aborted" },
+		{ "Halt", "stopped itself" },
+		{ "Ud2", "illegal instruction" },
+		{ "DivideByZero", "divided by zero" },
+		{ "WildWrite", "crashed" },
+		{ "ExitNow", "exited (status 7)" },
+		{ "UnknownSyscall", "system call 4242" },
+		{ "Deadlock", "deadlock" },
+	};
+	char why[512];
+	for (size_t i = 0; i < sizeof deaths / sizeof deaths[0]; i++) {
+		STAGE("a guest that dies: %s", deaths[i].name);
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0 && why[0] == '\0');
+		((void_fn)proc(h, deaths[i].name))();
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("run_guest: %s -> dead=%llu: %s\n", deaths[i].name, (unsigned long long)r.data, why);
+		CHECK(r.data == 1);
+		CHECK(strstr(why, deaths[i].says) != NULL);
+		/* the dying call's own words, and nobody else's: Abort says something
+		 * first, the others say nothing - and Init's lines are not theirs */
+		if (strcmp(deaths[i].name, "Abort") == 0) CHECK(strstr(why, "these are my last words") != NULL);
+		else CHECK(strstr(why, "It said") == NULL);
+		CHECK(strstr(why, "Init done") == NULL);
+		CHECK(Alive() == 0);   /* refused: nothing runs in a dead machine */
+
+		state.pos = 0;
+		wbx_deactivate_host(h, &r);
+		wbx_load_state(h, mem_read, (uintptr_t)&state, &r);
+		CHECK(!r.error_message[0]);
+		wbx_activate_host(h, &r);
+		wbx_get_death(h, why, sizeof why, &r);
+		CHECK(r.data == 0 && why[0] == '\0');
+		CHECK(Alive() == 0xA11FE);
+		CHECK(Step(0x5555) == expected);   /* the machine that was saved, exactly */
+	}
+	wbx_deactivate_host(h, &r);
+	wbx_destroy_host(h, &r);
+	free(state.buf);
 }
 
 int main(int argc, char **argv) {
@@ -265,6 +332,9 @@ int main(int argc, char **argv) {
 	wbx_destroy_host(hc, &r);
 
 	free(state.buf); free(junk.buf);
+
+	/* ---- a guest that dies does not take the host with it ---- */
+	guest_deaths_are_survived(path);
 
 	/* ---- a guest that aborts says why, in the diagnostic log ---- */
 	STAGE("checking that a guest abort is reported with its last words");

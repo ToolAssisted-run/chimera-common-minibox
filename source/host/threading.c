@@ -123,7 +123,16 @@ static uintptr_t swap_to_next(mb_threads *t, mb_context *c, uintptr_t ret) {
 	if (!found)
 		for (size_t i = 0; i < t->nthreads; i++)
 			if (t->threads[i].state == T_RUNNABLE) { best = t->threads[i].tid; found = true; break; }
-	if (!found) { fprintf(stderr, "miniBox: all threads fell asleep. states:"); for (size_t i=0;i<t->nthreads;i++) fprintf(stderr, " t%u=%s", t->threads[i].tid, t->threads[i].state==T_RUNNABLE?"R":"W"); fprintf(stderr, "\n"); __builtin_trap(); return ret; }
+	if (!found) {
+		/* every thread waits on another and none is left to wake them: a
+		 * deadlock, which on real hardware is a hang - here it stops the machine */
+		char states[160]; size_t o = 0;
+		for (size_t i = 0; i < t->nthreads && o + 16 < sizeof states; i++)
+			o += (size_t)snprintf(states + o, sizeof states - o, " t%u=%s", t->threads[i].tid,
+			                      t->threads[i].state == T_RUNNABLE ? "R" : "W");
+		states[o] = '\0';
+		mb_host_guest_death(c, "every thread of the core is waiting and none can wake the others (a deadlock:%s)", states);
+	}
 	if (best == t->active_tid) return ret;   /* yield that didn't change thread */
 	return swap_to(t, c, best, ret);
 }
@@ -161,14 +170,14 @@ mb_sword mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
 }
 
 uintptr_t mb_threads_exit(mb_threads *t, mb_context *c) {
-	if (t->active_tid == 1) { __builtin_trap(); }
+	if (t->active_tid == 1) mb_host_guest_death(c, "the core's main thread exited");
 	gthread *self = find_thread(t, t->active_tid);
 	uintptr_t addr = self->tid_address;
 	if (addr != 0) { *(uint32_t *)addr = 0; uint32_t tid; bool more; unpark_one(t, addr, &tid, &more); }
 	TDBG("exit tid=%u\n",t->active_tid);
 	uint32_t dead = t->active_tid;
 	uintptr_t ret = swap_to_next(t, c, sok(0));
-	if (t->active_tid == dead) { fprintf(stderr, "miniBox: last thread exited\n"); __builtin_trap(); }
+	if (t->active_tid == dead) mb_host_guest_death(c, "the core's last thread exited");
 	remove_thread(t, dead);
 	return ret;
 }
@@ -248,6 +257,8 @@ uint32_t mb_threads_set_tid_address(mb_threads *t, uintptr_t addr) {
 	return g->tid;
 }
 uint32_t mb_threads_get_tid(mb_threads *t) { return t->active_tid; }
+bool mb_threads_has_thread(mb_threads *t, uint32_t tid) { return find_thread(t, tid) != NULL; }
+void mb_threads_reset_active(mb_threads *t) { t->active_tid = 1; }
 uintptr_t mb_threads_yield(mb_threads *t, mb_context *c) { return swap_to_next(t, c, sok(0)); }
 
 /* ---- savestate (self-consistent; encoding is implementation-defined per SPEC) ---- */

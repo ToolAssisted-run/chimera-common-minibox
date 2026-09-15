@@ -322,7 +322,36 @@ typedef struct {
 	 * callbacks on the guest's %fs (see docs: the extcall path is NOT covered).
 	 * Read by the syscall dispatcher as a plain load, before any call. */
 	bool fs_swap;
+	/* The guest died (mb_host_guest_death): every call into it returns 0 at
+	 * once, until a state load revives it. Read by guarded.S. */
+	uint8_t dead;
+	/* The innermost escape record of a call in progress, or 0 outside one:
+	 * where a guest that dies sends control back to (guarded.S). */
+	uintptr_t esc_rsp;
+	/* Calls made into the guest, counted by guarded.S: which call some output
+	 * belongs to, so a death quotes what the dying call said and not what an
+	 * earlier one did. */
+	uint64_t calls;
 } mb_context;
+
+/* guarded.S: the one way into the guest for an exported call, and the two ways
+ * out of it for a guest that dies - from host C, or from a fault handler that
+ * points the interrupted context at mb_guarded_escape with rsp = esc_rsp. */
+void mb_guarded_call(void);
+void mb_guarded_escape(void);
+MB_SYSV __attribute__((noreturn)) void mb_guarded_escape_now(mb_context *c);
+
+/* host.c: the guest cannot go on. Says so in the diagnostic log, keeps the
+ * reason for wbx_get_death, marks the machine dead - and, inside a guarded
+ * call, leaves for its escape record. Outside one (the guest's _start, a seal)
+ * there is nothing to return to, and it traps as it always did. */
+__attribute__((noreturn, format(printf, 2, 3)))
+void mb_host_guest_death(mb_context *c, const char *fmt, ...);
+/* The same decision, for a fault handler: records the death and answers whether
+ * there is an escape record to send the interrupted context to. Never leaves
+ * by itself - the handler does, by rewriting the context. */
+__attribute__((format(printf, 2, 3)))
+bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...);
 
 /* Single-instruction %fs swaps (FSGSBASE). The guest and host share the CPU
  * thread; a Rust guest needs %fs = its thread pointer (mb_context.thread_area)
@@ -422,7 +451,11 @@ mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *kstat);
 mb_sword mb_fs_truncate_name(mb_fs *fs, const char *name, mb_sword size);
 mb_sword mb_fs_truncate_fd(mb_fs *fs, int fd, mb_sword size);
 mb_sword mb_fs_sync_fd(mb_fs *fs, int fd);
-size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap); /* newest console bytes, oldest first */
+size_t   mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap);
+/* bytes ever written to stdout/stderr, and the newest of those written since a
+ * count of them (at most cap, and at most what the ring still holds) */
+uint64_t mb_fs_sysout_total(const mb_fs *fs);
+size_t mb_fs_sysout_since(const mb_fs *fs, uint64_t mark, char *out, size_t cap); /* newest console bytes, oldest first */
 
 /* Internal helpers shared with tripguard (memblock.c). */
 mb_prot mb_page_native_prot(const mb_page *p);

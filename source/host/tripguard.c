@@ -17,6 +17,21 @@
 static mb_block *g_blocks[MAX_BLOCKS];
 static int g_nblocks = 0;
 
+/* Whether an instruction is the guest's own: guest code lives in a registered
+ * block, host code never does. */
+static bool code_in_guest(uintptr_t rip) {
+	for (int i = 0; i < g_nblocks; i++)
+		if (mb_range_contains(g_blocks[i]->addr, rip)) return true;
+	return false;
+}
+
+/* A fault the guest's own code took, with a machine to charge it to: that is a
+ * guest dying, which the host survives (mb_host_guest_death). Anything else - a
+ * fault in host code, or with no machine running - is not, and stays fatal. */
+static bool guest_can_die_here(uintptr_t rip) {
+	return mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0 && code_in_guest(rip);
+}
+
 /* Where an address IS, in the words the layout uses.
  *
  * "inside a registered block, page 20768" is arithmetic somebody has to do by
@@ -400,7 +415,22 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
 		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
 		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
-		if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
+		const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+		if (guest_can_die_here(rip)) {
+			/* a hlt in user mode arrives as this fault: it is musl's a_crash(),
+			 * which its allocator runs on finding the heap corrupt */
+			const bool halted = *(const unsigned char *)rip == 0xf4;
+			const bool escapable = halted
+				? mb_host_guest_death_in_handler(mb_guest_ctx,
+					"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
+				: mb_host_guest_death_in_handler(mb_guest_ctx,
+					"the core crashed: it %s address %p (at %p)", write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
+			if (escapable) {
+				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				rethrow = false;
+			}
+		} else if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
 			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
 	}
 	g_fault_depth--;
@@ -435,6 +465,44 @@ void mb_tripguard_ensure_altstack(void) {
 	if (!ss.ss_sp || sigaltstack(&ss, NULL) != 0) { perror("miniBox sigaltstack"); abort(); }
 }
 
+/* An illegal instruction (ud2) or an integer division by zero in guest code is
+ * the guest dying too. Anyone else's - a runtime that turns SIGFPE into a
+ * managed exception, say - goes to whoever had the signal before. */
+static struct sigaction g_old_ill, g_old_fpe;
+
+static void handler_other(int sig, siginfo_t *info, void *ucontext) {
+	ucontext_t *uc = (ucontext_t *)ucontext;
+	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	if (guest_can_die_here(rip)) {
+#ifdef MB_HAVE_FSBASE
+		/* host C from here on, which needs the host's %fs */
+		if (mb_fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+#endif
+		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
+		say_code_and_regs((const unsigned char *)rip,
+		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
+		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
+		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
+		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
+		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
+		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
+		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
+		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+		const bool escapable = sig == SIGILL
+			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core ran an illegal instruction at %p", (void *)rip)
+			: mb_host_guest_death_in_handler(mb_guest_ctx, "the core divided by zero at %p", (void *)rip);
+		if (escapable) {
+				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
+				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+			return;
+		}
+	}
+	const struct sigaction *old = sig == SIGILL ? &g_old_ill : &g_old_fpe;
+	if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
+	else if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) signal(sig, SIG_DFL);   /* the instruction runs again and the default takes it */
+	else old->sa_handler(sig);
+}
+
 static void initialize(void) {
 	trail_open();
 	mb_tripguard_ensure_altstack();
@@ -444,6 +512,14 @@ static void initialize(void) {
 	sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
 	sigfillset(&sa.sa_mask);
 	if (sigaction(SIGSEGV, &sa, &g_old_sa) != 0) { perror("miniBox sigaction"); abort(); }
+	struct sigaction other;
+	memset(&other, 0, sizeof(other));
+	other.sa_sigaction = handler_other;
+	other.sa_flags = SA_ONSTACK | SA_SIGINFO;
+	sigfillset(&other.sa_mask);
+	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
+		perror("miniBox sigaction"); abort();
+	}
 }
 
 #else
@@ -534,8 +610,33 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
 			                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
 			                  (long)c->R14, (long)c->R15);
-			if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
-				mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
+			if (guest_can_die_here(rip)
+			    && mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_PRIVILEGED_INSTRUCTION
+			           ? "the core stopped itself after finding its own memory corrupt (a halt at %p)"
+			           : "the core ran an illegal instruction at %p", (void *)rip)) {
+				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	if (code == STATUS_INTEGER_DIVIDE_BY_ZERO || code == STATUS_INTEGER_OVERFLOW) {
+		const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+		if (guest_can_die_here(rip)) {
+			const CONTEXT *c = ep->ContextRecord;
+			mb_diag_banner("the guest divided by zero");
+			say_code_and_regs((const unsigned char *)c->Rip, (long)c->Rsp, (long)c->Rbp,
+			                  (long)c->Rax, (long)c->Rbx, (long)c->Rcx, (long)c->Rdx,
+			                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
+			                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
+			                  (long)c->R14, (long)c->R15);
+			if (mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_INTEGER_DIVIDE_BY_ZERO
+			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
+				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
@@ -575,7 +676,15 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		                  (long)c->Rsi, (long)c->Rdi, (long)c->R8, (long)c->R9,
 		                  (long)c->R10, (long)c->R11, (long)c->R12, (long)c->R13,
 		                  (long)c->R14, (long)c->R15);
-		if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
+		const uintptr_t rip = (uintptr_t)c->Rip;
+		if (guest_can_die_here(rip)) {
+			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
+			        write ? "wrote to" : "read or ran", (void *)fault, (void *)rip)) {
+				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
+		} else if (mb_guest_ctx != NULL && mb_guest_ctx->host_ptr != 0)
 			mb_host_diag_guest_output((mb_host *)mb_guest_ctx->host_ptr);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;

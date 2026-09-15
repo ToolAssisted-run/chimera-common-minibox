@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 #include "minibox_internal.h"
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -22,6 +23,19 @@
 #define CALL_GUEST_IMPL_ADDR   (MB_ORG + 0x200)
 #define EXTCALL_THUNK_ADDR     (MB_ORG + 0x300)
 #define RUNTIME_TABLE_ADDR     (MB_ORG + 0x800)
+
+/* guarded.S reads the context by offset; any change to mb_context must move these */
+_Static_assert(offsetof(mb_context, thread_area) == 0x000, "guarded.S CTX_THREAD_AREA");
+_Static_assert(offsetof(mb_context, host_rsp) == 0x008, "guarded.S CTX_HOST_RSP");
+_Static_assert(offsetof(mb_context, guest_rsp) == 0x010, "guarded.S CTX_GUEST_RSP");
+_Static_assert(offsetof(mb_context, host_rsp_alt) == 0x018, "guarded.S CTX_HOST_RSP_ALT");
+_Static_assert(offsetof(mb_context, guest_rsp_alt) == 0x020, "guarded.S CTX_GUEST_RSP_ALT");
+_Static_assert(offsetof(mb_context, host_fs) == 0x238, "guarded.S CTX_HOST_FS");
+_Static_assert(offsetof(mb_context, fs_swap) == 0x240, "guarded.S CTX_FS_SWAP");
+_Static_assert(offsetof(mb_context, dead) == 0x241, "guarded.S CTX_DEAD");
+_Static_assert(offsetof(mb_context, esc_rsp) == 0x248, "guarded.S CTX_ESC_RSP");
+_Static_assert(offsetof(mb_context, calls) == 0x250, "guarded.S CTX_CALLS");
+_Static_assert(MB_ORG + 0x200 == 0x35f00000200ull, "guarded.S CALL_GUEST_IMPL");
 
 /* interop.bin lives in the sibling reference tree; embedded at build time. */
 extern const unsigned char mb_interop_bin[];
@@ -210,43 +224,17 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0; /* no room */
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
-	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
-	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, guest_entry);          /* mov r11, entry */
-#ifdef MB_HAVE_FSBASE
-	if (c->fs_swap) {
-		/* An exported call reaches the guest through here, not through
-		 * mb_call_guest_simple, so the %fs swap a Rust guest needs has to live
-		 * in the thunk itself. The host's %fs goes BOTH into ctx->host_fs (the
-		 * syscall dispatcher reads it) and onto the stack (we restore from
-		 * there, because the interop may clobber r10 across the call). Only rax
-		 * and r11 are touched, so the guest's argument registers survive; r11
-		 * is free after the impl has consumed it. Stack stays 16-aligned: entry
-		 * rsp%16==8, push -> 0, call -> 8 at the callee. `call` rather than the
-		 * old `jmp` so control comes back here to restore %fs. */
-		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xc0); /* rdfsbase rax */
-		emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0x82);
-		emit32(&p, (uint32_t)offsetof(mb_context, host_fs));             /* mov [r10+off], rax */
-		emit8(&p, 0x50);                                                 /* push rax (host %fs, for the way out) */
-		emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd0);               /* mov rax, r10 */
-		emit8(&p, 0x48); emit8(&p, 0xa3);
-		emit64(&p, (uintptr_t)&mb_guest_ctx);                            /* mov [abs], rax: the fault handlers read the context through this */
-		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);               /* mov rax, [r10] (thread_area) */
-		emit8(&p, 0x48); emit8(&p, 0x85); emit8(&p, 0xc0);               /* test rax, rax */
-		emit8(&p, 0x74); emit8(&p, 0x05);                                /* jz +5 (skip wrfsbase) */
-		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
-		emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, CALL_GUEST_IMPL_ADDR); /* mov rax, impl */
-		emit8(&p, 0xff); emit8(&p, 0xd0);                                /* call rax */
-		emit8(&p, 0x49); emit8(&p, 0x89); emit8(&p, 0xc3);               /* mov r11, rax (save retval) */
-		emit8(&p, 0x58);                                                 /* pop rax (host %fs) */
-		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
-		emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);               /* mov rax, r11 (retval) */
-		emit8(&p, 0xc3);                                                 /* ret */
-	} else
-#endif
-	{
-		emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, CALL_GUEST_IMPL_ADDR); /* mov rax, impl */
-		emit8(&p, 0xff); emit8(&p, 0xe0);                                   /* jmp rax */
-	}
+	/* The thunk only says which call this is. Everything a call needs - the %fs
+	 * swap a Rust guest wants, the escape record a guest that dies returns
+	 * through - is one routine in guarded.S, entered with r10 = context and
+	 * r11 = the guest function, the arguments untouched. The context also goes
+	 * where the fault handlers read it: to repair %fs, and to find that record. */
+	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);            /* mov r10, ctx */
+	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, guest_entry);              /* mov r11, entry */
+	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd0);                      /* mov rax, r10 */
+	emit8(&p, 0x48); emit8(&p, 0xa3); emit64(&p, (uintptr_t)&mb_guest_ctx); /* mov [abs], rax */
+	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, (uintptr_t)&mb_guarded_call); /* mov rax, guarded */
+	emit8(&p, 0xff); emit8(&p, 0xe0);                                       /* jmp rax */
 	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
 		 * later as a call into the middle of an instruction. */

@@ -15,6 +15,7 @@ minibox_host_sources = files(
   'tripguard.c',
   'interop_bin.c',
   'context.c',
+  'guarded.S',
   'elf.c',
   'fs.c',
   'host.c',

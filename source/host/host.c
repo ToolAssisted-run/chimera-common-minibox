@@ -6,6 +6,7 @@
 #include "minibox_threads.h"
 #include "minibox.h"
 #include <errno.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -31,6 +32,11 @@ struct mb_host {
 	 * state is asked for, because it describes that moment (mb_host_state_size) */
 	uint8_t *plan_head; size_t plan_head_len;
 	uint8_t *plan_tail; size_t plan_tail_len;
+	/* why the guest died, for wbx_get_death; meaningful while context.dead */
+	char death[512];
+	/* where the output of the call that last wrote any begins (context.calls,
+	 * and the output count then): the dying call's own words */
+	uint64_t out_call, out_mark;
 };
 
 /* ---- syscall numbers (x86-64) ---- */
@@ -42,7 +48,8 @@ enum {
 	NR_getppid=110, NR_gettid=186, NR_futex=202, NR_sched_setaffinity=203, NR_sched_getaffinity=204, NR_pread64=17, NR_sysinfo=99, NR_prctl=157, NR_openat=257, NR_newfstatat=262, NR_set_thread_area=205, NR_clock_nanosleep=230,
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
-	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000
+	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
+	NR_tkill=200, NR_exit_group=231, NR_tgkill=234
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -117,6 +124,104 @@ static const char *guest_str(mb_host *h, uintptr_t addr)
 
 static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp);
+
+/* ---- a guest that cannot go on ----
+ *
+ * A guest dies in ways that are nothing to do with the host: it aborts (a Rust
+ * panic, a failed allocation, an assertion), it finds its own heap corrupt and
+ * halts, it follows a wild pointer, it exits, it asks for a syscall nobody
+ * provides. Each of those used to be a trap, and the trap took the frontend
+ * with it - the session, what was not saved, and the chance to say why.
+ *
+ * Now the machine is marked dead and the call that was running returns to the
+ * host (guarded.S). Nothing of the guest runs again until a state is loaded,
+ * which is a machine that did exist - so the frontend can show why, keep its
+ * work, and carry on from its history. Only a death outside a call the host
+ * made (the guest's _start, a seal) still traps: there is nothing to go back
+ * to. And a fault in HOST code is not a guest's death at all; it stays fatal. */
+
+/* The newest few lines the dying call wrote, joined: usually the reason in the
+ * guest's own words. Only this call's - a line from frames ago is not why this
+ * one died. A Rust panic ends with a "note:" about backtraces, which is not
+ * the reason either. */
+static void guest_last_words(mb_host *h, char *out, size_t cap) {
+	out[0] = '\0';
+	if (h == NULL || h->fs == NULL || cap < 4) return;
+	if (h->out_call != h->context.calls) return;   /* it said nothing this call */
+	static char tail[4096];
+	const size_t n = mb_fs_sysout_since(h->fs, h->out_mark, tail, sizeof tail);
+	const char *lines[3]; size_t lens[3]; int count = 0;
+	size_t end = n;
+	while (end > 0 && count < 3) {
+		while (end > 0 && (tail[end - 1] == '\n' || tail[end - 1] == '\r')) end--;
+		size_t start = end;
+		while (start > 0 && tail[start - 1] != '\n') start--;
+		if (end > start && !(end - start >= 5 && memcmp(tail + start, "note:", 5) == 0)) {
+			lines[count] = tail + start; lens[count] = end - start; count++;
+		}
+		end = start;
+	}
+	size_t o = 0;
+	for (int i = count - 1; i >= 0 && o + 1 < cap; i--) {
+		if (o != 0) { if (o + 4 >= cap) break; memcpy(out + o, " | ", 3); o += 3; }
+		size_t take = lens[i] < cap - 1 - o ? lens[i] : cap - 1 - o;
+		memcpy(out + o, lines[i], take); o += take;
+	}
+	out[o] = '\0';
+}
+
+/* Says it, keeps it, marks it. True when a guarded call is in progress to go
+ * back to. */
+static bool record_death(mb_context *c, const char *fmt, va_list ap) {
+	mb_host *h = c != NULL ? (mb_host *)c->host_ptr : NULL;
+	char what[256];
+	vsnprintf(what, sizeof what, fmt, ap);
+	mb_diag_banner("the guest died");
+	mb_diag("miniBox: %s\n", what);
+	if (h != NULL) {
+		mb_host_diag_guest_output(h);
+		char words[300];
+		guest_last_words(h, words, sizeof words);
+		if (words[0] != '\0') snprintf(h->death, sizeof h->death, "%s. It said: %s", what, words);
+		else snprintf(h->death, sizeof h->death, "%s", what);
+	}
+	if (c == NULL) return false;
+	c->dead = 1;
+	const bool escapable = c->esc_rsp != 0;
+	mb_diag(escapable
+		? "  the call returns to the host, and the machine runs nothing until a state is loaded\n"
+		: "  not inside a call the host made, so there is nothing to return to\n");
+	return escapable;
+}
+
+void mb_host_guest_death(mb_context *c, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	const bool escapable = record_death(c, fmt, ap);
+	va_end(ap);
+	if (escapable) mb_guarded_escape_now(c);
+	__builtin_trap();
+}
+
+bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	const bool escapable = record_death(c, fmt, ap);
+	va_end(ap);
+	return escapable;
+}
+
+bool mb_host_death(mb_host *h, char *out, size_t cap) {
+	const bool dead = h->context.dead != 0;
+	if (out != NULL && cap != 0) {
+		const char *src = dead ? h->death : "";
+		size_t n = strlen(src);
+		if (n >= cap) n = cap - 1;
+		memcpy(out, src, n);
+		out[n] = '\0';
+	}
+	return dead;
+}
 
 /* Tracing wrapper: the arguments go out BEFORE the syscall runs (a crash
  * inside it still shows what was asked), the result right after - a call
@@ -212,10 +317,21 @@ static void diag_guest_callers(mb_host *h) {
 	mb_diag("[mmap]   addr2line -f -C -e core.wbx <addr> names these\n");
 }
 
+/* After a write: if it reached stdout or stderr and is the first this call made,
+ * this call's words start where the output stood before it. */
+static void note_output(mb_host *h, uint64_t before) {
+	if (mb_fs_sysout_total(h->fs) == before || h->out_call == h->context.calls) return;
+	h->out_call = h->context.calls;
+	h->out_mark = before;
+}
+
 static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
 	mb_host *h = (mb_host *)hp;
 	(void)a6;
+	/* Already dead - it died in a call made from inside a host callback, and the
+	 * guest that made the callback carried on regardless. It runs nothing more. */
+	if (h->context.dead && h->context.esc_rsp != 0) mb_guarded_escape_now(&h->context);
 	switch (nr) {
 		case NR_mmap: {
 			bool bad; mb_prot prot = arg_to_prot(a3, &bad); if (bad) return serr(EINVAL);
@@ -270,19 +386,26 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		case NR_fstat: { mb_sword r = mb_fs_stat_fd(h->fs, (int)a1, (void *)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ioctl: return sok(0);
 		case NR_read:  { mb_sword r = mb_fs_read(h->fs, (int)a1, (uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
-		case NR_write: { mb_sword r = mb_fs_write(h->fs, (int)a1, (const uint8_t *)a2, a3); return r < 0 ? serr((int)-r) : sok(r); }
+		case NR_write: {
+			const uint64_t before = mb_fs_sysout_total(h->fs);
+			mb_sword r = mb_fs_write(h->fs, (int)a1, (const uint8_t *)a2, a3);
+			note_output(h, before);
+			return r < 0 ? serr((int)-r) : sok(r);
+		}
 		case NR_readv: case NR_writev: {
 			/* iovec: {void* base; size_t len} */
 			struct iov { uintptr_t base; uintptr_t len; } *iov = (struct iov *)a2;
 			mb_sword total = 0;
+			const uint64_t before = mb_fs_sysout_total(h->fs);
 			for (uintptr_t i = 0; i < a3; i++) {
 				if (!iov[i].base) continue;
 				mb_sword r = (nr == NR_readv)
 					? mb_fs_read(h->fs, (int)a1, (uint8_t *)iov[i].base, iov[i].len)
 					: mb_fs_write(h->fs, (int)a1, (const uint8_t *)iov[i].base, iov[i].len);
-				if (r < 0) return serr((int)-r);
+				if (r < 0) { note_output(h, before); return serr((int)-r); }
 				total += r;
 			}
+			note_output(h, before);
 			return sok(total);
 		}
 		case NR_open:  { const char *p = guest_str(h, a1); if (!p) return serr(EFAULT);
@@ -379,6 +502,22 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			/* the same, for one descriptor: it is flushed if it is open at all */
 			{ mb_sword r = mb_fs_sync_fd(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_rt_sigprocmask: return sok(0);
+		case NR_tkill: case NR_tgkill: {
+			/* A signal to one of its own threads. The one a guest sends is to itself:
+			 * musl's abort() is tkill(self, SIGABRT), which is how a Rust panic, a
+			 * failed allocation and a failed assertion all end (chimera issue #43
+			 * met it as "unimplemented syscall 200"). Signal 0 asks whether a thread
+			 * exists, and is answered. Any other cannot be delivered - a guest has no
+			 * signal handlers here - and would have ended a Linux process, so it ends
+			 * the machine the same way. */
+			const uintptr_t tid = nr == NR_tkill ? a1 : a2;
+			const uintptr_t sig = nr == NR_tkill ? a2 : a3;
+			if (sig == 0) return mb_threads_has_thread(h->threads, (uint32_t)tid) ? sok(0) : serr(ESRCH);
+			if (sig == 6) mb_host_guest_death(&h->context, "the core aborted");
+			mb_host_guest_death(&h->context, "the core raised signal %llu against itself", (unsigned long long)sig);
+		}
+		case NR_exit_group:
+			mb_host_guest_death(&h->context, "the core exited (status %lld)", (long long)(intptr_t)a1);
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, a1));
 		case NR_gettid: return sok(mb_threads_get_tid(h->threads));
@@ -457,27 +596,14 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				default: return serr(ENOSYS);
 			}
 		}
-		default: {
-			/* flush before trapping: an illegal instruction takes the process down
-			 * without running atexit, and a redirected stderr would lose the one
-			 * line that explains the crash.
-			 *
-			 * tkill(self, SIGABRT) - syscall 200, signal 6 - is not a guest asking
-			 * for something missing: it is musl's abort(), which is what a Rust
-			 * panic, a failed allocation or a failed assertion ends in. The guest
-			 * has already said why on its stderr, so that is printed with it. */
-			const bool aborted = nr == 200 && a2 == 6;
-			mb_diag_banner(aborted ? "the guest aborted" : "unimplemented syscall");
-			mb_diag("miniBox: unimplemented syscall %llu (%llx, %llx, %llx)\n",
+		default:
+			/* Something the host does not provide. Answering ENOSYS would send the
+			 * guest down a path nobody has looked at, so the rule is still to stop
+			 * and say what was asked - stopping the machine, not the process. */
+			mb_host_guest_death(&h->context,
+			        "the core asked for system call %llu (%llx, %llx, %llx), which the sandbox does not provide",
 			        (unsigned long long)nr, (unsigned long long)a1,
 			        (unsigned long long)a2, (unsigned long long)a3);
-			if (aborted)
-				mb_diag("  that is tkill(SIGABRT): the guest called abort() - a panic, a failed allocation or an assertion.\n");
-			else
-				mb_diag("  the guest asked the host for something it does not provide; it cannot continue.\n");
-			mb_host_diag_guest_output(h);
-			__builtin_trap();
-		}
 			return serr(ENOSYS);
 	}
 }
@@ -800,6 +926,10 @@ static int expect(mb_read_cb r, uintptr_t ud, const char *magic, size_t n) {
 int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, size_t errlen) {
 	if (!h->sealed) { snprintf(errbuf, errlen, "Not sealed!"); return -1; }
 	bool was_active = h->active; mb_host_activate(h);
+	/* A machine that died on another thread than the first is still "on" that
+	 * thread, and a thread set only loads onto a machine on its first. The load
+	 * replaces every thread anyway. */
+	if (h->context.dead) mb_threads_reset_active(h->threads);
 	int rc = -1;
 	uint8_t elfhash[32];
 	if (expect(r, ud, SAVE_START, sizeof(SAVE_START)-1)) { snprintf(errbuf, errlen, "bad start magic"); goto done; }
@@ -812,6 +942,9 @@ int mb_host_load_state(mb_host *h, mb_read_cb r, uintptr_t ud, char *errbuf, siz
 	if (mb_threads_load(h->threads, &h->context, r, ud) != 0) { snprintf(errbuf, errlen, "thread set load failed"); goto done; }
 	if (expect(r, ud, SAVE_END, sizeof(SAVE_END)-1)) { snprintf(errbuf, errlen, "bad end magic"); goto done; }
 	rc = 0;
+	/* a whole machine that did exist: whatever killed the last one is gone */
+	h->context.dead = 0;
+	h->death[0] = '\0';
 done:
 	if (!was_active) mb_host_deactivate(h);
 	return rc;

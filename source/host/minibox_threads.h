@@ -27,4 +27,10 @@ uintptr_t mb_threads_futex_unlock_pi(mb_threads *t, mb_context *c, uintptr_t add
 int mb_threads_save(mb_threads *t, mb_context *c, mb_write_cb w, uintptr_t ud);
 int mb_threads_load(mb_threads *t, mb_context *c, mb_read_cb r, uintptr_t ud);
 
+/* whether a thread of that id exists (tkill with signal 0 asks) */
+bool mb_threads_has_thread(mb_threads *t, uint32_t tid);
+/* before loading a state onto a machine that died on another thread than its
+ * first: a thread set only loads onto the first, and the load replaces them all */
+void mb_threads_reset_active(mb_threads *t);
+
 #endif

@@ -161,4 +161,67 @@ __asm__(
 	"\tpop %rbx\n"
 	"\tret\n");
 
+/* ---- ways a guest dies ----
+ * Each export below ends the machine a different way. The host must hand
+ * control back to the caller, say why, refuse every later call, and bring the
+ * machine back when a state is loaded (run_guest, "a guest that dies"). */
+ECL_EXPORT uint32_t Alive(void) { return 0xA11FE; }
+
+ECL_EXPORT void ExitNow(void) { exit(7); }   /* exit_group, after musl's atexit work */
+
+
+/* writes to an address no region of the machine covers */
+ECL_EXPORT void WildWrite(void) {
+	volatile uintptr_t where = 0x10;
+	*(volatile uint32_t *)where = 1;
+}
+
+/* Instructions the compiler would not emit on request. Halt is exactly musl's
+ * a_crash(), which its allocator runs when its own heap check fails. */
+__asm__(
+	".text\n"
+	".globl Halt\n.type Halt,@function\n"
+	"Halt:\n"
+	"\thlt\n"
+	"\tret\n"
+	".globl Ud2\n.type Ud2,@function\n"
+	"Ud2:\n"
+	"\tud2\n"
+	"\tret\n"
+	".globl DivideByZero\n.type DivideByZero,@function\n"
+	"DivideByZero:\n"
+	"\tmov $1, %eax\n"
+	"\txor %edx, %edx\n"
+	"\txor %ecx, %ecx\n"
+	"\tdiv %ecx\n"
+	"\tret\n"
+	/* straight into the host's syscall entry, as SyscallR10 does: libc's
+	 * syscall() is not the thing under test here */
+	".globl UnknownSyscall\n.type UnknownSyscall,@function\n"
+	"UnknownSyscall:\n"
+	"\tpush %rbx\n"
+	"\tmov $1, %edi\n"
+	"\tmov $2, %esi\n"
+	"\tmov $3, %edx\n"
+	"\tmov $4242, %eax\n"
+	"\tmovabs $0x35f00000080, %r10\n"
+	"\tcall *%r10\n"
+	"\tpop %rbx\n"
+	"\tret\n"
+	/* FUTEX_WAIT on a word that holds the value waited for, with no other
+	 * thread to wake it */
+	".local deadlock_word\n.comm deadlock_word,4,4\n"
+	".globl Deadlock\n.type Deadlock,@function\n"
+	"Deadlock:\n"
+	"\tpush %rbx\n"
+	"\tlea deadlock_word(%rip), %rdi\n"
+	"\txor %esi, %esi\n"
+	"\txor %edx, %edx\n"
+	"\txor %ecx, %ecx\n"
+	"\tmov $202, %eax\n"
+	"\tmovabs $0x35f00000080, %r10\n"
+	"\tcall *%r10\n"
+	"\tpop %rbx\n"
+	"\tret\n");
+
 int main(void) { return 0; }

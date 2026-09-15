@@ -79,6 +79,7 @@ struct mb_fs {
 	 * fatal paths (mb_host_diag_guest_output). Host memory, so no savestate
 	 * carries it and it cannot change the machine. */
 	char sysout_tail[16 * 1024];
+	uint64_t sysout_total;   /* every byte ever written to stdout and stderr */
 	size_t tail_at;      /* where the next byte goes */
 	bool tail_wrapped;   /* the ring is full: the oldest byte is at tail_at */
 };
@@ -270,6 +271,7 @@ mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n) {
 
 static void sysout_remember(mb_fs *fs, const uint8_t *buf, size_t n) {
 	const size_t cap = sizeof fs->sysout_tail;
+	fs->sysout_total += n;
 	if (n >= cap) {   /* more than the ring holds: only its end survives */
 		memcpy(fs->sysout_tail, buf + (n - cap), cap);
 		fs->tail_at = 0;
@@ -291,6 +293,14 @@ static void sysout_remember(mb_fs *fs, const uint8_t *buf, size_t n) {
 
 /* The newest bytes the guest wrote to stdout/stderr, oldest first, at most
  * `cap` of them. */
+uint64_t mb_fs_sysout_total(const mb_fs *fs) { return fs->sysout_total; }
+
+size_t mb_fs_sysout_since(const mb_fs *fs, uint64_t mark, char *out, size_t cap) {
+	if (mark >= fs->sysout_total) return 0;
+	const uint64_t since = fs->sysout_total - mark;
+	return mb_fs_sysout_tail(fs, out, since < cap ? (size_t)since : cap);
+}
+
 size_t mb_fs_sysout_tail(const mb_fs *fs, char *out, size_t cap) {
 	const size_t size = sizeof fs->sysout_tail;
 	const size_t have = fs->tail_wrapped ? size : fs->tail_at;

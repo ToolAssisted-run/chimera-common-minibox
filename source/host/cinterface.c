@@ -25,6 +25,7 @@ int       mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *o
 size_t    mb_host_page_len(mb_host *h);
 const uint8_t *mb_host_hash(mb_host *h);
 uint8_t   mb_host_page_info(mb_host *h, size_t i);
+bool      mb_host_death(mb_host *h, char *out, size_t cap);
 int       mb_host_save_state(mb_host *h, mb_write_callback w, uintptr_t ud, char *errbuf, size_t errlen);
 size_t    mb_host_state_size(mb_host *h);
 size_t    mb_host_state_plan(mb_host *h, uint8_t *dest, size_t size);
@@ -85,6 +86,9 @@ void wbx_activate_host(mb_host *obj, mb_return *ret) { mb_host_activate(obj); ok
 void wbx_deactivate_host(mb_host *obj, mb_return *ret) { mb_host_deactivate(obj); ok(ret, 0); }
 
 void wbx_get_proc_addr(mb_host *obj, const char *name, mb_return *ret) { ok(ret, mb_host_proc_addr(obj, name)); }
+void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret) {
+	ok(ret, mb_host_death(obj, out, cap) ? 1 : 0);
+}
 void wbx_get_proc_addr_raw(mb_host *obj, const char *name, mb_return *ret) { ok(ret, mb_host_proc_addr_raw(obj, name)); }
 void wbx_get_callin_addr(mb_host *obj, uintptr_t ptr, mb_return *ret) { ok(ret, mb_host_callin_addr(obj, ptr)); }
 

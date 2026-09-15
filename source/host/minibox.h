@@ -108,6 +108,12 @@ void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret);
 void wbx_set_always_evict_blocks(bool val);
 void wbx_get_page_len(mb_host *obj, mb_return *ret);
 void wbx_get_page_data(mb_host *obj, uintptr_t index, mb_return *ret);
+/* Whether the guest has died - aborted, halted, faulted, exited, or asked for
+ * something the host does not provide - and why, as one line for a person.
+ * ret->data is 1 for a dead machine and 0 for a live one; `out` receives the
+ * reason (empty while alive), cut to `cap`. A dead machine returns 0 from
+ * every call into it and runs nothing, until wbx_load_state revives it. */
+void wbx_get_death(mb_host *obj, char *out, uintptr_t cap, mb_return *ret);
 
 #ifdef __cplusplus
 }
