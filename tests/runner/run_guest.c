@@ -10,6 +10,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/syscall.h>
+#include <unistd.h>
+/* The host thread's %fs base: where glibc - and a runtime like Mono - keep this
+ * thread's state. Nothing done on behalf of a guest that does not use %fs may
+ * change it. */
+static uintptr_t host_fs_base(void) {
+	uintptr_t v = 0;
+	syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &v);
+	return v;
+}
+#endif
 
 typedef struct { FILE *f; } freader;
 static intptr_t file_read(uintptr_t ud, uint8_t *data, uintptr_t size) {
@@ -166,6 +178,9 @@ static void guest_deaths_are_survived(const char *path) {
 	CHECK(!r.error_message[0]);
 	wbx_activate_host(h, &r);
 	const uint32_t expected = Step(0x5555);   /* what the saved machine does next */
+#ifndef _WIN32
+	const uintptr_t fs_before_deaths = host_fs_base();
+#endif
 
 	static const struct { const char *name; const char *says; } deaths[] = {
 		{ "Abort", "aborted" },
@@ -203,6 +218,9 @@ static void guest_deaths_are_survived(const char *path) {
 		CHECK(r.data == 0 && why[0] == '\0');
 		CHECK(Alive() == 0xA11FE);
 		CHECK(Step(0x5555) == expected);   /* the machine that was saved, exactly */
+#ifndef _WIN32
+		CHECK(host_fs_base() == fs_before_deaths);   /* and the host's thread pointer, untouched */
+#endif
 	}
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
@@ -252,8 +270,20 @@ int main(int argc, char **argv) {
 	seal_and_activate(h);
 
 	STAGE("stepping the guest");
+#ifndef _WIN32
+	/* The first steps after the seal write to clean pages, so they take the
+	 * dirty-page faults. This guest is C: its thread pointer is not in %fs, and
+	 * the handler must leave the host's there - it once "repaired" it to the
+	 * guest's, and the frontend's runtime broke a few calls later. */
+	const uintptr_t fs_before_steps = host_fs_base();
+#endif
 	uint32_t s1 = Step(0x11111111);
 	uint32_t s2 = Step(0x22222222);
+#ifndef _WIN32
+	printf("run_guest: host %%fs across faulting steps: before=%llx after=%llx\n",
+	       (unsigned long long)fs_before_steps, (unsigned long long)host_fs_base());
+	CHECK(host_fs_base() == fs_before_steps);
+#endif
 	STAGE("steps done");
 	uint64_t acc_at_save = GetAcc();
 	CHECK(g_last_log == (uint32_t)acc_at_save);   /* the guest->host callback fired */

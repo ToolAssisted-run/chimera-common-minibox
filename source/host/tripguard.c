@@ -276,7 +276,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * them must be left exactly as it arrived. Asking the rip rather than
 	 * rdfsbase also means this still works when %fs has already been lost -
 	 * see the Windows handler below, where that is the normal case. */
-	const bool guest_rip = mb_fs_swap && mb_guest_ctx
+	const bool guest_rip = mb_guest_ctx && mb_guest_ctx->fs_swap
 	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
 	                                       ->uc_mcontext.gregs[REG_RIP]);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
@@ -476,7 +476,7 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	if (guest_can_die_here(rip)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
-		if (mb_fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
+		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 #endif
 		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
 		say_code_and_regs((const unsigned char *)rip,
@@ -560,7 +560,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
-	const bool guest_rip = mb_fs_swap && mb_guest_ctx
+	const bool guest_rip = mb_guest_ctx && mb_guest_ctx->fs_swap
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	/* The real register, not drop_fs_for_test's pretend one: that hook forces
