@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,8 +59,28 @@ static int bad_paths_are_refused(void) {
 	return 1;
 }
 
+/* The box has no /proc, and nothing mounted in it is a symlink.
+ *
+ * A core may still ask - RPCS3 does, twice, hunting for its own executable -
+ * and asking must not stop the machine. Both answers are checked, because a
+ * host that refused everything with a single errno would hide the difference
+ * between a name that is not here and a name that is here and is not a link.
+ *
+ * Returns 1 when both were refused, for the right reason. */
+static int readlinks_are_refused(void) {
+	char buf[64];
+	errno = 0;
+	if (readlink("/proc/self/exe", buf, sizeof buf) >= 0) return 0;
+	if (errno != ENOENT) return 0;
+	errno = 0;
+	if (readlink("seed", buf, sizeof buf) >= 0) return 0;   /* mounted, not a link */
+	if (errno != EINVAL) return 0;
+	return 1;
+}
+
 ECL_EXPORT int Init(void) {
 	if (!bad_paths_are_refused()) return 0;
+	if (!readlinks_are_refused()) return 0;
 	g_table = (uint32_t *)alloc_sealed(256 * sizeof(uint32_t));
 	if (!g_table) return 0;
 	uint32_t seed = read_seed();

@@ -49,7 +49,8 @@ enum {
 	NR_clock_gettime=228, NR_set_tid_address=218, NR_getrandom=318, NR_fcntl=72,
 	NR_fsync=74, NR_fdatasync=75, NR_sync=162, NR_syncfs=306,
 	NR_getuid=102, NR_getgid=104, NR_geteuid=107, NR_getegid=108, NR_wbx_clone=2000,
-	NR_tkill=200, NR_exit_group=231, NR_tgkill=234
+	NR_tkill=200, NR_exit_group=231, NR_tgkill=234,
+	NR_readlink=89, NR_readlinkat=267
 };
 
 #define MAP_ANONYMOUS 0x20
@@ -450,6 +451,34 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			const char *p = guest_str(h, a2); if (!p || !guest_owns(h, a3, 1)) return serr(EFAULT);
 			mb_sword r = mb_fs_stat_name(h->fs, p, (void *)a3);
 			return r < 0 ? serr((int)-r) : sok(0);
+		}
+		case NR_readlink: case NR_readlinkat: {
+			/* Nothing in this box is a symlink, and there is no /proc: the guest
+			 * namespace is flat, and every name in it was mounted by the host.
+			 *
+			 * RPCS3 asks anyway - readlink("/proc/self/exe", ..., PATH_MAX), once
+			 * in fs::get_executable_path and once while the overlay hunts for the
+			 * icons it draws - and until this arm existed the PS3 core stopped
+			 * dead there, "system call 89, which the sandbox does not provide",
+			 * before it had drawn a frame. Both call sites guard the result and
+			 * carry on without it: the overlay skips the icons it would have
+			 * loaded from disk, the path lookup returns an empty string and says
+			 * so. That is the branch every non-Linux build already takes.
+			 *
+			 * So the answer is a refusal, and not a path. A real executable path
+			 * would put the host's install directory inside the machine and make
+			 * what it does depend on where Chimera was unpacked - the reason
+			 * getuid below answers with one fixed identity. A made-up one would
+			 * send the guest hunting under a directory that cannot exist. Linux
+			 * answers EINVAL when a name is there and is not a link, and ENOENT
+			 * when it is not there; so does this. */
+			if (nr == NR_readlinkat && (int)a1 != -100) return serr(EBADF);
+			const uintptr_t pa  = nr == NR_readlink ? a1 : a2;
+			const uintptr_t buf = nr == NR_readlink ? a2 : a3;
+			const uintptr_t len = nr == NR_readlink ? a3 : a4;
+			const char *p = guest_str(h, pa); if (!p) return serr(EFAULT);
+			if (len && !guest_owns(h, buf, 1)) return serr(EFAULT);
+			return mb_fs_exists(h->fs, p) ? serr(EINVAL) : serr(ENOENT);
 		}
 		case NR_close: { mb_sword r = mb_fs_close(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_lseek: { mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a2, (int)a3); return r < 0 ? serr((int)-r) : sok(r); }

@@ -371,6 +371,10 @@ static mb_sword stat_file(mounted_file *f, kstat *s) {
 mb_sword mb_fs_stat_name(mb_fs *fs, const char *name, void *ks) {
 	mounted_file *f = by_name(fs, name); if (!f) return -ENOENT; return stat_file(f, (kstat *)ks);
 }
+/* Is there a name like this at all? readlink asks, so it can tell a name that
+ * is here and is not a link (EINVAL) from one that is not here (ENOENT),
+ * without filling in a stat that nobody wants. */
+bool mb_fs_exists(mb_fs *fs, const char *name) { return by_name(fs, name) != NULL; }
 mb_sword mb_fs_stat_fd(mb_fs *fs, int fd, void *ks) {
 	open_handle *h = handle_by_fd(fs, fd); if (!h) return -ENOENT; return stat_file(&fs->files[h->file], (kstat *)ks);
 }
