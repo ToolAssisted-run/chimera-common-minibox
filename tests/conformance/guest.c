@@ -159,6 +159,22 @@ __asm__(
 	"\tcall *%r10\n"
 	"\tmov %r10, %rax\n"
 	"\tpop %rbx\n"
+	"\tret\n"
+	/* And the third boundary: a guest calling OUT to a host callback comes back
+	 * through the blob's extcall path. That return used to leave the context in
+	 * r10 and the host callback's own scratch registers - stack addresses among
+	 * them - for the guest to spill. Calls the log callback the host registered. */
+	".globl ExtcallR10\n.type ExtcallR10,@function\n"
+	"ExtcallR10:\n"
+	"\tpush %rbx\n"
+	"\tmov g_log_cb(%rip), %rax\n"
+	"\ttest %rax, %rax\n"
+	"\tjz 1f\n"
+	"\txor %edi, %edi\n"
+	"\tcall *%rax\n"
+	"1:\n"
+	"\tmov %r10, %rax\n"
+	"\tpop %rbx\n"
 	"\tret\n");
 
 /* ---- ways a guest dies ----

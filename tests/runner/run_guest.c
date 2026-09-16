@@ -316,10 +316,13 @@ int main(int argc, char **argv) {
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		uint64_t at_entry = ((u64_fn)proc(h, "EntryR10"))();
 		uint64_t after_syscall = ((u64_fn)proc(h, "SyscallR10"))();
-		printf("run_guest: r10 seen by the guest on entry=%llx, after a syscall=%llx\n",
-		       (unsigned long long)at_entry, (unsigned long long)after_syscall);
+		uint64_t after_extcall = ((u64_fn)proc(h, "ExtcallR10"))();
+		printf("run_guest: r10 seen by the guest on entry=%llx, after a syscall=%llx, "
+		       "after a callback=%llx\n", (unsigned long long)at_entry,
+		       (unsigned long long)after_syscall, (unsigned long long)after_extcall);
 		CHECK(at_entry == 0);
 		CHECK(after_syscall == 0);
+		CHECK(after_extcall == 0);
 	}
 	STAGE("Init returned");
 	seal_and_activate(h);
