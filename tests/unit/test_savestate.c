@@ -182,6 +182,62 @@ static void test_stack_leftovers_are_not_identity(void) {
 	mb_block_free(b);
 }
 
+/* Two boots of one machine that differ only in whether the guest TOUCHED a page
+ * with zeros must be the same machine.
+ *
+ * A page never written reads back zeros, and so does a page written with zeros;
+ * a state load cannot tell them apart, so the seal must not either. Before this
+ * they hashed as different tags (ZERO vs NONE), and Ruffle reopened in one
+ * process sealed differently in 3 pages of 232,774 - enough to refuse a 246 MB
+ * greenzone that had loaded 195 states a moment earlier.
+ *
+ * The negative half matters just as much: a page written with something OTHER
+ * than zeros really is a different baseline, and must still refuse. */
+static void test_zeros_written_are_not_a_different_machine(void) {
+	mb_block *a = mb_block_new((mb_range){ 0x36f00000000ull, 0x10000 });
+	mb_block_activate(a);
+	CHECK_EQ(mb_block_mmap_fixed(a, (mb_range){ 0x36f00000000ull, 0x10000 }, MB_PROT_RW, true), 0);
+	for (int i = 0; i < 0x8000; i++) gp(a, i)[0] = (uint8_t)(i * 5 + 9);   /* the machine proper */
+	CHECK_EQ(mb_block_seal(a), 0);
+	uint8_t hash_a[32];
+	memcpy(hash_a, mb_block_hash(a), 32);
+	/* a state to carry across, taken before the block goes: one address, one
+	 * block at a time - mapping a second at 0x36f00000000 while this one lives
+	 * fails with "slice busy" */
+	gp(a, 0x0010)[0] = 0xAA;
+	membuf st = {0};
+	CHECK_EQ(mb_block_save_state(a, membuf_write, (uintptr_t)&st), 0);
+	mb_block_free(a);
+
+	/* the same machine, but one page of the untouched tail was written with
+	 * zeros on the way to the seal - as an allocator clearing a fresh page does */
+	mb_block *b = mb_block_new((mb_range){ 0x36f00000000ull, 0x10000 });
+	mb_block_activate(b);
+	CHECK_EQ(mb_block_mmap_fixed(b, (mb_range){ 0x36f00000000ull, 0x10000 }, MB_PROT_RW, true), 0);
+	for (int i = 0; i < 0x8000; i++) gp(b, i)[0] = (uint8_t)(i * 5 + 9);
+	memset(gp(b, 0xC000), 0, MB_PAGESIZE);
+	CHECK_EQ(mb_block_seal(b), 0);
+	CHECK_EQ(memcmp(hash_a, mb_block_hash(b), 32), 0);
+
+	/* and a state really does cross between them */
+	st.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&st), 0);
+	CHECK_EQ(gp(b, 0x0010)[0], 0xAA);
+	CHECK(mb_block_maps_consistent(b));
+	membuf_free(&st);
+	mb_block_free(b);
+
+	/* NOT zeros: a genuinely different baseline, still refused */
+	mb_block *c = mb_block_new((mb_range){ 0x36f00000000ull, 0x10000 });
+	mb_block_activate(c);
+	CHECK_EQ(mb_block_mmap_fixed(c, (mb_range){ 0x36f00000000ull, 0x10000 }, MB_PROT_RW, true), 0);
+	for (int i = 0; i < 0x8000; i++) gp(c, i)[0] = (uint8_t)(i * 5 + 9);
+	memset(gp(c, 0xC000), 0x7E, MB_PAGESIZE);
+	CHECK_EQ(mb_block_seal(c), 0);
+	CHECK(memcmp(hash_a, mb_block_hash(c), 32) != 0);
+	mb_block_free(c);
+}
+
 static void run_all(void) {
 	RUN(test_revert_after_save);
 	RUN(test_invisible_excluded);
@@ -190,5 +246,6 @@ static void run_all(void) {
 	RUN(test_save_before_seal);
 	RUN(test_foreign_state_refused);
 	RUN(test_stack_leftovers_are_not_identity);
+	RUN(test_zeros_written_are_not_a_different_machine);
 }
 TEST_MAIN()

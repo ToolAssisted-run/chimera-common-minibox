@@ -963,6 +963,16 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 	return 0;
 }
 
+/* Whether a page whose baseline is live memory reads back as zeros. The seal's
+ * identity is what a CLEAN page gives a state load, and zeros written by the
+ * guest are indistinguishable from a page never written - see mb_block_seal. */
+static bool page_reads_back_zero(const mb_block *b, size_t i) {
+	if (b->pages[i].uncommitted) return true;   /* nothing backs it; it reads zero */
+	const uint64_t *w = (const uint64_t *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT));
+	for (size_t k = 0; k < MB_PAGESIZE / sizeof(uint64_t); k++) if (w[k]) return false;
+	return true;
+}
+
 /* ---- seal ---- */
 
 int mb_block_seal(mb_block *b) {
@@ -985,6 +995,21 @@ int mb_block_seal(mb_block *b) {
 			if (b->pages[i].status == MB_ST_RWSTACK)
 				mb_page_maybe_snapshot(&b->pages[i], mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
 #endif
+			/* A baseline that reads back as zeros IS a zero page, and saying so is
+			 * not bookkeeping: NONE and ZERO are reverted differently. A state that
+			 * has this page clean while the machine has it dirty is restored by
+			 * memset for ZERO, and REFUSES THE WHOLE LOAD for NONE ("missing
+			 * snapshot for dirty region"). Leaving a zero-filled page as NONE was
+			 * therefore both a false difference between machines and a load that
+			 * could not be undone.
+			 *
+			 * It made two boots of one core in one process disagree: Ruffle sealed
+			 * 3 pages of 232,774 as ZERO in one boot and NONE in the other - an
+			 * allocator had touched them with zeros on its way past - and those
+			 * three tags changed the machine hash, so a 246 MB greenzone that had
+			 * just restored 195 states restored 1 (chimera, 2026-09-16). */
+			if (b->pages[i].snap_kind == MB_SNAP_NONE && page_reads_back_zero(b, i))
+				b->pages[i].snap_kind = MB_SNAP_ZERO;
 		}
 	}
 	refresh_all(b);
@@ -1023,8 +1048,13 @@ int mb_block_seal(mb_block *b) {
 		FILE *df = fopen(seal_dump, "ab");
 		if (df != NULL) {
 			for (size_t i = 0; i < b->npages; i++) {
-				uint64_t rec[3] = { (uint64_t)(b->addr.start + (i << MB_PAGESHIFT)),
-				                    (uint64_t)b->pages[i].status, (uint64_t)b->pages[i].snap_kind };
+				/* The fourth word is what the page READS BACK AS, which the tag
+				 * alone does not say: a NONE page whose live bytes are all zero is
+				 * indistinguishable from a ZERO one to any state load, and telling
+				 * those apart is the whole question when two seals disagree. */
+				uint64_t rec[4] = { (uint64_t)(b->addr.start + (i << MB_PAGESHIFT)),
+				                    (uint64_t)b->pages[i].status, (uint64_t)b->pages[i].snap_kind,
+				                    (uint64_t)(page_reads_back_zero(b, i) ? 1 : 0) };
 				fwrite(rec, sizeof(rec), 1, df);
 				if (b->pages[i].snap_kind == MB_SNAP_DATA) fwrite(b->pages[i].snap_data, MB_PAGESIZE, 1, df);
 			}
