@@ -1431,6 +1431,19 @@ done:
 
 static const char DELTA_MAGIC[] = "MiniBoxDelta1";
 
+/* A data entry's index carries one flag in its top bit: the page was written
+ * during the epoch and then GIVEN BACK (munmap, MADV_DONTNEED), so it ends the
+ * epoch holding its baseline again and CLEAN - free_pages undirties a page
+ * whose baseline is zero. Without the flag, applying the delta wrote the zeros
+ * and marked the page dirty, so a machine rebuilt from deltas carried pages a
+ * machine that ran the same frames did not: identical bytes, a bigger state,
+ * and a byte-exact comparison of the two that could never pass (measured on a
+ * PS3: 100 such pages after a 55-delta restore). The flag rides in the index
+ * because every reader compares indices and the format's counts come first;
+ * a page index is nowhere near 2^63. */
+#define DELTA_IDX_CLEAN (UINT64_C(1) << 63)
+static uint64_t delta_page(uint64_t idx) { return idx & ~DELTA_IDX_CLEAN; }
+
 /* Forget what an epoch knew about one page, returning its pre-image. */
 static void epoch_clear_page(mb_page *p) {
 	p->epoch_dirty = false;
@@ -1561,6 +1574,7 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 			size_t i = (bw << 6) + (size_t)bits_first(m);
 			m &= m - 1;
 			uint64_t idx = i;
+			if (!b->pages[i].dirty) idx |= DELTA_IDX_CLEAN;   /* given back: baseline again, and clean */
 			if (wr(w, ud, &idx, sizeof(idx))) return -EIO;
 			ensure_committed(b, i, 1);   /* the live page, as the frame left it */
 			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
@@ -1649,7 +1663,7 @@ static int parts_read(mb_read_cb r, uintptr_t ud, delta_parts *d) {
 	for (uint64_t k = 0; k < d->ndata; k++) {
 		if (rd(r, ud, &d->didx[k], sizeof(uint64_t))
 			|| rd(r, ud, d->data + k * MB_PAGESIZE, MB_PAGESIZE)) { parts_free(d); return -EIO; }
-		if (d->didx[k] >= d->npages) { parts_free(d); return -EINVAL; }
+		if (delta_page(d->didx[k]) >= d->npages) { parts_free(d); return -EINVAL; }
 	}
 	return 0;
 }
@@ -1658,8 +1672,8 @@ static int parts_read(mb_read_cb r, uintptr_t ud, delta_parts *d) {
 static uint64_t merged_count(const uint64_t *a, uint64_t na, const uint64_t *b, uint64_t nb) {
 	uint64_t i = 0, j = 0, n = 0;
 	while (i < na && j < nb) {
-		if (a[i] < b[j]) i++;
-		else if (b[j] < a[i]) j++;
+		if (delta_page(a[i]) < delta_page(b[j])) i++;
+		else if (delta_page(b[j]) < delta_page(a[i])) j++;
 		else { i++; j++; }
 		n++;
 	}
@@ -1691,7 +1705,7 @@ typedef struct {
 static uint64_t view_idx(const uint8_t *entry) {
 	uint64_t v;
 	memcpy(&v, entry, sizeof v);
-	return v;
+	return delta_page(v);   /* the page: the clean flag stays in the entry, and travels with it */
 }
 
 /* Bounds-checked because a delta can come from a file somebody edited. */
@@ -1803,10 +1817,10 @@ int mb_block_delta_compose(mb_read_cb ra, uintptr_t uda, mb_read_cb rb, uintptr_
 
 	if (wr(w, ud, &ndata, sizeof(ndata))) goto done;
 	for (uint64_t i = 0, j = 0; i < a.ndata || j < b.ndata; ) {
-		bool takeB = i >= a.ndata || (j < b.ndata && b.didx[j] <= a.didx[i]);
-		uint64_t idx = takeB ? b.didx[j] : a.didx[i];
+		bool takeB = i >= a.ndata || (j < b.ndata && delta_page(b.didx[j]) <= delta_page(a.didx[i]));
+		uint64_t idx = takeB ? b.didx[j] : a.didx[i];   /* the later entry's flag with it */
 		const uint8_t *page = takeB ? b.data + j * MB_PAGESIZE : a.data + i * MB_PAGESIZE;
-		if (takeB) { if (i < a.ndata && a.didx[i] == idx) i++; j++; } else i++;
+		if (takeB) { if (i < a.ndata && delta_page(a.didx[i]) == delta_page(idx)) i++; j++; } else i++;
 		if (wr(w, ud, &idx, sizeof(idx)) || wr(w, ud, page, MB_PAGESIZE)) goto done;
 	}
 	rc = 0;
@@ -1859,6 +1873,8 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	for (uint64_t k = 0; k < ndata; k++) {
 		uint64_t idx = 0;
 		if (rd(r, ud, &idx, sizeof(idx))) goto done;
+		const bool clean = (idx & DELTA_IDX_CLEAN) != 0;
+		idx = delta_page(idx);
 		if (idx >= b->npages) { rc = -EINVAL; goto done; }
 		mb_page *p = &b->pages[idx];
 		const mb_prot before = mb_page_native_prot(p);
@@ -1880,9 +1896,17 @@ int mb_block_delta_apply(mb_block *b, mb_read_cb r, uintptr_t ud) {
 			if (mb_page_native_prot(p) != before || was_uncommitted) run_note(b, &run, (size_t)idx);
 			goto done;
 		}
-		/* the content is no longer the baseline's, so a full state must carry it */
-		set_dirty(b, (size_t)idx, true);
-		if (p->hot) memcpy(p->shadow, (const void *)maddr, MB_PAGESIZE);
+		/* the content is no longer the baseline's, so a full state must carry it
+		 * - unless the frame gave the page back, in which case it IS the
+		 * baseline's and the page is as clean as the run that made the delta
+		 * left it (and a hot one cools, as load_state cools one made clean) */
+		if (clean && !p->invisible) {
+			set_dirty(b, (size_t)idx, false);
+			if (p->hot) page_cool(b, (size_t)idx);
+		} else {
+			set_dirty(b, (size_t)idx, true);
+			if (p->hot) memcpy(p->shadow, (const void *)maddr, MB_PAGESIZE);
+		}
 		if (mb_page_native_prot(p) != before || was_uncommitted) run_note(b, &run, (size_t)idx);
 	}
 	rc = 0;

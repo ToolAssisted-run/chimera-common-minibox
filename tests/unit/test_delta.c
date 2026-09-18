@@ -699,18 +699,51 @@ static void test_delta_zeroes_a_page_the_guest_gave_back(void) {
 
 	CHECK_EQ(((const volatile uint8_t *)page.start)[0], 0);  /* the machine says zero */
 	uint8_t *live = snapshot(b, SIZE);
+	/* and the page is CLEAN: given back, it holds its zero baseline again, so
+	 * a state does not carry it - and a rebuilt machine has to agree about
+	 * that too, not only about the bytes (a PS3 restored through 55 deltas
+	 * carried 100 such pages its straight run did not) */
+	CHECK_EQ(mb_block_page_info(b, 4) & 0x80, 0);
+	const size_t liveState = mb_block_state_size(b);
 
 	/* now rebuild that frame the way a seek does: the anchor, then the deltas */
 	anchor.pos = 0;
 	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
 	d1.pos = 0;
 	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d1), 0);
+	CHECK_EQ(mb_block_page_info(b, 4) & 0x80, 0x80);           /* written in the first epoch */
 	d2.pos = 0;
 	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&d2), 0);
 	CHECK_EQ(((const volatile uint8_t *)page.start)[0], 0);  /* and so must the rebuild */
 	CHECK(memcmp((const void *)b->addr.start, live, SIZE) == 0);
+	CHECK_EQ(mb_block_page_info(b, 4) & 0x80, 0);              /* given back: clean again */
+	CHECK_EQ(mb_block_state_size(b), liveState);
 
-	membuf_free(&anchor); membuf_free(&d1); membuf_free(&d2);
+	/* the same through the composed delta, which has to carry the flag of the
+	 * later entry for a page both mention */
+	membuf both = { 0 };
+	d1.pos = 0; d2.pos = 0;
+	CHECK_EQ(mb_block_delta_compose(membuf_read, (uintptr_t)&d1, membuf_read, (uintptr_t)&d2,
+	                                membuf_write, (uintptr_t)&both), 0);
+	anchor.pos = 0;
+	CHECK_EQ(mb_block_load_state(b, membuf_read, (uintptr_t)&anchor), 0);
+	CHECK_EQ(mb_block_delta_apply(b, membuf_read, (uintptr_t)&both), 0);
+	CHECK(memcmp((const void *)b->addr.start, live, SIZE) == 0);
+	CHECK_EQ(mb_block_page_info(b, 4) & 0x80, 0);
+	CHECK_EQ(mb_block_state_size(b), liveState);
+	/* and composed in memory, the way the history does it every frame */
+	membuf bothMem = { 0 };
+	size_t used = 0;
+	CHECK_EQ(mb_block_delta_compose_mem(d1.buf, d1.len, d2.buf, d2.len, membuf_write, (uintptr_t)&bothMem, &used), 0);
+	CHECK_EQ(bothMem.len, both.len);
+	CHECK(memcmp(bothMem.buf, both.buf, both.len) == 0);
+	/* a state written from the rebuilt machine is the live one's, byte for byte */
+	membuf rebuilt = { 0 }, liveState2 = { 0 };
+	CHECK_EQ(mb_block_save_state(b, membuf_write, (uintptr_t)&rebuilt), 0);
+	CHECK_EQ(rebuilt.len, liveState);
+
+	membuf_free(&anchor); membuf_free(&d1); membuf_free(&d2); membuf_free(&both); membuf_free(&bothMem);
+	membuf_free(&rebuilt); membuf_free(&liveState2);
 	free(live);
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);

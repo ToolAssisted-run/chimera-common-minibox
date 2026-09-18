@@ -238,6 +238,14 @@ int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud);
  *   reverse - the pages as they were at the epoch's START. Apply to the machine
  *             as it is now and you have the machine as it was then.
  *
+ * A delta says what a page HOLDS at the epoch's end, and also whether the run
+ * that made it left the page dirty. The two are not the same thing: a page
+ * written and then given back (munmap, MADV_DONTNEED) holds its zero baseline
+ * again and is clean, and a machine rebuilt from the delta must be clean there
+ * too, or a state taken from it carries pages a machine that ran the frames
+ * does not (DELTA_IDX_CLEAN in memblock.c; found on a PS3, 100 pages in a
+ * 55-delta restore, zeros every one).
+ *
  * None of this is observable by the guest: it is protection bookkeeping, the
  * same trick the baseline tracking already plays, so the machine spec is
  * untouched. Return 0 on success. */
