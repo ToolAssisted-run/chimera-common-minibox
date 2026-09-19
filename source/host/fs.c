@@ -18,6 +18,10 @@
  * change either. Writable mounts stay in memory: they are memory cards and
  * save files, they are small, and their contents belong to the machine. */
 #include "minibox_internal.h"
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +102,26 @@ static int seek64(FILE *f, int64_t off, int whence) { return fseeko(f, (off_t)of
 static int64_t tell64(FILE *f) { return (int64_t)ftello(f); }
 #endif
 
+/* A host path arrives as UTF-8 (the engine's convention on every platform).
+ * On Windows fopen reads it in the ANSI code page, so a name with a letter
+ * outside it - "Broderbund" with its o-slash, most of Europe's file names -
+ * opens nothing and says ENOENT for a file that is right there. The wide
+ * open is the one that reads UTF-8 as what it is. */
+static FILE *open_read(const char *path) {
+#if defined(_WIN32)
+	int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (n <= 0) { errno = ENOENT; return NULL; }
+	wchar_t *wide = malloc((size_t)n * sizeof(wchar_t));
+	if (!wide) { errno = ENOMEM; return NULL; }
+	MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, n);
+	FILE *fp = _wfopen(wide, L"rb");
+	free(wide);
+	return fp;
+#else
+	return fopen(path, "rb");
+#endif
+}
+
 static mounted_file *add(mb_fs *fs) {
 	if (fs->n == fs->cap) { fs->cap = fs->cap ? fs->cap * 2 : 8; fs->files = realloc(fs->files, fs->cap * sizeof(mounted_file)); }
 	mounted_file *f = &fs->files[fs->n++];
@@ -167,7 +191,7 @@ int mb_fs_mount(mb_fs *fs, const char *name, const uint8_t *data, size_t len, bo
  * turn it into a nondeterminism nobody could see. */
 int mb_fs_mount_path(mb_fs *fs, const char *name, const char *path) {
 	if (by_name(fs, name)) return -EEXIST;
-	FILE *fp = fopen(path, "rb");
+	FILE *fp = open_read(path);
 	if (!fp) return -ENOENT;
 	if (seek64(fp, 0, SEEK_END) != 0) { fclose(fp); return -EIO; }
 	int64_t end = tell64(fp);

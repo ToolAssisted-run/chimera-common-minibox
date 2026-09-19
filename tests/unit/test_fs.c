@@ -6,6 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -272,8 +276,44 @@ static void test_host_file(void) {
 	snprintf(ghost, sizeof ghost, "%s-does-not-exist", path);
 	CHECK_EQ(mb_fs_mount_path(fs, "ghost", ghost), -ENOENT);
 
+	/* a name with a letter outside ASCII - "Br\xc3\xb8derbund" - opens as the
+	 * UTF-8 it arrives as, on every host (Windows' fopen would read the bytes
+	 * in the ANSI code page and find nothing) */
+	char accented[600];
+	snprintf(accented, sizeof accented, "%s-Br\xc3\xb8derbund.dsk", path);
+	{
+#if defined(_WIN32)
+		wchar_t wide[600];
+		int wn = MultiByteToWideChar(CP_UTF8, 0, accented, -1, wide, 600);
+		CHECK(wn > 0);
+		FILE *af = _wfopen(wide, L"wb");
+#else
+		FILE *af = fopen(accented, "wb");
+#endif
+		CHECK(af != NULL);
+		CHECK_EQ(fwrite(text, 1, len, af), len);
+		fclose(af);
+	}
+	CHECK_EQ(mb_fs_mount_path(fs, "accented", accented), 0);
+	{
+		mb_sword h = mb_fs_open(fs, "accented", O_RDONLY);
+		CHECK(h >= 0);
+		char back[64];
+		CHECK_EQ((size_t)mb_fs_read(fs, (int)h, (uint8_t *)back, len), len);
+		CHECK_EQ(memcmp(back, text, len), 0);
+		mb_fs_close(fs, (int)h);
+	}
+
 	mb_fs_free(fs);
 	unlink(path);
+#if defined(_WIN32)
+	{
+		wchar_t wide[600];
+		if (MultiByteToWideChar(CP_UTF8, 0, accented, -1, wide, 600) > 0) _wunlink(wide);
+	}
+#else
+	unlink(accented);
+#endif
 }
 
 static void run_all(void) {
