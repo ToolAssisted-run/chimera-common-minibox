@@ -191,22 +191,35 @@ uintptr_t mb_get_callback_ptr(uintptr_t slot) {
 
 /* ---- thunk manager (thunks.rs) ---- */
 /* 32 was enough for the bare stack-switch jump; the %fs swap a Rust guest needs
- * (see mb_thunks_get) brings one thunk to 71 bytes. */
+ * (see mb_thunks_get) brings one thunk to 71 bytes.
+ *
+ * ONE PAGE WAS NOT ENOUGH. A page holds 32 thunks, shared between entry points
+ * and extcall wrappers, and a core with the full optional tooling wants more
+ * than that: quickerNES asks for 45 and silently got 32 - mb_thunks_get
+ * answered 0 for the rest, which mb_host_proc_addr reports exactly the way it
+ * reports a symbol that is not there, so the host read a full pool as "this
+ * core exports no trace logger and no save data". Found 2026-09-20 building
+ * Chimera's memory callbacks, which were the exports that fell off the end.
+ *
+ * 16 pages is 512 thunks, which is 64 KiB of address space per instance and
+ * more than any core has exports. And exhaustion is no longer silent. */
 #define THUNK_SIZE 128
+#define THUNK_ARENA (16u * MB_PAGESIZE)
+#define THUNK_CAP (THUNK_ARENA / THUNK_SIZE)
 struct mb_thunks {
 	mb_range mem;
-	uintptr_t entries[MB_PAGESIZE / THUNK_SIZE];
-	uintptr_t ptrs[MB_PAGESIZE / THUNK_SIZE];
+	uintptr_t entries[THUNK_CAP];
+	uintptr_t ptrs[THUNK_CAP];
 	size_t count;
 	/* callbacks pointing the other way (guest -> host) get their own wrappers */
-	uintptr_t ext_entries[MB_PAGESIZE / THUNK_SIZE];
-	uintptr_t ext_ptrs[MB_PAGESIZE / THUNK_SIZE];
+	uintptr_t ext_entries[THUNK_CAP];
+	uintptr_t ext_ptrs[THUNK_CAP];
 	size_t ext_count;
 };
 
 mb_thunks *mb_thunks_new(void) {
 	mb_thunks *t = (mb_thunks *)calloc(1, sizeof(mb_thunks));
-	mb_range in = { 0, MB_PAGESIZE };
+	mb_range in = { 0, THUNK_ARENA };
 	if (mb_pal_map_anon(in, MB_PROT_RWX, &t->mem) != 0) { free(t); return NULL; }
 	return t;
 }
@@ -224,7 +237,17 @@ static void emit64(uint8_t **p, uintptr_t v) { memcpy(*p, &v, 8); *p += 8; }
 uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	for (size_t i = 0; i < t->count; i++)
 		if (t->entries[i] == guest_entry) return t->ptrs[i];
-	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0; /* no room */
+	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) {
+		/* Never silently: a full pool used to be indistinguishable from an
+		 * export that is not there, and a host read it as a core with no
+		 * tooling. Say it once, loudly, naming the number. */
+		static bool said = false;
+		if (!said) { said = true; fprintf(stderr,
+			"miniBox: the thunk pool is full (%zu entry points + %zu callbacks, cap %u) - "
+			"further exports cannot be called and will look absent\n",
+			t->count, t->ext_count, (unsigned)THUNK_CAP); }
+		return 0;
+	}
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
 	/* The thunk only says which call this is. Everything a call needs - the %fs
@@ -277,7 +300,14 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	/* Entry thunks grow from the bottom of the page and these from the top,
 	 * so a thunk taken out later cannot land on a wrapper handed out earlier
 	 * (which is what happens if both count from the same end). */
-	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) return 0;
+	if ((t->count + t->ext_count + 1) * THUNK_SIZE > t->mem.size) {
+		static bool said = false;
+		if (!said) { said = true; fprintf(stderr,
+			"miniBox: the thunk pool is full (%zu entry points + %zu callbacks, cap %u) - "
+			"this callback cannot be given to the guest\n",
+			t->count, t->ext_count, (unsigned)THUNK_CAP); }
+		return 0;
+	}
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
 	uint8_t *p = (uint8_t *)addr;
 	/* The guest's %fs is read back from the context on the way out rather than
