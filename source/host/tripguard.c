@@ -242,6 +242,58 @@ static void say_code_and_regs(const unsigned char *ip, uintptr_t rsp, uintptr_t 
 	mb_diag("\n");
 }
 
+/* The guest's own return addresses, read off its stack.
+ *
+ * A guest ELF is ET_EXEC at a fixed base and a core package ships its core.wbx
+ * unstripped, so every one of these is `addr2line -f -C -e core.wbx <addr>`
+ * away from a name. Without them a fault report names the faulting function
+ * and nothing about who called it, which for a crash inside a shared helper
+ * (__dynamic_cast, memcpy, an allocator) says nothing at all.
+ *
+ * Only what is safe to read: the scan stays inside the one layout region rsp
+ * is on, and on Windows asks the OS about each page first - a nested fault in
+ * here would lose the report it is part of. */
+#ifdef _WIN32
+static bool page_readable(uintptr_t p) {
+	MEMORY_BASIC_INFORMATION mbi;
+	if (VirtualQuery((void *)p, &mbi, sizeof mbi) != sizeof mbi) return false;
+	if (mbi.State != MEM_COMMIT) return false;
+	return (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+}
+#else
+static bool page_readable(uintptr_t p) { (void)p; return true; }
+#endif
+
+static void say_guest_stack(uintptr_t rsp) {
+	const mb_layout *L = g_layout;
+	if (L == NULL || rsp == 0) return;
+	/* Whichever region rsp is on - the two guest stacks, but also the mmap
+	 * arena and the heaps, because a core that runs its own threads puts their
+	 * stacks there. Staying inside that one region is what keeps the walk from
+	 * stepping off into a guard page. */
+	const mb_range *rs = &L->elf;
+	const mb_range *stack = NULL;
+	for (int i = 0; i < 8; i++)
+		if (mb_range_contains(rs[i], rsp)) { stack = &rs[i]; break; }
+	if (stack == NULL) { mb_diag(" guest stack: rsp is in no region of the layout, not walked\n"); return; }
+
+	uintptr_t stop = rsp + MB_PAGESIZE * 16;
+	if (stop > mb_range_end(*stack)) stop = mb_range_end(*stack);
+
+	mb_diag(" guest stack (addr2line -f -C -e core.wbx):");
+	int shown = 0;
+	for (uintptr_t p = rsp; p + sizeof(uintptr_t) <= stop && shown < 24; p += sizeof(uintptr_t)) {
+		/* the first word of each page, and the first of all, decides whether
+		 * the page may be read at all; a page that may not ends the walk */
+		if ((p == rsp || (p & MB_PAGEMASK) == 0) && !page_readable(p)) break;
+		const uintptr_t v = *(const uintptr_t *)p;
+		if (!mb_range_contains(L->elf, v)) continue;
+		mb_diag(" +%llu:%llx", (unsigned long long)(p - rsp), (unsigned long long)v);
+		shown++;
+	}
+	mb_diag(shown ? "\n" : " (nothing on it)\n");
+}
+
 #ifndef _WIN32
 /* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
@@ -430,6 +482,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
 		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
 		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+		if (guest_code) say_guest_stack((uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
 		const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
 		if (guest_can_die_here(rip)) {
 			/* a hlt in user mode arrives as this fault: it is musl's a_crash(),
@@ -702,6 +755,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
 		                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
 		                  (uintptr_t)c->R14, (uintptr_t)c->R15);
+		if (guest_code) say_guest_stack((uintptr_t)c->Rsp);
 		const uintptr_t rip = (uintptr_t)c->Rip;
 		if (guest_can_die_here(rip)) {
 			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",

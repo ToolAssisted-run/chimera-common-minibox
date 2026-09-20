@@ -151,6 +151,21 @@ line reports a GUEST address, so
 packaged core names the exact instruction. That is usually faster than any
 debugger, and it works from a log the user mailed in.
 
+The line under the registers does the other half - WHO called it. A guest ELF is
+ET_EXEC at a fixed base and a core package ships `core.wbx` unstripped, so the
+`guest stack (addr2line -f -C -e core.wbx): +8:36f0... +40:36f0...` list is a
+set of names away:
+`addr2line -f -C -e core.wbx 0x36f01563547 0x36f012f9e0a`. Subtract one from
+each before looking it up - a return address points at the instruction AFTER
+the call, which for a call in the last statement of a function lands in the
+next one. The offsets are from rsp, and only words that fall inside the ELF are
+listed, so the list is a sieve and not a backtrace: a frame's return address
+and a stale word from a call that has already returned look the same here.
+Read it as candidates and check them against the code. It earned its keep on
+chimera#110, where the faulting function was `__dynamic_cast` - a name that on
+its own says nothing at all - and the words above it named
+`GLGSRender::chimera_gl_teardown` and the container it was clearing.
+
 ## A fault the handler never gets to report
 
 A guest fault normally ends in a diagnosis: `tripguard` says what address was
