@@ -5,6 +5,10 @@
  * file read), sealed/invisible memory, a guest->host callback, savestate
  * round-trip + determinism, and the error/poison paths. */
 #include "minibox.h"
+/* For the two checks on the fault handler's own state: what it would name a
+ * region with, and (on Windows) pointing it somewhere it cannot read on
+ * purpose. Both are internal to the host, and a test is the one caller. */
+#include "minibox_internal.h"
 #include <stdbool.h>
 #include <time.h>
 #include <stdio.h>
@@ -176,6 +180,61 @@ static int host_fault_is_reported_as_passed_on(const char *self, const char *gue
 }
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+/* The child half of the handler-recursion check (chimera#127).
+ *
+ * A vectored handler that faults is called again FOR ITS OWN FAULT, with no
+ * depth limit and no second chance. The layout pointer is put somewhere that
+ * cannot be read - which is exactly what a destroyed host used to leave behind -
+ * and then host code faults. The handler starts to describe that fault, reads
+ * the layout, and faults itself. Unguarded, that is an endless tower of
+ * handlers on one stack and the process dies of a stack overflow with neither
+ * fault named anywhere; guarded, the second fault is said once and passed on,
+ * and the log still names the first. The log is the verdict - the child dies
+ * either way, and only what it managed to say differs. */
+static int handler_recursion_child(const char *guest) {
+	mb_return r;
+	SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+	mb_host *h = make_host(guest, 0xABCD);
+	wbx_activate_host(h, &r);
+	mb_tripguard_set_layout((const mb_layout *)(uintptr_t)0x40);
+	volatile uint32_t v = *(volatile uint32_t *)(uintptr_t)0x20;
+	(void)v;
+	return 3;   /* the read did not fault */
+}
+
+/* The parent half: the handler must say the first fault once, notice that it
+ * faulted on its own diagnosis, and stop - not repeat itself until the stack
+ * is gone. An unguarded handler writes the same line hundreds of times and
+ * never writes the second sentence at all. */
+static int handler_does_not_recurse(const char *self, const char *guest) {
+	const char *dir = getenv("TEMP");
+	if (dir == NULL || dir[0] == '\0') dir = ".";
+	char log[512], cmd[2048];
+	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld.log", dir, (long)time(NULL));
+	remove(log);
+	_putenv_s("MINIBOX_LOG", log);
+	snprintf(cmd, sizeof cmd, "\"\"%s\" --handler-recursion-child \"%s\" >NUL 2>&1\"", self, guest);
+	system(cmd);
+	_putenv_s("MINIBOX_LOG", "");
+	static char text[256 * 1024];
+	size_t n = 0;
+	FILE *f = fopen(log, "rb");
+	if (f != NULL) { n = fread(text, 1, sizeof text - 1, f); fclose(f); }
+	text[n] = '\0';
+	remove(log);
+	int veh_lines = 0;
+	for (const char *p = text; (p = strstr(p, "[veh] ")) != NULL; p += 6) veh_lines++;
+	const bool said_once = strstr(text, "the fault handler faulted while reporting a fault") != NULL;
+	const bool first_named = strstr(text, "fault in host code, passed on") != NULL;
+	const bool bounded = veh_lines <= 4;
+	printf("run_guest: handler-recursion child: first fault named=%d, own fault said=%d, [veh] lines=%d (bounded=%d)\n",
+	       first_named, said_once, veh_lines, bounded);
+	return first_named && said_once && bounded;
+}
+#endif
+
 /* A guest that aborts must leave its reason in the diagnostic log: the death
  * named as an abort, and what the guest last wrote to stderr. */
 static int guest_abort_is_reported(const char *self, const char *guest) {
@@ -283,6 +342,8 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--abort-child") == 0) return abort_child(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
+#else
+	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
 	const char *path = argc > 1 ? argv[1] : "guest.wbx";
 	mb_return r;
@@ -424,10 +485,35 @@ int main(int argc, char **argv) {
 	/* ---- a guest that dies does not take the host with it ---- */
 	guest_deaths_are_survived(path);
 
+	/* ---- a destroyed machine is not what the fault handler reads (chimera#127) ----
+	 * The handler names the region an address landed in by reading the live
+	 * machine's layout, and that layout lives INSIDE the mb_host. A host that is
+	 * freed without taking it back leaves the handler reading a dead heap chunk
+	 * on the next fault anywhere in the process - and on Windows that chunk is
+	 * really gone, so the handler faults, is called again for its own fault, and
+	 * the process dies of a stack overflow. Both halves are checked, because a
+	 * NULL that was never set would pass the second on its own. */
+	STAGE("checking that a destroyed host gives its layout back");
+	{
+		mb_host *hl = make_host(path, 0xABCD);
+		wbx_activate_host(hl, &r);
+		CHECK(mb_tripguard_layout() != NULL);   /* a live machine has one */
+		wbx_deactivate_host(hl, &r);
+		wbx_destroy_host(hl, &r);
+		CHECK(mb_tripguard_layout() == NULL);   /* a dead one does not */
+	}
+
 #ifndef _WIN32
 	/* ---- a fault in host code is passed on, and said to be ---- */
 	STAGE("checking that a host fault is reported as passed on, not unhandled");
 	CHECK(host_fault_is_reported_as_passed_on(argv[0], path));
+#else
+	/* ---- the handler does not fault on its own diagnosis for ever ----
+	 * Windows only, because only Windows re-enters a vectored handler for its
+	 * own fault; a POSIX SIGSEGV inside the SIGSEGV handler, with the signal
+	 * blocked, kills the process at once and cannot recurse. */
+	STAGE("checking that a handler which faults while reporting stops instead of recursing");
+	CHECK(handler_does_not_recurse(argv[0], path));
 #endif
 
 	/* ---- a guest that aborts says why, in the diagnostic log ---- */

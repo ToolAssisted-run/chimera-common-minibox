@@ -292,6 +292,13 @@ void mb_tripguard_unregister(mb_block *b);
 /* The live machine's layout, so an unhandled fault can name the region it
  * landed in rather than a page number somebody has to work out by hand. */
 void mb_tripguard_set_layout(const mb_layout *l);
+/* And give it back when the machine that owns it goes away: the pointer names
+ * memory inside the mb_host, so a host that is freed leaves the fault handler
+ * reading a dead heap chunk the next time anything at all faults. */
+void mb_tripguard_forget_layout(const mb_layout *l);
+/* What the handler would name regions with right now (NULL when no machine is
+ * up). Here so a test can ask; nothing in the host reads it. */
+const mb_layout *mb_tripguard_layout(void);
 
 /* ---- context.c: host<->guest transitions (interop.bin at 0x35f00000000) ---- */
 #define MB_ORG            0x35f00000000ull

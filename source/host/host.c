@@ -734,6 +734,12 @@ void mb_host_destroy(mb_host *h) {
 	 * machine opened in the same process took its first fault against this one's
 	 * freed context and wrote whatever was left there into the host's %fs. */
 	if (mb_guest_ctx == &h->context) mb_guest_ctx = NULL;
+	/* The same rule for the same reason, one field over: the fault handler
+	 * names the region an address landed in by reading this host's layout, and
+	 * a freed host is not a layout. chimera#127 died of exactly this - the
+	 * handler faulted on its own diagnosis and Windows re-entered it until the
+	 * stack ran out. */
+	mb_tripguard_forget_layout(&h->layout);
 	if (h->active) mb_block_deactivate(h->block);
 	free(h->plan_head); free(h->plan_tail);
 	mb_block_free(h->block); mb_fs_free(h->fs); mb_elf_free(h->elf);

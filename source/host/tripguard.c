@@ -42,10 +42,27 @@ static bool guest_can_die_here(uintptr_t rip) {
  * looks like.
  *
  * Set by mb_host_new. One machine runs at a time; a second host replaces it,
- * which is right, because its layout is the live one. */
+ * which is right, because its layout is the live one.
+ *
+ * It is a pointer INTO the mb_host, so the host that set it must take it back
+ * when it is destroyed, exactly as it takes back mb_guest_ctx. It did not, and
+ * chimera#127 is what that costs: a PS3 core died, the machine was torn down,
+ * and the next fault anywhere in the process - an ordinary one, the kind the
+ * CLR raises and handles every day - reached say_region below, read the freed
+ * host, and faulted INSIDE the handler. Windows answered that by running the
+ * handler again, on the handler's own fault, for ever; the process died of a
+ * stack overflow in msvcrt with nothing in the crash note about either fault. */
 static const mb_layout *g_layout = NULL;
 
 void mb_tripguard_set_layout(const mb_layout *l) { g_layout = l; }
+
+void mb_tripguard_forget_layout(const mb_layout *l) {
+	/* Only the layout that is still the live one: a host destroyed after a
+	 * second has already started must not blind the second one's reports. */
+	if (g_layout == l) g_layout = NULL;
+}
+
+const mb_layout *mb_tripguard_layout(void) { return g_layout; }
 
 static void say_region(uintptr_t a) {
 	const mb_layout *L = g_layout;
@@ -596,6 +613,43 @@ static void initialize(void) {
 
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 
+/* One report at a time, and never a report inside a report.
+ *
+ * A vectored handler that faults is called again FOR ITS OWN FAULT, at the same
+ * instruction, with a fresh set of frames on the same stack. There is no depth
+ * limit and no second chance: it ends when the stack runs out, and what the
+ * crash note then says is "stack overflow in msvcrt.dll", which is true and
+ * useless - neither the handler's fault nor the fault it was reporting appears
+ * anywhere in it. chimera#127 is that log: one line naming a perfectly ordinary
+ * host fault, then fifteen hundred identical lines naming the handler faulting
+ * on its own diagnosis, then a dead process.
+ *
+ * Handling may nest - the guest's own fault handler runs guest code, which can
+ * trip a clean page and fault again, and that must be served. REPORTING may
+ * not: it walks the layout, the block list, the bytes at rip and the guest
+ * stack, any of which can be the thing that is wrong. So a fault that arrives
+ * while a report is running is passed straight on, and said once, in the
+ * plainest way there is, because saying more is exactly what just failed. */
+static volatile LONG g_reporting;
+
+static bool report_begin(EXCEPTION_POINTERS *ep) {
+	if (InterlockedCompareExchange(&g_reporting, 1, 0) != 0) {
+		static volatile LONG said;
+		if (InterlockedCompareExchange(&said, 1, 0) == 0)
+			mb_diag("\n=== miniBox: the fault handler faulted while reporting a fault ===\n"
+			        "[veh] a second fault (code 0x%08lx) at rip=%p arrived while the handler was"
+			        " describing the first, and is passed on undiagnosed. Diagnosing it is what"
+			        " just failed, and a handler that recurses here dies of a stack overflow with"
+			        " neither fault in the crash note.\n",
+			        (unsigned long)ep->ExceptionRecord->ExceptionCode,
+			        (void *)ep->ContextRecord->Rip);
+		return false;
+	}
+	return true;
+}
+
+static void report_end(void) { InterlockedExchange(&g_reporting, 0); }
+
 /* Windows does not keep a user-mode FS base at all, and not merely across a
  * fault. That is worth stating precisely, because the weaker version of it was
  * believed here for a while and the repair built on it cannot work.
@@ -668,6 +722,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, rip)) { in_guest = true; break; }
 		if (in_guest) {
+			if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
 			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
@@ -683,14 +738,17 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			           : "the core ran an illegal instruction at %p", (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				report_end();
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
+			report_end();
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	if (code == STATUS_INTEGER_DIVIDE_BY_ZERO || code == STATUS_INTEGER_OVERFLOW) {
 		const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
 		if (guest_can_die_here(rip)) {
+			if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner("the guest divided by zero");
 			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
@@ -702,8 +760,10 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				report_end();
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
+			report_end();
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
@@ -726,6 +786,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	 * KernelBase, so one handled exception used to be logged as two "unhandled"
 	 * faults (issue #82). If nobody handles it, the crash note says so. */
 	{
+		if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
 		mb_block *owner = NULL;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
@@ -762,9 +823,11 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			        write ? "wrote to" : "read or ran", (void *)fault, (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				report_end();
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
 		}
+		report_end();
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }

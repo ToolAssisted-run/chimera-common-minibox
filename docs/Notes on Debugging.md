@@ -192,6 +192,28 @@ it died. Three stores when on, nothing when off. Decode it as little-endian
 
 Linux only; on Windows the vectored handler reports the same things itself.
 
+**A fault inside the fault handler, on Windows.** The same mistake there is
+worse, not better. A vectored handler that faults is called AGAIN for its own
+fault, at the same instruction, on the same stack, with no depth limit and no
+second chance; it ends when the stack runs out. The crash note then says "stack
+overflow in msvcrt.dll", which is true and names neither fault, and
+`minibox-diag.log` holds one line about a real fault followed by hundreds of
+identical lines about the handler faulting on its own diagnosis. That is
+chimera#127 exactly: `mb_host_destroy` freed the host without taking back
+`g_layout`, which points inside it, so `say_region` read a dead heap chunk the
+next time anything at all faulted - and on Windows a freed chunk really is
+gone.
+
+Two rules came out of it. The handler gives up its pointers when the machine
+that owns them is destroyed, `g_layout` as well as `mb_guest_ctx`. And the
+REPORT does not re-enter: handling may nest (the guest's own fault handler runs
+guest code, which can trip a clean page and fault again, and that must be
+served), but a fault that arrives while a report is running is said once, in
+one sentence, and passed straight on - because describing it is exactly what
+just failed. `run_guest --handler-recursion-child` is the leg: it points the
+layout at an address that is not there, faults, and counts the `[veh]` lines.
+Two is right; 659 is the handler eating its own stack.
+
 ## What the guest said last
 
 A guest that aborts has usually already said why - a Rust panic prints
