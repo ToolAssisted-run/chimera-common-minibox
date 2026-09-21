@@ -10,9 +10,15 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
-/* Single-threaded host, so a plain array + no lock is sufficient. (The Rust
- * reference guards a global block list with a mutex for multi-core hosting.) */
+/* The block LIST changes only when a machine is created or destroyed, on the
+ * thread that does that, so a plain array serves it. (The Rust reference
+ * guards it with a mutex for multi-core hosting.) The per-block TRACKING state
+ * the handler writes is another matter: see mb_block_track_lock. */
 #define MAX_BLOCKS 64
 static mb_block *g_blocks[MAX_BLOCKS];
 static int g_nblocks = 0;
@@ -89,6 +95,84 @@ static bool g_initialized = false;
 
 static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
 	return guest - b->addr.start + b->mirror.start;
+}
+
+/* ---- what the handler is doing on THIS thread ------------------------------
+ *
+ * Two questions a fault has to answer before it is served: is the thread it
+ * arrived on already inside the handler, and if so, doing what. The Linux
+ * handler has asked the first since it learned to survive a fault inside
+ * itself (g_fault_depth below: a nested fault is reported, and the process
+ * dies as it would have, rather than dying silent). The Windows handler asked
+ * neither. A vectored handler is an ordinary callback: it can be entered on
+ * several threads at once - which is the tracking lock's business, see
+ * mb_block_track_lock - and re-entered on one thread, for its own fault, with
+ * no depth limit and no second chance (chimera#127: a handler faulting on its
+ * own report, called again for that fault, until the stack ran out).
+ *
+ * Not every re-entry is a defect. The guest's own fault handler runs guest
+ * code, which can write a held page and fault again, and that fault must be
+ * served: handling may nest. What may NOT nest is the handler's own work - a
+ * fault while it is TRACKING a page (it holds the tracking lock, so serving
+ * the new fault would wait for ever) or while it is REPORTING one (the report
+ * reads memory that may be exactly what is wrong). So a thread carries its
+ * phase as well as its depth, and a fault that arrives in a phase that may not
+ * nest, or deeper than any guest handler has business going, is said once and
+ * passed on. The shared code below sets the phase on both hosts; on Linux the
+ * signal is blocked for the handler's duration, so a fault in any phase is
+ * fatal there and the phase only makes the last words precise.
+ *
+ * Per-thread storage: __thread on Linux, where the handler has the host's %fs
+ * back before it reads anything. On Windows mingw's __thread is EMULATED
+ * (__emutls_get_address), which allocates on a thread's first touch, and this
+ * runs inside a fault handler on threads it has never seen - so a TLS slot,
+ * which is a read of the TEB and nothing else. */
+enum { MB_PHASE_NONE = 0, MB_PHASE_TRACK, MB_PHASE_GUEST, MB_PHASE_REPORT };
+#define MB_FAULT_DEPTH_MOST 32   /* a guest handler that faults for ever is not served for ever */
+
+#ifndef _WIN32
+static __thread int g_fault_depth;
+static __thread int g_fault_phase;
+static int  fault_depth(void) { return g_fault_depth; }
+static void fault_depth_set(int d) { g_fault_depth = d; }
+static int  fault_phase(void) { return g_fault_phase; }
+static void fault_phase_set(int p) { g_fault_phase = p; }
+#else
+static DWORD g_fault_tls = TLS_OUT_OF_INDEXES;   /* allocated in initialize(): depth << 8 | phase */
+static uintptr_t fault_word(void) { return (uintptr_t)TlsGetValue(g_fault_tls); }
+static int  fault_depth(void) { return (int)(fault_word() >> 8); }
+static void fault_depth_set(int d) { TlsSetValue(g_fault_tls, (LPVOID)(((uintptr_t)d << 8) | (fault_word() & 0xff))); }
+static int  fault_phase(void) { return (int)(fault_word() & 0xff); }
+static void fault_phase_set(int p) { TlsSetValue(g_fault_tls, (LPVOID)((fault_word() & ~(uintptr_t)0xff) | (uintptr_t)p)); }
+#endif
+
+static const char *phase_name(int phase) {
+	switch (phase) {
+		case MB_PHASE_TRACK:  return "tracking a page";
+		case MB_PHASE_GUEST:  return "in the guest's own fault handler";
+		case MB_PHASE_REPORT: return "reporting a fault";
+	}
+	return "idle";
+}
+
+/* A fault the handler cannot serve because it is the handler's own, or one
+ * thread's handling nested past any sense. Said ONCE per process, in one
+ * sentence, because describing it at length is exactly what may just have
+ * failed - and then passed on: on Windows to the process's own handlers, which
+ * end in a crash note, on Linux to whoever had the signal. */
+static void say_handler_fault_once(int phase, int depth, uintptr_t fault, uintptr_t rip) {
+	static volatile int said;
+	if (__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL) != 0) return;
+	mb_diag("\n=== miniBox: the fault handler faulted while %s ===\n"
+	        "[veh] a fault at addr=%p rip=%p arrived on a thread that was already in the handler,"
+	        " %s, %d deep, and is passed on undiagnosed. Serving it would wait for a lock this"
+	        " thread holds, or describe memory that is what just failed; a handler that recurses"
+	        " here dies of a stack overflow with neither fault in the crash note.\n",
+	        phase_name(phase), (void *)fault, (void *)rip, phase_name(phase), depth);
+}
+
+static bool tracked_status(uint8_t s) {
+	return s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK;
 }
 
 /* The guest's own fault handler, when it exports one (GuestFaultHandler,
@@ -177,37 +261,62 @@ static bool guest_protected(uintptr_t addr, bool write) {
 
 static bool ask_guest(uintptr_t addr, bool write) {
 	if (!g_guest_fault || !guest_protected(addr, write)) return false;
-	return g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
+	/* guest code runs from here: a fault it takes on a held page is served */
+	const int phase = fault_phase();
+	fault_phase_set(MB_PHASE_GUEST);
+	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
+	fault_phase_set(phase);
+	return handled;
 }
 
-/* Shared: handle a write fault at addr. Returns true if handled. */
+/* Shared: handle a write fault at addr. Returns true if handled.
+ *
+ * Under the block's tracking lock, because what this writes - the epoch's
+ * bitmap and count, the unheld bitmap, the dirty map, a snapshot - is shared
+ * with every other thread that faults on this block and with the block
+ * operations the guest's syscalls run. Two faults on two pages of one bitmap
+ * word used to lose one of the two bits (test_tripguard). */
 static bool trip(uintptr_t addr) {
-	mb_block *b = NULL;
-	for (int i = 0; i < g_nblocks; i++)
-		if (mb_range_contains(g_blocks[i]->addr, addr)) { b = g_blocks[i]; break; }
+	mb_block *b = owner_of(addr);
 	if (!b) return false;
 	uintptr_t page_start = addr & ~(uintptr_t)MB_PAGEMASK;
 	size_t pi = (addr - b->addr.start) >> MB_PAGESHIFT;
 	mb_page *p = &b->pages[pi];
-	uint8_t s = p->status;
-	if (!(s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK))
-		return false;  /* not a tracked clean page: the guest's, or nobody's */
-	/* Order matters: the epoch wants what the page held before THIS write, and
-	 * so does the baseline the first time round. Both read the same bytes, so
-	 * both must run before the write is let through. */
-	mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
-	mb_page_maybe_snapshot(p, mirror_of(b, page_start));
-	/* And a state being taken in the background wants the same bytes: this is
-	 * the last moment they exist. One atomic exchange when no state is being
-	 * taken, which is almost always. */
-	mb_block_plan_capture(b, pi);
-	mb_block_note_dirty(b, pi, true);
-	mb_range r = { page_start, MB_PAGESIZE };
-	if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
-	/* It is writable from here, so the next epoch has to hold it again. Only a
-	 * bit: this is a signal handler. */
-	mb_block_note_unheld(b, pi);
-	return true;
+	/* A look before the lock: most faults that are not this file's business
+	 * are settled here. The status is read again under the lock. */
+	if (!tracked_status(p->status)) return false;  /* not a tracked clean page: the guest's, or nobody's */
+	/* The holder of the tracking lock faulting on the block it holds: a block
+	 * operation touching the guest view it just protected, or this handler
+	 * faulting on its own bookkeeping. Serving that would wait here for ever. */
+	if (mb_block_track_held_here(b)) {
+		say_handler_fault_once(MB_PHASE_TRACK, fault_depth(), addr, 0);
+		return false;
+	}
+	const int phase = fault_phase();
+	fault_phase_set(MB_PHASE_TRACK);
+	mb_block_track_lock(b);
+	bool tripped = false;
+	if (tracked_status(p->status)) {
+		/* Order matters: the epoch wants what the page held before THIS write,
+		 * and so does the baseline the first time round. Both read the same
+		 * bytes, so both must run before the write is let through. */
+		mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
+		mb_page_maybe_snapshot(p, mirror_of(b, page_start));
+		/* And a state being taken in the background wants the same bytes: this
+		 * is the last moment they exist. One atomic exchange when no state is
+		 * being taken, which is almost always. */
+		mb_block_plan_capture(b, pi);
+		mb_block_note_dirty(b, pi, true);
+		mb_range r = { page_start, MB_PAGESIZE };
+		if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
+		/* It is writable from here, so the next epoch has to hold it again.
+		 * Only a bit: this is a signal handler. */
+		mb_block_note_unheld(b, pi);
+		tripped = true;
+	}
+	mb_block_track_unlock(b);
+	fault_phase_set(phase);
+	return tripped;
 }
 
 /* The faulting instruction and the registers that made its address.
@@ -374,7 +483,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
  * Then the handler is put back to SIG_DFL and the inner fault is allowed to
  * happen again, so the process still dies the way it would have (core file
  * included) rather than being papered over. */
-static __thread int g_fault_depth;
+/* g_fault_depth and g_fault_phase are above, shared with the Windows handler */
 static __thread uintptr_t g_outer_fault, g_outer_rip;
 
 /* The last faults, in a file, for the crash that leaves nothing behind.
@@ -421,10 +530,13 @@ static void trail_stage(unsigned stage) {
 
 static void sigsafe_report_nested(uintptr_t inner_fault, uintptr_t inner_rip) {
 	static const char hex[] = "0123456789abcdef";
-	char buf[192];
+	char buf[256];
 	size_t n = 0;
-	const char *lead = "miniBox: a fault INSIDE the fault handler; the host cannot survive it.\n  outer ";
+	const char *lead = "miniBox: a fault INSIDE the fault handler (";
 	for (const char *p = lead; *p; p++) buf[n++] = *p;
+	for (const char *p = phase_name(fault_phase()); *p; p++) buf[n++] = *p;
+	const char *lead2 = "); the host cannot survive it.\n  outer ";
+	for (const char *p = lead2; *p; p++) buf[n++] = *p;
 	const uintptr_t v[4] = { g_outer_fault, g_outer_rip, inner_fault, inner_rip };
 	for (int i = 0; i < 4; i++) {
 		const char *label = (i == 0 || i == 2) ? "addr=0x" : " rip=0x";
@@ -612,6 +724,7 @@ static void initialize(void) {
 #include <windows.h>
 
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
+static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault);
 
 /* One report at a time, and never a report inside a report.
  *
@@ -632,23 +745,25 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
  * plainest way there is, because saying more is exactly what just failed. */
 static volatile LONG g_reporting;
 
-static bool report_begin(EXCEPTION_POINTERS *ep) {
+/* Same-thread re-entry into a report is caught before this by the phase check
+ * in veh_inner (MB_PHASE_REPORT); this is the cross-thread half - one report
+ * at a time - and the phase is set here so the other half can see it. */
+static bool report_begin(EXCEPTION_POINTERS *ep, int *phase_before) {
 	if (InterlockedCompareExchange(&g_reporting, 1, 0) != 0) {
-		static volatile LONG said;
-		if (InterlockedCompareExchange(&said, 1, 0) == 0)
-			mb_diag("\n=== miniBox: the fault handler faulted while reporting a fault ===\n"
-			        "[veh] a second fault (code 0x%08lx) at rip=%p arrived while the handler was"
-			        " describing the first, and is passed on undiagnosed. Diagnosing it is what"
-			        " just failed, and a handler that recurses here dies of a stack overflow with"
-			        " neither fault in the crash note.\n",
-			        (unsigned long)ep->ExceptionRecord->ExceptionCode,
-			        (void *)ep->ContextRecord->Rip);
+		say_handler_fault_once(MB_PHASE_REPORT, fault_depth(),
+		                       (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1],
+		                       (uintptr_t)ep->ContextRecord->Rip);
 		return false;
 	}
+	*phase_before = fault_phase();
+	fault_phase_set(MB_PHASE_REPORT);
 	return true;
 }
 
-static void report_end(void) { InterlockedExchange(&g_reporting, 0); }
+static void report_end(int phase_before) {
+	fault_phase_set(phase_before);
+	InterlockedExchange(&g_reporting, 0);
+}
 
 /* Windows does not keep a user-mode FS base at all, and not merely across a
  * fault. That is worth stating precisely, because the weaker version of it was
@@ -678,8 +793,21 @@ static void report_end(void) { InterlockedExchange(&g_reporting, 0); }
  *
  * The way OUT still restores as well, for the fault that does drop the base and
  * for the OS that keeps it, where the write is a no-op. */
+static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep);
+
+/* The per-thread state above is read through TlsGetValue, which writes the
+ * thread's last-error value on the way, and the code that faulted may be about
+ * to read that value: it is put back. */
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
+	const DWORD last_error = GetLastError();
+	const LONG r = veh_fs(ep);
+	SetLastError(last_error);
+	return r;
+}
+
+__attribute__((no_stack_protector))
+static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 #ifdef MB_HAVE_FSBASE
 	const bool guest_rip = mb_guest_ctx && mb_guest_ctx->fs_swap
 	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
@@ -722,7 +850,8 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, rip)) { in_guest = true; break; }
 		if (in_guest) {
-			if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
+			int phase_before;
+			if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
 			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
@@ -738,17 +867,18 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			           : "the core ran an illegal instruction at %p", (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
-				report_end();
+				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
-			report_end();
+			report_end(phase_before);
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	if (code == STATUS_INTEGER_DIVIDE_BY_ZERO || code == STATUS_INTEGER_OVERFLOW) {
 		const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
 		if (guest_can_die_here(rip)) {
-			if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
+			int phase_before;
+			if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner("the guest divided by zero");
 			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
@@ -760,10 +890,10 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
-				report_end();
+				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
-			report_end();
+			report_end(phase_before);
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
@@ -771,6 +901,25 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	/* ExceptionInformation[0]: 0 read, 1 write, 8 DEP */
 	bool write = ep->ExceptionRecord->ExceptionInformation[0] == 1;
 	uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+	/* Is this thread already in here, and may it nest? Mirrors the Linux
+	 * handler's g_fault_depth, with the one difference that matters: there the
+	 * signal is blocked and a nested fault is fatal; here a fault the guest's
+	 * own handler takes is served, and only the handler's OWN work is not
+	 * re-entered. See the phase notes above trip(). */
+	{
+		const int phase = fault_phase(), depth = fault_depth();
+		if (phase == MB_PHASE_TRACK || phase == MB_PHASE_REPORT || depth >= MB_FAULT_DEPTH_MOST) {
+			say_handler_fault_once(phase, depth, fault, (uintptr_t)ep->ContextRecord->Rip);
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+		fault_depth_set(depth + 1);
+	}
+	const LONG r = veh_access_violation(ep, write, fault);
+	fault_depth_set(fault_depth() - 1);
+	return r;
+}
+
+static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault) {
 	if (write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
 	if (ask_guest(fault, write)) return EXCEPTION_CONTINUE_EXECUTION;
 
@@ -786,7 +935,8 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	 * KernelBase, so one handled exception used to be logged as two "unhandled"
 	 * faults (issue #82). If nobody handles it, the crash note says so. */
 	{
-		if (!report_begin(ep)) return EXCEPTION_CONTINUE_SEARCH;
+		int phase_before;
+		if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
 		mb_block *owner = NULL;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
@@ -823,16 +973,21 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			        write ? "wrote to" : "read or ran", (void *)fault, (void *)rip)) {
 				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
 				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
-				report_end();
+				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
 		}
-		report_end();
+		report_end(phase_before);
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void initialize(void) {
+	g_fault_tls = TlsAlloc();
+	if (g_fault_tls == TLS_OUT_OF_INDEXES) {
+		fprintf(stderr, "miniBox: TlsAlloc failed\n");
+		abort();
+	}
 	if (AddVectoredExceptionHandler(1 /* CALL_FIRST */, veh) == NULL) {
 		fprintf(stderr, "miniBox: AddVectoredExceptionHandler failed\n");
 		abort();

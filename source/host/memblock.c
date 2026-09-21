@@ -13,6 +13,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>   /* GetCurrentThreadId: who holds the tracking lock */
+#else
+#include <pthread.h>   /* pthread_self, likewise */
+#endif
 
 /* Phase 1 is Linux single-slice: at most one block occupies its 4GiB region at
  * a time and stays resident. (The Rust reference supports many blocks sharing a
@@ -172,6 +178,60 @@ void mb_page_maybe_snapshot(mb_page *p, uintptr_t maddr) {
 }
 
 static bool epoch_tracks(const mb_page *p);
+static void epoch_clear_impl(mb_block *b);
+static int plan_finish_impl(mb_block *b);
+
+/* ---- the tracking lock ---------------------------------------------------
+ *
+ * See the field in minibox_internal.h for what it covers and why. Two rules
+ * keep it from deadlocking:
+ *
+ *   - it is never held across a callback into the caller. save_state,
+ *     load_state, delta_save and delta_apply stream through the caller's read
+ *     or write callback, and what that callback does is not this file's to
+ *     know - it may wait for a thread that is at this moment faulting on a
+ *     page of this block, and that fault wants the lock. So those four take it
+ *     around their bookkeeping and let it go before the stream. What the
+ *     stream then sees is whatever a concurrent fault leaves, which is what it
+ *     saw before this lock existed: a machine being saved or loaded is a
+ *     machine nothing else may be writing into.
+ *
+ *   - it is never taken twice by one thread. The one way that could happen is
+ *     a fault taken by the holder - a block operation touching the guest view
+ *     it just protected, or the handler faulting on its own bookkeeping - and
+ *     the handler asks mb_block_track_held_here before it takes the lock, so
+ *     such a fault is reported as the handler's own and passed on, rather
+ *     than served by a thread waiting for itself.
+ *
+ * A spin lock with a pause, because one holder is a signal handler, where a
+ * mutex is not safe, and the others hold it for microseconds. The exception
+ * is a block operation over a long run of pages; a fault that arrives during
+ * one waits for it, which is exactly what it should do. */
+static uintptr_t self_id(void) {
+#ifdef _WIN32
+	return (uintptr_t)GetCurrentThreadId();
+#else
+	return (uintptr_t)pthread_self();
+#endif
+}
+
+void mb_block_track_lock(mb_block *b) {
+	while (__atomic_test_and_set(&b->track_lock, __ATOMIC_ACQUIRE)) {
+#if defined(__x86_64__) || defined(__i386__)
+		__builtin_ia32_pause();
+#endif
+	}
+	b->track_owner = self_id();
+}
+
+void mb_block_track_unlock(mb_block *b) {
+	b->track_owner = 0;
+	__atomic_clear(&b->track_lock, __ATOMIC_RELEASE);
+}
+
+bool mb_block_track_held_here(const mb_block *b) {
+	return b->track_lock != 0 && b->track_owner == self_id();
+}
 
 /* ---- page-index bitmaps -------------------------------------------------
  *
@@ -453,6 +513,7 @@ static void refresh_all(mb_block *b);
 
 void mb_block_activate(mb_block *b) {
 	if (b->active) return;
+	mb_block_track_lock(b);
 	if (!b->swapped_in) {
 		mb_range in = b->addr, out;
 		if (mb_pal_map_handle(b->handle, in, &out) != 0) {
@@ -478,6 +539,7 @@ void mb_block_activate(mb_block *b) {
 		refresh_all(b);
 	}
 	b->active = true;
+	mb_block_track_unlock(b);
 }
 
 void mb_block_deactivate(mb_block *b) {
@@ -774,7 +836,7 @@ static void get_stack_epoch(mb_block *b) {
 
 /* ---- allocation ops ---- */
 
-int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replace) {
+static int mmap_fixed_impl(mb_block *b, mb_range addr, mb_prot prot, bool no_replace) {
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
 	if (no_replace)
@@ -782,6 +844,13 @@ int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replac
 			if (b->pages[i].status != MB_ST_FREE) return -EEXIST;
 	set_protections(b, ps, pcount, prot_status(prot));
 	return 0;
+}
+
+int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replace) {
+	mb_block_track_lock(b);
+	const int r = mmap_fixed_impl(b, addr, prot, no_replace);
+	mb_block_track_unlock(b);
+	return r;
 }
 
 
@@ -824,7 +893,7 @@ static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_coun
 	return best;
 }
 
-mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace) {
+static mb_sword mmap_impl(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace) {
 	if (addr.size == 0) return -EINVAL;
 	if (addr.start == 0) {
 		if (addr.size != mb_align_down(addr.size)) return -EINVAL;
@@ -868,12 +937,19 @@ mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena,
 		set_protections(b, ps, addr.size >> MB_PAGESHIFT, prot_status(prot));
 		return (mb_sword)(b->addr.start + (ps << MB_PAGESHIFT));
 	} else {
-		int r = mb_block_mmap_fixed(b, addr, prot, no_replace);
+		int r = mmap_fixed_impl(b, addr, prot, no_replace);
 		return r != 0 ? r : (mb_sword)addr.start;
 	}
 }
 
-int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
+mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace) {
+	mb_block_track_lock(b);
+	const mb_sword r = mmap_impl(b, addr, prot, arena, no_replace);
+	mb_block_track_unlock(b);
+	return r;
+}
+
+static int mprotect_impl(mb_block *b, mb_range addr, mb_prot prot) {
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
 	get_stack_dirty_range(b, ps, pcount);
@@ -881,6 +957,13 @@ int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
 		if (b->pages[i].status == MB_ST_FREE) return -ENOMEM;
 	set_protections(b, ps, pcount, prot_status(prot));
 	return 0;
+}
+
+int mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot) {
+	mb_block_track_lock(b);
+	const int r = mprotect_impl(b, addr, prot);
+	mb_block_track_unlock(b);
+	return r;
 }
 
 /* zero + free (munmap) or keep-allocated (madvise dontneed) */
@@ -913,11 +996,22 @@ static int munmap_impl(mb_block *b, mb_range addr, bool advise_only) {
 	return 0;
 }
 
-int mb_block_munmap(mb_block *b, mb_range addr) { return munmap_impl(b, addr, false); }
-int mb_block_madvise_dontneed(mb_block *b, mb_range addr) { return munmap_impl(b, addr, true); }
+int mb_block_munmap(mb_block *b, mb_range addr) {
+	mb_block_track_lock(b);
+	const int r = munmap_impl(b, addr, false);
+	mb_block_track_unlock(b);
+	return r;
+}
+
+int mb_block_madvise_dontneed(mb_block *b, mb_range addr) {
+	mb_block_track_lock(b);
+	const int r = munmap_impl(b, addr, true);
+	mb_block_track_unlock(b);
+	return r;
+}
 
 /* in-place mremap only (grow needs following pages free; shrink munmaps tail) */
-mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
+static mb_sword mremap_impl(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
 	(void)arena;
 	if (addr.size == 0 || new_size == 0) return -EINVAL;
 	if (addr.start == 0) return -ENOSYS; /* move path unreachable in the reference */
@@ -942,7 +1036,14 @@ mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_rang
 	}
 }
 
-int mb_block_mark_invisible(mb_block *b, mb_range addr) {
+mb_sword mb_block_mremap(mb_block *b, mb_range addr, uintptr_t new_size, mb_range arena) {
+	mb_block_track_lock(b);
+	const mb_sword r = mremap_impl(b, addr, new_size, arena);
+	mb_block_track_unlock(b);
+	return r;
+}
+
+static int mark_invisible_impl(mb_block *b, mb_range addr) {
 	if (b->sealed) { fprintf(stderr, "miniBox: mark_invisible after seal\n"); return -EINVAL; }
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
@@ -951,7 +1052,14 @@ int mb_block_mark_invisible(mb_block *b, mb_range addr) {
 	return 0;
 }
 
-int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len) {
+int mb_block_mark_invisible(mb_block *b, mb_range addr) {
+	mb_block_track_lock(b);
+	const int r = mark_invisible_impl(b, addr);
+	mb_block_track_unlock(b);
+	return r;
+}
+
+static int copy_from_external_impl(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len) {
 	mb_range r = { start, len };
 	mb_range e = mb_range_align_expand(r);
 	size_t pcount, ps = validate(b, e, &pcount);
@@ -961,6 +1069,13 @@ int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start
 	for (size_t i = ps; i < ps + pcount; i++) { mb_block_plan_capture(b, i); set_dirty(b, i, true); page_cool(b, i); }
 	memcpy((void *)mirror_addr(b, start), src, len);
 	return 0;
+}
+
+int mb_block_copy_from_external(mb_block *b, const uint8_t *src, uintptr_t start, uintptr_t len) {
+	mb_block_track_lock(b);
+	const int r = copy_from_external_impl(b, src, start, len);
+	mb_block_track_unlock(b);
+	return r;
 }
 
 /* Whether a page whose baseline is live memory reads back as zeros. The seal's
@@ -975,12 +1090,12 @@ static bool page_reads_back_zero(const mb_block *b, size_t i) {
 
 /* ---- seal ---- */
 
-int mb_block_seal(mb_block *b) {
+static int seal_impl(mb_block *b) {
 	if (b->sealed) { fprintf(stderr, "miniBox: already sealed\n"); return -EINVAL; }
 	get_stack_dirty(b);
 	/* the baseline is about to become the live image, so any epoch measured
 	 * against the old one is meaningless */
-	mb_block_epoch_clear(b);
+	epoch_clear_impl(b);
 	for (size_t i = 0; i < b->npages; i++) {
 		if (b->pages[i].dirty && !b->pages[i].invisible) {
 			page_cool(b, i);
@@ -1064,6 +1179,13 @@ int mb_block_seal(mb_block *b) {
 	return 0;
 }
 
+int mb_block_seal(mb_block *b) {
+	mb_block_track_lock(b);
+	const int r = seal_impl(b);
+	mb_block_track_unlock(b);
+	return r;
+}
+
 /* ---- introspection ---- */
 
 size_t mb_block_page_len(const mb_block *b) { return b->npages; }
@@ -1074,7 +1196,7 @@ size_t mb_block_page_len(const mb_block *b) { return b->npages; }
  * has to key them on this and not on the core's name and settings. */
 const uint8_t *mb_block_hash(const mb_block *b) { return b->hash; }
 
-uint8_t mb_block_page_info(mb_block *b, size_t i) {
+static uint8_t page_info_impl(mb_block *b, size_t i) {
 	/* A Windows stack reports nothing, so the answer is only true once this has
 	 * looked - and an introspection call that can be stale is worse than a page
 	 * compared. One page, not the whole set. */
@@ -1084,6 +1206,13 @@ uint8_t mb_block_page_info(mb_block *b, size_t i) {
 	if (p->dirty) res |= 0x80;
 	if (p->invisible) res |= 0x40;
 	return res;
+}
+
+uint8_t mb_block_page_info(mb_block *b, size_t i) {
+	mb_block_track_lock(b);
+	const uint8_t r = page_info_impl(b, i);
+	mb_block_track_unlock(b);
+	return r;
 }
 
 /* ---- savestate (see docs/docs/MACHINE-SPEC.md section 6) ---- */
@@ -1105,7 +1234,11 @@ static int rd(mb_read_cb r, uintptr_t ud, void *data, uintptr_t n) {
 
 int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
+	/* the one thing this writes; the stream below runs outside the lock (see
+	 * mb_block_track_lock: never across the caller's callback) */
+	mb_block_track_lock(b);
 	get_stack_dirty(b);
+	mb_block_track_unlock(b);
 	if (wr(w, ud, MAGIC, sizeof(MAGIC) - 1)) return -EIO;
 	if (wr(w, ud, b->hash, 32)) return -EIO;
 	if (wr(w, ud, &b->addr, sizeof(b->addr))) return -EIO;
@@ -1164,7 +1297,7 @@ static bool plan_can_hold(const mb_page *p) {
 }
 
 /* What mb_block_save_state would write, to the byte. */
-size_t mb_block_state_size(mb_block *b) {
+static size_t state_size_impl(mb_block *b) {
 	if (!b->sealed) return 0;
 	get_stack_dirty(b);
 	size_t n = sizeof(MAGIC) - 1 + 32 + sizeof(b->addr) + b->npages * 2;
@@ -1174,10 +1307,17 @@ size_t mb_block_state_size(mb_block *b) {
 	return n;
 }
 
+size_t mb_block_state_size(mb_block *b) {
+	mb_block_track_lock(b);
+	const size_t r = state_size_impl(b);
+	mb_block_track_unlock(b);
+	return r;
+}
+
 /* Writes everything but the page data into `dest`, holds the pages the data
  * will come from, and records where each one goes. Returns the offset page data
  * starts at, or 0 on failure. */
-size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
+static size_t state_plan_impl(mb_block *b, uint8_t *dest) {
 	if (!b->sealed || b->plan_active || dest == NULL) return 0;
 	get_stack_dirty(b);
 
@@ -1227,6 +1367,13 @@ size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
 	}
 	if (run_start != (size_t)-1) refresh_range(b, run_start, run_last - run_start + 1);
 	return at;
+}
+
+size_t mb_block_state_plan(mb_block *b, uint8_t *dest) {
+	mb_block_track_lock(b);
+	const size_t r = state_plan_impl(b, dest);
+	mb_block_track_unlock(b);
+	return r;
 }
 
 /* Who copies a held page, and when it is safe to change it.
@@ -1293,7 +1440,7 @@ size_t mb_block_plan_count(const mb_block *b) { return b->plan_active ? b->plan_
 /* Copies whatever is left, ends the plan, and gives the pages their ordinary
  * protection back. After this the buffer is a state and the machine is as it
  * was, minus the holds. */
-int mb_block_plan_finish(mb_block *b) {
+static int plan_finish_impl(mb_block *b) {
 	if (!b->plan_active) return -EINVAL;
 	/* every page copied, including one another thread was still copying: the
 	 * buffer is the caller's the moment this returns */
@@ -1317,15 +1464,27 @@ int mb_block_plan_finish(mb_block *b) {
 	return 0;
 }
 
+int mb_block_plan_finish(mb_block *b) {
+	mb_block_track_lock(b);
+	const int r = plan_finish_impl(b);
+	mb_block_track_unlock(b);
+	return r;
+}
+
 int mb_block_load_state(mb_block *b, mb_read_cb r, uintptr_t ud) {
 	if (!b->sealed) return -EINVAL;
 	/* A load replaces the machine the plan is describing, so the plan is
 	 * finished first - the caller is meant to have done that, and doing it here
 	 * as well is the difference between a stale state and a corrupt one. */
-	if (b->plan_active) mb_block_plan_finish(b);
+	mb_block_track_lock(b);
+	if (b->plan_active) plan_finish_impl(b);
 	get_stack_dirty(b);
 	/* the load replaces the machine, so an open epoch no longer describes it */
-	mb_block_epoch_clear(b);
+	epoch_clear_impl(b);
+	/* The page loop below runs OUTSIDE the lock: it reads through the caller's
+	 * callback (see mb_block_track_lock). A load replaces the machine, and a
+	 * machine being replaced is one nothing else may be writing into. */
+	mb_block_track_unlock(b);
 	char magic[sizeof(MAGIC) - 1];
 	if (rd(r, ud, magic, sizeof(magic))) return -EIO;
 	if (memcmp(magic, MAGIC, sizeof(magic)) != 0) return -EINVAL;
@@ -1465,9 +1624,15 @@ static void epoch_forget(mb_block *b) {
 	b->epoch_nstat = 0;
 }
 
-void mb_block_epoch_clear(mb_block *b) {
+static void epoch_clear_impl(mb_block *b) {
 	epoch_forget(b);
 	b->epoch_active = false;
+}
+
+void mb_block_epoch_clear(mb_block *b) {
+	mb_block_track_lock(b);
+	epoch_clear_impl(b);
+	mb_block_track_unlock(b);
 }
 
 /* Is this a page an epoch tracks at all? Invisible pages are excluded for the
@@ -1493,7 +1658,7 @@ static bool epoch_tracks(const mb_page *p) {
  * its write already faults, and that fault records the epoch's pre-image too.
  * The hold exists only to make a DIRTY page - one already mapped writable -
  * fault once more. */
-int mb_block_epoch_begin(mb_block *b) {
+static int epoch_begin_impl(mb_block *b) {
 	if (!b->sealed) return -EINVAL;
 	epoch_forget(b);
 	b->epoch_active = true;   /* before the refresh below: it reads the holds */
@@ -1534,12 +1699,23 @@ int mb_block_epoch_begin(mb_block *b) {
 	return 0;
 }
 
+int mb_block_epoch_begin(mb_block *b) {
+	mb_block_track_lock(b);
+	const int r = epoch_begin_impl(b);
+	mb_block_track_unlock(b);
+	return r;
+}
+
 size_t mb_block_epoch_page_count(const mb_block *b) { return b->epoch_ndirty; }
 
 int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) {
 	if (!b->epoch_active) return -EINVAL;
+	/* the words this writes are written under the lock; the stream through the
+	 * caller's callback below is not (see mb_block_track_lock) */
+	mb_block_track_lock(b);
 	get_stack_epoch(b);
 	get_hot_epoch(b);
+	mb_block_track_unlock(b);
 
 	/* What the allocation map did, so applying a delta lands on the same shape
 	 * of machine and not merely the same bytes. */
@@ -1580,7 +1756,9 @@ int mb_block_delta_save(mb_block *b, bool forward, mb_write_cb w, uintptr_t ud) 
 			if (wr(w, ud, (const void *)mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)), MB_PAGESIZE)) return -EIO;
 		}
 	}
+	mb_block_track_lock(b);
 	heat_written_pages(b);
+	mb_block_track_unlock(b);
 	static int trace_delta = -1;
 	if (trace_delta < 0) trace_delta = getenv("MB_TRACE_DELTA") != NULL;
 	if (trace_delta) {
@@ -1917,6 +2095,8 @@ done:
 	 * anything. The caller opens the next one when it wants it. Forgetting it
 	 * touches only the pages it wrote, and none of them changes protection by
 	 * being forgotten: a written page had its hold lifted by the write. */
-	mb_block_epoch_clear(b);
+	mb_block_track_lock(b);
+	epoch_clear_impl(b);
+	mb_block_track_unlock(b);
 	return rc;
 }

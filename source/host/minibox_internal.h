@@ -180,6 +180,23 @@ typedef struct mb_block {
 	uint8_t *status_map;    /* pages[i].status */
 	uint8_t *dirty_map;     /* pages[i].dirty, as 0 or 1 */
 
+	/* ---- the tracking lock (see mb_block_track_lock in memblock.c) ----
+	 *
+	 * Everything above that is per FRAME rather than per page - the bitmaps,
+	 * epoch_ndirty, nhot - is a word shared by sixty-four pages, and the fault
+	 * handler writes those words from whichever thread faulted. One guest
+	 * thread was the only writer for a long time; a frontend has a GPU driver
+	 * thread writing into guest memory beside the guest, and two faults on two
+	 * pages of one word are two read-modify-writes of it. A plain |= loses one:
+	 * the delta is short a page and a later seek rebuilds a machine that never
+	 * existed. So the handler's bookkeeping, and every path outside it that
+	 * writes the same words, runs under this. A spin lock, because one holder
+	 * is a signal handler and nothing else is safe there; the owner is recorded
+	 * so that a fault taken by the holder itself is recognised as the holder's
+	 * own and not served, which would otherwise be a thread waiting for itself. */
+	volatile unsigned char track_lock;
+	volatile uintptr_t track_owner;
+
 	/* ---- a state being filled while the machine runs ----
 	 *
 	 * Taking a whole machine is the largest stall the history has: 95 to 98% of
@@ -499,6 +516,15 @@ void    mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t mirror_addr);
 /* One page just became writable, so an epoch has to hold it again next time.
  * Called from the fault handler, which is why it only sets a bit. */
 void    mb_block_note_unheld(mb_block *b, size_t pi);
+/* The tracking lock. Taken by the fault handler around its bookkeeping and by
+ * every block operation that writes the per-frame words (see mb_block). Never
+ * held across a callback into the caller, and never taken twice by one thread:
+ * held_here is how the handler finds out that the fault it is looking at was
+ * taken by the thread that holds the lock, i.e. by a block operation or by the
+ * handler itself, in which case serving it would wait for ever. */
+void    mb_block_track_lock(mb_block *b);
+void    mb_block_track_unlock(mb_block *b);
+bool    mb_block_track_held_here(const mb_block *b);
 /* One page's dirty bit, and the packed copy of it, together. */
 void    mb_block_note_dirty(mb_block *b, size_t pi, bool dirty);
 /* Do the packed maps say what the page array says? For tests. */
