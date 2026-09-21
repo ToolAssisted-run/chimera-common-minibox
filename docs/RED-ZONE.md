@@ -66,8 +66,85 @@ report by symbol, rule is zero, named allowlist for hand-written assembly.
 Negative controls: red on the unflagged flycast core.wbx (3746) and on an
 unflagged sysroot archive; green on the flagged build.
 
+## What the flag reached, per build path and per archive
+
+Every C and C++ guest compile in every core passes through the sysroot's
+`lib/musl-gcc.specs`, either through the `musl-gcc` wrapper or an explicit
+`-specs`, so the `*cc1` entry is the one place that reaches all of them.
+Verified with a leaf that spills 22 words at `-O2`: none through the specs,
+for `gcc` and for `g++` (the entry is read by cc1 and cc1plus alike).
+
+| build path | how it gets the flag | verified |
+|---|---|---|
+| per-core meson cross files (flycast, quickernes, pcsx2, ppsspp, gpgx, snes9x, stella, opera, dosbox-x, applewin, ares, xemu) | `-specs .../musl-gcc.specs` already in their `c_args`/`cpp_args` | flycast, quickernes, pcsx2 rebuilt and clean |
+| Makefile guests (dolphin, rpcs3, eka2l1) | `SPECS := -specs $(SR)/lib/musl-gcc.specs` in `guest.mk` | not rebuilt here |
+| shell guests (pcem) | `-specs $SR/lib/musl-gcc.specs` in `GUESTFLAGS` | not rebuilt here |
+| xemu's wrapper compilers | `guest-cc`/`guest-cxx` exec gcc with the specs | not rebuilt here |
+| mesa guest archives (flycast, pcsx2, ruffle) | `gw-cc`/`gw-cxx` wrappers, same specs | all three rebuilt, 18 archives each, clean |
+| the Rust guest (ruffle) | NOT a C flag: `disable-redzone: true` in `waterbox-guest.json`, with `build-std` so std is rebuilt too | rebuilt: 16657 -> 0, and no Rust-mangled symbol remains |
+| miniBox's own `emulibc.c.o`, `cxxglue.c.o` | `waterbox_guest_cflags` | rebuilt, clean |
+
+Sysroot archives, before and after (memory operands below rsp):
+
+| archive | how it is built | before | after |
+|---|---|---|---|
+| `libc.a` (musl) | plain gcc, so `musl_cflags` in meson.build carries the flag | 217 | 0 |
+| `libstdc++.a`, `libstdc++fs.a`, `libstdc++exp.a`, `libsupc++.a` | the libstdc++ target's `wbx_flags` | 0 after the lint's lea fix | 0 |
+| `crt1.o`, `Scrt1.o`, `crti.o`, `crtn.o` | musl | 0 | 0 |
+| `libgcc.a`, `libgcc_eh.a` | the HOST gcc's own, not rebuilt | 1 (`__strub_leave`) | allowlisted |
+
+Two hand-written waterbox routines used the red zone on purpose and were
+changed to push a scratch word instead, the idiom `__fesetround` in the same
+file already used: `src/fenv/waterbox/fenv.s` (`feclearexcept`,
+`feraiseexcept`, MXCSR scratch) and `src/math/waterbox/exp2l.s` (`expm1l`, a
+float constant). Nothing else in musl's assembly addresses below rsp.
+
+`libgcc.a` is the one archive that cannot be rebuilt here - it belongs to the
+compiler installation - and one of its members, `__strub_leave`, keeps a word
+below rsp. It is the `-fstrub` stack-scrubbing runtime, no guest is built with
+`-fstrub`, and an archive member is linked only when something references it,
+so it never enters a guest image. That is the whole of
+`red-zone-allowlist.txt`; empty the file and the check goes red on exactly it.
+
+## What the check counts, and two things it does not
+
+The rule is zero memory operands with a negative displacement from rsp,
+reported by symbol. Two forms are deliberately not counted, each after a
+false positive:
+
+- `lea` is address arithmetic, not a memory access. `lea -0x8(%rsp),%rsp` IS
+  the stack allocation, and `lea -0x1000(%rsp),%rax` is how a variable-length
+  array is set up. Counting them called libstdc++ and musl's `getcwd` guilty.
+- an INDEXED operand such as `-0x8(%rsp,%rax,8)` resolves above rsp for any
+  nonzero index and cannot be judged without running the code. Counting those
+  turned compiler-generated frame indexing into 65 false violations.
+
+## The proof on flycast
+
+Prince of Persia: Arabian Nights, `cpu=jit`, 1000 frames, the reproduction
+that found this:
+
+| run | result |
+|---|---|
+| flagged guest (core + sysroot + mesa), Windows, greenzone on | byte-identical to Linux |
+| flagged guest, Windows, greenzone off | byte-identical to Linux |
+| flagged guest on Linux vs the UNFLAGGED guest's Linux reference | byte-identical - the machine does not depend on frame layout |
+| unflagged guest, Windows, greenzone on, same host build | parts at frame 137 |
+
+Cost, 1000 frames through run-wbx on Linux, three runs each alternating:
+unflagged 55.64 / 55.67 / 55.50 s, flagged 55.59 / 55.33 / 55.91 s. The means
+differ by 0.01 s, which is inside the run-to-run spread of either set. The
+guest image grew by 92 KB on 94 MB.
+
 ## Progress
 
-- DONE: flycast-only proof (second cross file + build dir), 1000 frames.
-- TODO: choke points 1-5, sysroot rebuild, check, re-proof, other cores,
-  cost, docs. Each is ticked here as it lands, with its commit.
+- DONE: the flag at every choke point, the sysroot rebuilt, the two musl
+  assembly routines fixed, the check and its allowlist, the negative
+  controls, the flycast re-proof, quickernes + pcsx2 + ruffle rebuilt and
+  gated, the cost number. All of the above is measured, not assumed.
+- NOT DONE, for CI after the push: dolphin, rpcs3, eka2l1, pcem, xemu,
+  ppsspp, gpgx, snes9x, stella, opera, dosbox-x, applewin, ares,
+  quickerneshawk, angrylion. Each reaches the flag through the specs, and
+  none was rebuilt here.
+- Still unnamed: the component that rewrites the bytes, and the condition
+  that enables it. The flag removes the exposure; it does not explain it.
