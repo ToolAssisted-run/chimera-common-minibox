@@ -214,6 +214,28 @@ just failed. `run_guest --handler-recursion-child` is the leg: it points the
 layout at an address that is not there, faults, and counts the `[veh]` lines.
 Two is right; 659 is the handler eating its own stack.
 
+**What the OS thinks of the address, on Windows.** A fault in HOST code that
+lands outside every registered block is, by definition, somebody else's memory,
+and the report now says one more thing about it: `VirtualQuery`'s answer, as a
+`[vq]` line. It costs one syscall on a path that is already writing a file, and
+it takes no lock, so it is safe where a fault report has to be.
+
+It is worth having because the three answers mean different things and nothing
+else in the report tells them apart. `state=2000` (reserved, not committed) or
+a `type` of `1000000`/`40000` (a loaded image, a mapped file) with a read-only
+`protect` says the writer walked off the end of what it owns - a heap coalescing
+a block whose size is not what it thinks. A committed private page says the
+opposite: something took a mapping away, or protected it, under its owner.
+
+chimera#123 was decided by that one line. The fault was in ntdll's free path,
+after the sandbox was gone, and the obvious suspicion was that this library had
+unmapped a range the heap had since grown into. `[vq]` said the target was
+reserved-not-committed in one run and a read-only image page in the next, which
+is not what an unmapped range looks like - so the box was innocent and the heap
+was walking, and the hunt turned to what could give a heap a bad block. (It was
+a double free: a `thread_local std::string` in the engine DLL, destroyed twice
+by mingw's teardown.)
+
 ## What the guest said last
 
 A guest that aborts has usually already said why - a Rust panic prints

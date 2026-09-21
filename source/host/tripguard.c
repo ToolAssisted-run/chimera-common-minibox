@@ -960,6 +960,21 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
+		{	/* What the OS thinks of the page that was written to. A fault in
+			 * host code is usually somebody else's memory, and "reserved but
+			 * not committed", "read-only", or "part of a loaded image" is the
+			 * difference between a mapping this library took away and a heap
+			 * walking off the end of its own segment. chimera#123 turned on
+			 * that one line. */
+			MEMORY_BASIC_INFORMATION mbi;
+			if (VirtualQuery((void *)fault, &mbi, sizeof mbi))
+				mb_diag(" [vq] base=%p alloc=%p size=%llx state=%lx protect=%lx allocprotect=%lx type=%lx\n",
+				        mbi.BaseAddress, mbi.AllocationBase, (unsigned long long)mbi.RegionSize,
+				        (unsigned long)mbi.State, (unsigned long)mbi.Protect,
+				        (unsigned long)mbi.AllocationProtect, (unsigned long)mbi.Type);
+			else
+				mb_diag(" [vq] VirtualQuery(%p) failed\n", (void *)fault);
+		}
 		const CONTEXT *c = ep->ContextRecord;
 		say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
 		                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
