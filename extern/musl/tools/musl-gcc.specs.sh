@@ -8,7 +8,7 @@ cat <<EOF
 -nostdinc -isystem $incdir -isystem include%s %(old_cpp_options)
 
 *cc1:
-%(cc1_cpu) -nostdinc -isystem $incdir -isystem include%s
+%(cc1_cpu) -mno-red-zone -nostdinc -isystem $incdir -isystem include%s
 
 *link_libgcc:
 -L$libdir -L .%s

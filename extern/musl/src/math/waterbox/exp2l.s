@@ -4,8 +4,10 @@ expm1l:
 	fldt 8(%rsp)
 	fldl2e
 	fmulp
-	movl $0xc2820000,-4(%rsp)
-	flds -4(%rsp)
+	push %rax                  # the constant is built above %rsp, not in the
+	movl $0xc2820000,(%rsp)    # red zone below it (see fenv.s, docs/RED-ZONE.md)
+	flds (%rsp)
+	pop %rax
 	fucomip %st(1),%st
 	fld1
 	jb 1f

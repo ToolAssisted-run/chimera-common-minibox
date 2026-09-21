@@ -8,24 +8,33 @@ feclearexcept:
 	test %eax,%ecx
 	jz 1f
 	fnclex
-1:	stmxcsr -8(%rsp)
+		# the scratch word is PUSHED, not taken from the red zone below %rsp:
+		# a guest is interrupted by dirty-page faults at arbitrary
+		# instructions and on Windows that exception is delivered onto this
+		# stack, where the bytes below %rsp do not survive it (miniBox
+		# docs/RED-ZONE.md). __fesetround below already does it this way.
+1:	push %rax
+	stmxcsr (%rsp)
 	and $0x3f,%eax
-	or %eax,-8(%rsp)
-	test %ecx,-8(%rsp)
+	or %eax,(%rsp)
+	test %ecx,(%rsp)
 	jz 1f
 	not %ecx
-	and %ecx,-8(%rsp)
-	ldmxcsr -8(%rsp)
-1:	xor %eax,%eax
+	and %ecx,(%rsp)
+	ldmxcsr (%rsp)
+1:	pop %rax
+	xor %eax,%eax
 	ret
 
 .global feraiseexcept
 .type feraiseexcept,@function
 feraiseexcept:
 	and $0x3f,%edi
-	stmxcsr -8(%rsp)
-	or %edi,-8(%rsp)
-	ldmxcsr -8(%rsp)
+	push %rax                  # scratch above %rsp, see feclearexcept
+	stmxcsr (%rsp)
+	or %edi,(%rsp)
+	ldmxcsr (%rsp)
+	pop %rax
 	xor %eax,%eax
 	ret
 

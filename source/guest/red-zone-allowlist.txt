@@ -1,0 +1,16 @@
+# Symbols check-wbx.sh may find keeping data below %rsp. One symbol per line,
+# with the reason it is safe; anything not listed here fails the check.
+#
+# Keep this list as short as the evidence allows: an entry that no longer
+# triggers is noise, and an entry added to quiet a real finding is how the
+# class comes back. Each was verified to be the ONLY reason its object passes
+# (empty the file and the check goes red on exactly these).
+#
+# The host gcc's libgcc.a is linked into every guest (-lgcc) and is not rebuilt
+# with the guest flags, because it belongs to the compiler installation. One of
+# its members addresses below %rsp:
+__strub_leave   # libgcc, the -fstrub stack-scrubbing runtime. No guest is built
+                # with -fstrub, and a static archive member is linked only when
+                # something references it, so this never enters a guest image.
+                # If a guest ever does link it, that is a real finding: the
+                # scrubber would be writing to bytes an exception can rewrite.

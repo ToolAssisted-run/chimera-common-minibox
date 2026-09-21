@@ -33,7 +33,7 @@ waterbox_linkscript  = meson.current_source_dir() / 'linkscript.T'
 waterbox_guest_cflags = [
   '-fvisibility=hidden', '-I' + waterbox_emulibc_dir,
   '-I' + waterbox_guestkit_inc, '-I' + waterbox_jsmn_dir,
-  '-Wall', '-mcmodel=large',
+  '-Wall', '-mcmodel=large', '-mno-red-zone',
   '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none',
   '-O2', '-DNDEBUG',
 ]

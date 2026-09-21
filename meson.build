@@ -35,7 +35,12 @@ if build_guest_toolchain
   waterbox_sysroot = meson.current_build_dir() / 'guest-sysroot'
   musl_src         = meson.current_source_dir() / 'extern' / 'musl'
   # The frozen musl CFLAGS (from extern/musl/wbox_configure.sh).
-  musl_cflags = '-Werror -fvisibility=hidden -mcmodel=large ' + \
+  # -mno-red-zone: a guest may be interrupted by a dirty-tracking fault at any
+  # instruction, and on Windows that exception is delivered onto the guest's own
+  # stack, where the bytes below rsp do not survive it (docs/RED-ZONE.md). So no
+  # guest code, libc included, may keep anything below rsp. The same flag sits
+  # in the musl-gcc specs (*cc1) for everything compiled through them.
+  musl_cflags = '-Werror -fvisibility=hidden -mcmodel=large -mno-red-zone ' + \
                 '-mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none'
 
   # Phase 1: configure musl out-of-tree. Writes config.mak + a Makefile symlink
@@ -97,7 +102,7 @@ if build_guest_toolchain
     gcc_srcdir = cpp_dir / 'src' / 'gcc-' + gcc_version
     musl_specs = waterbox_sysroot / 'lib' / 'musl-gcc.specs'
     # Same frozen guest flags the .wbx itself is compiled with.
-    wbx_flags = '-mcmodel=large -mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -O2'
+    wbx_flags = '-mcmodel=large -mno-red-zone -mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -O2'
 
     waterbox_libstdcxx = custom_target('libstdcxx',
       input: waterbox_musl_gcc,           # needs the guest musl headers/libs first
