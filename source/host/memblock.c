@@ -98,7 +98,7 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 	/* An open epoch holds a page read-only until it is written, exactly as the
 	 * baseline tracking does - so one page can be held for either reason, and
 	 * the fault that lifts the hold serves both. */
-	bool clean = !p->dirty || p->epoch_hold;
+	bool clean = !p->dirty || p->held;
 	if (p->status == MB_ST_RW && clean) return MB_PROT_R;
 	if (p->status == MB_ST_RWX && clean) return MB_PROT_RX;
 #ifndef _WIN32
@@ -266,9 +266,20 @@ static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 	/* a hot page is writable and is never to be held, so it is not "unheld" */
 	if (writable && !b->pages[i].hot) bits_set(b->unheld_bits, i);
 	else bits_clr(b->unheld_bits, i);
+	/* and a page that is writable is by definition not held: `held` says
+	 * "mapped read-only although dirty" (minibox_internal.h), and this is the
+	 * one place that knows what the page was actually mapped as. A hot page,
+	 * or a stack on Windows, comes through mb_block_epoch_begin with the flag
+	 * set and out of here writable; the flag goes with the protection. */
+	if (writable) b->pages[i].held = false;
 }
 
-void mb_block_note_unheld(mb_block *b, size_t pi) { bits_set(b->unheld_bits, pi); }
+/* From the fault handler, after it made the page writable. A hot page is never
+ * to be held (see note_prot above), so a hot page that tripped - one a planned
+ * state had protected - is left out. */
+void mb_block_note_unheld(mb_block *b, size_t pi) {
+	if (!b->pages[pi].hot) bits_set(b->unheld_bits, pi);
+}
 
 static void page_cool(mb_block *b, size_t i);
 
@@ -309,6 +320,10 @@ bool mb_block_maps_consistent(const mb_block *b) {
 		if (b->status_map[i] != p->status || b->dirty_map[i] != (uint8_t)p->dirty) return false;
 		if (p->hot != bits_get(b->hot_bits, i)) return false;
 		if (p->hot && (!p->dirty || p->shadow == NULL || bits_get(b->unheld_bits, i))) return false;
+		/* held is a fact about protection - dirty yet mapped read-only - so it
+		 * cannot be true of a page that is writable: a hot one, or one in
+		 * unheld_bits */
+		if (p->held && (p->hot || bits_get(b->unheld_bits, i))) return false;
 		if (!p->hot && p->shadow != NULL && p->status != MB_ST_RWSTACK) return false;
 		hot += p->hot;
 	}
@@ -429,7 +444,7 @@ void mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t maddr) {
 	mb_page *p = &b->pages[pi];
 	/* Whether or not an epoch wants this page, the hold is over: the write that
 	 * brought us here is about to be let through. */
-	p->epoch_hold = false;
+	p->held = false;
 	/* An epoch tracks a page whether or not it was HELD. A page that was
 	 * already read-only - clean against the baseline - needed no hold and got
 	 * none, and it still belongs in the delta the moment it is written. */
@@ -1603,13 +1618,24 @@ static const char DELTA_MAGIC[] = "MiniBoxDelta1";
 #define DELTA_IDX_CLEAN (UINT64_C(1) << 63)
 static uint64_t delta_page(uint64_t idx) { return idx & ~DELTA_IDX_CLEAN; }
 
-/* Forget what an epoch knew about one page, returning its pre-image. */
+/* Forget what an epoch knew about one page.
+ *
+ * Only epoch_dirty: `held` is not the epoch's to clear. It says the page is
+ * mapped read-only although dirty, and it stays true for exactly as long as
+ * that is - until the write that faults. This used to clear it too, for the
+ * pages the epoch wrote, which was a no-op (the write had cleared it) that
+ * read as if the epoch owned the flag and had merely forgotten to clear it on
+ * the pages it did not write. Clearing it there is a real defect: a page
+ * held read-only and unwritten would read as writable, and the next refresh
+ * over it - a planned state finishing during the next frame, say - would MAP
+ * it writable, so the write that followed would fault nowhere and the frame's
+ * delta would be short a page (test_a_hold_survives_a_planned_state). */
 static void epoch_clear_page(mb_page *p) {
 	p->epoch_dirty = false;
-	p->epoch_hold = false;
 }
 
-/* Forgets the whole of the last epoch, visiting only the pages it touched. */
+/* Forgets the whole of the last epoch, visiting only the pages it touched. The
+ * pages it held and nobody wrote are not touched, and are still held. */
 static void epoch_forget(mb_block *b) {
 	for (size_t w = 0; w < b->nwords; w++) {
 		uint64_t m = b->epoch_bits[w];
@@ -1686,9 +1712,11 @@ static int epoch_begin_impl(mb_block *b) {
 			size_t i = (w << 6) + (size_t)bits_first(m);
 			m &= m - 1;
 			mb_page *p = &b->pages[i];
-			if (epoch_tracks(p)) {
-				p->epoch_hold = true;
-			}
+			/* held from here until its next write, whether or not that write
+			 * lands in this epoch (see `held` in minibox_internal.h); the
+			 * refresh below takes the flag back off a page that comes out
+			 * writable anyway - a hot one, or a stack on Windows */
+			if (epoch_tracks(p)) p->held = true;
 			/* maximal runs, so the syscalls are as few as the pages allow */
 			if (run_start == (size_t)-1) { run_start = run_last = i; }
 			else if (i == run_last + 1) { run_last = i; }

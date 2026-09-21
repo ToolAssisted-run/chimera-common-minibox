@@ -1000,6 +1000,166 @@ static void test_compose_in_memory_matches_streaming(void) {
 	mb_block_free(b);
 }
 
+
+/* ---- the hold is a fact about the page, not about the epoch -----------------
+ *
+ * An epoch holds a dirty page read-only so that its next write faults. A page
+ * nobody writes that frame is still read-only when the frame ends, and stays
+ * so until something writes it - that is the whole economy of the scheme: a
+ * page written once and never again costs one fault, ever, not a
+ * re-protection per frame. So `held` says "dirty, yet mapped read-only,
+ * awaiting the write that lifts it", and it has to keep saying so after the
+ * epoch ends, or mb_page_native_prot - its one reader - calls the page
+ * writable while the OS has it read-only, and the next refresh over it MAKES
+ * it writable with no fault left to record the write that follows.
+ *
+ * It used to be named epoch_hold, and the end of an epoch cleared it for the
+ * pages written that epoch, which read as a flag stuck on the others. This
+ * pins what is actually true of the unwritten page: held, read-only, said to
+ * be, and its next write counted by whichever epoch it lands in - and the
+ * complementary case, that the write does lift it. Run against a version
+ * that cleared the flag for every held page at the end of the epoch, it fails
+ * at the first "still held" line (and the plan leg below fails harder). */
+static void test_a_hold_outlives_its_epoch(void) {
+	mb_block *b = sealed(0x20000);
+	gp(b, 0x5000)[0] = 1;                                   /* page 5: dirty, writable */
+	CHECK(!b->pages[5].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_RW);
+
+	CHECK_EQ(mb_block_epoch_begin(b), 0);                   /* epoch 1 holds it */
+	CHECK(b->pages[5].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_R);
+	/* nobody writes it; that epoch ends and the next begins */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK(b->pages[5].held);                                /* still held: the truth */
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_R);
+	CHECK(mb_block_maps_consistent(b));
+	/* and the OS agrees: its first write in epoch 2 faults, and is counted once */
+	CHECK_EQ(mb_block_epoch_page_count(b), 0);
+	gp(b, 0x5000)[0] = 2;
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	/* written: the hold is lifted by the write, and by nothing else */
+	CHECK(!b->pages[5].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_RW);
+	CHECK(mb_block_maps_consistent(b));
+	/* the next epoch holds it again, and the same again */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK(b->pages[5].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_R);
+	gp(b, 0x5000)[0] = 3;
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK(!b->pages[5].held);
+	/* an epoch given up with no successor leaves an unwritten page as it is:
+	 * read-only, and said to be */
+	gp(b, 0x6000)[0] = 1;
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK(b->pages[6].held);
+	mb_block_epoch_clear(b);
+	CHECK(b->pages[6].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[6]), MB_PROT_R);
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* The same fact where it is load-bearing. A planned state finishing during
+ * the next frame re-protects every page it held from what the page's flags
+ * say, and a page that was held read-only before the plan has to come out
+ * read-only after it. Clear the hold at the end of the epoch that set it and
+ * the page comes out WRITABLE here, its next write faults nowhere, and the
+ * frame's delta is short a page: a machine rebuilt from that delta lacks the
+ * write. Watched: with epoch_forget clearing every hold, this reports the
+ * page count 0 where 1 is owed and the rebuilt page holding 1 where 2 was
+ * written. */
+static void test_a_hold_survives_a_planned_state(void) {
+	mb_block *b = sealed(0x20000);
+	gp(b, 0x5000)[0] = 1;
+	CHECK_EQ(mb_block_epoch_begin(b), 0);                   /* held, and not written */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);                   /* the next frame */
+	CHECK(b->pages[5].held);
+
+	/* an anchor taken during that frame: page 5 is dirty, so the plan holds
+	 * it, and finishing the plan re-protects it from its flags */
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+	CHECK(b->pages[5].held);
+	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_R);
+	CHECK(mb_block_maps_consistent(b));
+
+	/* the frame writes it after the anchor: the fault must still come */
+	gp(b, 0x5000)[0] = 2;
+	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	membuf d = { 0 };
+	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+
+	/* and a machine rebuilt from the delta has the write */
+	mb_block *other = sealed_at(0x37f00000000ull, 0x20000);
+	((volatile uint8_t *)(other->addr.start + 0x5000))[0] = 1;   /* as the frame found it */
+	d.pos = 0;
+	CHECK_EQ(mb_block_delta_apply(other, membuf_read, (uintptr_t)&d), 0);
+	CHECK_EQ(((const volatile uint8_t *)(other->addr.start + 0x5000))[0], 2);
+
+	membuf_free(&d);
+	free(dest);
+	mb_block_free(other);
+	mb_block_free(b);
+}
+
+/* held is never true on a page that is writable - the invariant that makes it
+ * a fact rather than a flag. Two ways it was not: a hot page held by a plan
+ * trips when the guest writes it (hot means mapped writable; the plan made it
+ * read-only; the write faults) and left the fault writable-and-hot with an
+ * unheld bit, so the next epoch_begin set the hold on it while refresh_range,
+ * seeing it hot, left it writable. And on Windows every stack page got the
+ * hold set at every epoch and stayed writable, because a Windows stack is
+ * never held. Neither misled mb_page_native_prot, which asks hot and the stack
+ * first - but a flag that is true where it cannot be is one the next reader
+ * believes. Now the refresh that leaves a page writable clears it, and a hot
+ * page that trips is not marked unheld (it is never to be held). Watched red
+ * on the code before: FAIL mb_block_maps_consistent(b) at the two marked
+ * lines, the stack one on Windows only. */
+static void test_held_is_never_true_on_a_writable_page(void) {
+	mb_block *b = sealed(0x20000);
+	/* a stack page: on Windows it is never held, and must not read as held */
+	mb_range stack = { b->addr.start + 0xa000, 0x1000 };
+	CHECK_EQ(mb_block_mprotect(b, stack, MB_PROT_RWSTACK), 0);
+	gp(b, 0xa000)[0] = 1;
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK(mb_block_maps_consistent(b));                     /* red before, on Windows */
+#ifdef _WIN32
+	CHECK(!b->pages[10].held);
+#endif
+	/* a hot page: written enough frames in a row */
+	for (int f = 0; f < 6; f++) {
+		CHECK_EQ(mb_block_epoch_begin(b), 0);
+		gp(b, 0x4000)[f] = (uint8_t)(f + 1);
+		membuf d = { 0 };
+		CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
+		membuf_free(&d);
+	}
+	CHECK(b->pages[4].hot);
+	CHECK(mb_block_maps_consistent(b));
+	/* an anchor taken while it is hot holds it, and the guest's write trips it */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	const size_t size = mb_block_state_size(b);
+	uint8_t *dest = (uint8_t *)calloc(1, size);
+	CHECK(dest != NULL);
+	CHECK(mb_block_state_plan(b, dest) != 0);
+	gp(b, 0x4000)[7] = 0x77;
+	CHECK(b->pages[4].hot);
+	CHECK(mb_block_maps_consistent(b));                     /* red before: hot, with an unheld bit */
+	CHECK_EQ(mb_block_plan_finish(b), 0);
+	/* the next frame: the hot page is writable, and must not read as held */
+	CHECK_EQ(mb_block_epoch_begin(b), 0);
+	CHECK(b->pages[4].hot);
+	CHECK(!b->pages[4].held);
+	CHECK(mb_block_maps_consistent(b));                     /* red before, both hosts */
+	free(dest);
+	mb_block_free(b);
+}
+
 static void run_all(void) {
 	test_epoch_tracks_what_changed();
 	test_forward_delta_reproduces();
@@ -1027,6 +1187,9 @@ static void run_all(void) {
 	test_compose_carries_allocation();
 	test_compose_refuses_a_foreign_delta();
 	test_compose_in_memory_matches_streaming();
+	test_a_hold_outlives_its_epoch();
+	test_a_hold_survives_a_planned_state();
+	test_held_is_never_true_on_a_writable_page();
 }
 
 TEST_MAIN()

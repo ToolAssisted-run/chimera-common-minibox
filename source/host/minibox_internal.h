@@ -90,10 +90,28 @@ typedef struct {
 	uint8_t *snap_data;  /* MB_PAGESIZE bytes when snap_kind==DATA, else NULL */
 	bool uncommitted;    /* lazy blocks only: neither view is backed yet (reads as zero) */
 	/* ---- epochs (see mb_block_epoch_begin) ----
-	 * dirty says "changed since the baseline", which only ever grows. These say
-	 * "changed since a MOMENT", so a caller can ask what one frame did rather
-	 * than what the whole run did. hold means the page is write-protected for
-	 * this epoch and has not been written yet.
+	 * dirty says "changed since the baseline", which only ever grows.
+	 * epoch_dirty says "changed since a MOMENT", so a caller can ask what one
+	 * frame did rather than what the whole run did; it belongs to the open
+	 * epoch and is cleared when the epoch is forgotten.
+	 *
+	 * held does NOT belong to the epoch, and used to be named as if it did
+	 * (epoch_hold). It is a fact about the page's PROTECTION: dirty, yet
+	 * mapped read-only, because an epoch protected it and nothing has written
+	 * it since. An epoch holds the pages that are writable when it opens so
+	 * that their next write faults; a page nobody writes that frame is still
+	 * read-only when the frame ends, and stays so - that is the economy of the
+	 * scheme, one fault per page per burst of writes rather than one
+	 * re-protection per page per frame. mb_page_native_prot, the one reader,
+	 * has to keep describing that page as read-only for as long as it is, or
+	 * the next refresh over it (a planned state finishing, a neighbouring
+	 * mprotect) would make it writable with no fault left to record the write
+	 * that follows. So the flag outlives the epoch by design, and is lifted by
+	 * the write that faults (mb_block_epoch_capture) or by any refresh that
+	 * maps the page writable (note_prot) - never by the end of an epoch. The
+	 * invariant, checked by mb_block_maps_consistent: held is never true on a
+	 * page that is writable, which is to say on a hot page or one in
+	 * unheld_bits.
 	 *
 	 * There is no pre-image here. An epoch used to copy a page's content the
 	 * first time a frame wrote it, so that the frame could be described
@@ -101,7 +119,7 @@ typedef struct {
 	 * every page every frame, paid whether or not anybody ever stepped back. A
 	 * frame is rebuilt by loading an anchor and applying the deltas since it,
 	 * so nothing ever asked. */
-	bool epoch_hold;
+	bool held;
 	bool epoch_dirty;
 	/* ---- hot pages (see page_heat in memblock.c) ----
 	 * A page written frame after frame is left writable and compared instead

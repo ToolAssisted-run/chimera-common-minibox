@@ -67,7 +67,7 @@ static bool consistent(const char *where) {
 		else if (!p->hot && p->shadow != NULL && p->status != MB_ST_RWSTACK) why = "shadow while cold";
 		if (why) {
 			fprintf(stderr, "  seed %d step %d (%s): page %zu: %s (status %02x dirty %d hot %d heat %d hold %d edirty %d)\n",
-				g_seed, g_step, where, i, why, p->status, p->dirty, p->hot, p->heat, p->epoch_hold, p->epoch_dirty);
+				g_seed, g_step, where, i, why, p->status, p->dirty, p->hot, p->heat, p->held, p->epoch_dirty);
 			return false;
 		}
 		hot += p->hot;
