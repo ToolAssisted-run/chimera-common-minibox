@@ -243,6 +243,27 @@ mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags) {
 	return handle_add(fs, idx)->fd;
 }
 
+/* dup(2): a second descriptor on what `fd` has open (chimera#148 - Dolphin
+ * copies a disc image's reader, which dups its descriptor, when a Triforce
+ * game's image is loaded into the media board's DIMM).
+ *
+ * One difference from POSIX, deliberately: the new descriptor gets its own
+ * position, starting where the old one is, rather than SHARING it. Handles
+ * here have always carried their own positions (see the header), and a
+ * shared one would be a second kind of handle for no caller that needs it -
+ * the readers that dup read with an explicit offset. A writable file stays
+ * single-open, as mb_fs_open keeps it, so dup refuses one. */
+mb_sword mb_fs_dup(mb_fs *fs, int fd) {
+	open_handle *h = handle_by_fd(fs, fd);
+	if (!h) return -EBADF;
+	const size_t file = h->file, pos = h->pos;
+	mounted_file *f = &fs->files[file];
+	if (f->kind == F_REGULAR && f->writable) return -EACCES;
+	open_handle *d = handle_add(fs, file);   /* may move fs->hs: h is stale */
+	d->pos = pos;
+	return d->fd;
+}
+
 mb_sword mb_fs_close(mb_fs *fs, int fd) {
 	open_handle *h = handle_by_fd(fs, fd);
 	if (!h) return -EBADF;

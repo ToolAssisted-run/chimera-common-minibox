@@ -316,6 +316,30 @@ static void test_host_file(void) {
 #endif
 }
 
+/* dup: a second descriptor on the same file, starting where the first one
+ * is and moving on its own; a writable file stays single-open */
+static void test_dup(void) {
+	mb_fs *fs = mb_fs_new();
+	CHECK_EQ(mb_fs_mount(fs, "f", (const uint8_t *)DOG, sizeof(DOG)-1, false), 0);
+	mb_sword fd = mb_fs_open(fs, "f", O_RDONLY);
+	uint8_t buf[8];
+	CHECK_EQ(mb_fs_read(fs, fd, buf, 4), 4);
+	mb_sword d = mb_fs_dup(fs, (int)fd);
+	CHECK(d >= 0 && d != fd);
+	CHECK_EQ(mb_fs_read(fs, (int)d, buf, 6), 6);
+	CHECK(memcmp(buf, "quick ", 6) == 0);        /* from where the original was */
+	CHECK_EQ(mb_fs_read(fs, fd, buf, 5), 5);
+	CHECK(memcmp(buf, "quick", 5) == 0);          /* the original did not move */
+	CHECK_EQ(mb_fs_close(fs, fd), 0);
+	CHECK_EQ(mb_fs_read(fs, (int)d, buf, 5), 5);  /* and outlives it */
+	CHECK(memcmp(buf, "brown", 5) == 0);
+	CHECK(mb_fs_dup(fs, 99) < 0);                 /* nothing open there */
+	CHECK_EQ(mb_fs_mount(fs, "w", (const uint8_t *)"", 0, true), 0);
+	mb_sword w = mb_fs_open(fs, "w", O_RDWR);
+	CHECK(mb_fs_dup(fs, (int)w) < 0);             /* writable: single-open */
+	mb_fs_free(fs);
+}
+
 static void run_all(void) {
 	RUN(test_ro_read);
 	RUN(test_seek);
@@ -325,5 +349,6 @@ static void run_all(void) {
 	RUN(test_sysout_tail);
 	RUN(test_stdout_write);
 	RUN(test_host_file);
+	RUN(test_dup);
 }
 TEST_MAIN()

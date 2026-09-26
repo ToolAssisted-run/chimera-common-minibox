@@ -493,6 +493,7 @@ int    mb_fs_unmount(mb_fs *fs, const char *name, uint8_t **out_data, size_t *ou
 /* syscall-shaped ops: return value or -errno */
 mb_sword mb_fs_open(mb_fs *fs, const char *name, int flags);
 mb_sword mb_fs_close(mb_fs *fs, int fd);
+mb_sword mb_fs_dup(mb_fs *fs, int fd);
 mb_sword mb_fs_read(mb_fs *fs, int fd, uint8_t *buf, size_t n);
 mb_sword mb_fs_write(mb_fs *fs, int fd, const uint8_t *buf, size_t n);
 mb_sword mb_fs_seek(mb_fs *fs, int fd, mb_sword offset, int whence);

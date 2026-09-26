@@ -41,7 +41,7 @@ struct mb_host {
 
 /* ---- syscall numbers (x86-64) ---- */
 enum {
-	NR_read=0, NR_write=1, NR_open=2, NR_close=3, NR_stat=4, NR_fstat=5, NR_lseek=8,
+	NR_read=0, NR_write=1, NR_open=2, NR_close=3, NR_dup=32, NR_stat=4, NR_fstat=5, NR_lseek=8,
 	NR_mmap=9, NR_mprotect=10, NR_munmap=11, NR_brk=12, NR_rt_sigprocmask=14,
 	NR_ioctl=16, NR_readv=19, NR_writev=20, NR_sched_yield=24, NR_mremap=25, NR_madvise=28,
 	NR_nanosleep=35, NR_getpid=39, NR_exit=60, NR_truncate=76, NR_ftruncate=77,
@@ -481,6 +481,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return mb_fs_exists(h->fs, p) ? serr(EINVAL) : serr(ENOENT);
 		}
 		case NR_close: { mb_sword r = mb_fs_close(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(0); }
+		case NR_dup:   { mb_sword r = mb_fs_dup(h->fs, (int)a1); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_lseek: { mb_sword r = mb_fs_seek(h->fs, (int)a1, (mb_sword)a2, (int)a3); return r < 0 ? serr((int)-r) : sok(r); }
 		case NR_truncate:  { mb_sword r = mb_fs_truncate_name(h->fs, (const char *)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
 		case NR_ftruncate: { mb_sword r = mb_fs_truncate_fd(h->fs, (int)a1, (mb_sword)a2); return r < 0 ? serr((int)-r) : sok(0); }
