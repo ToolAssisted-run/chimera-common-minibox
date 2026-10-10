@@ -1,0 +1,4 @@
+KhronosGroup/Vulkan-Headers, tag vulkan-sdk-1.4.350.1, commit 8864cdc896bbc2a9b6eb36b3218fc9ef57908d77.
+Only what the Vulkan bridge needs is here: vulkan_core.h and vk_platform.h, the
+vk_video headers vulkan_core.h includes, and the registry (vk.xml) the bridge
+is generated from. Nothing is modified.

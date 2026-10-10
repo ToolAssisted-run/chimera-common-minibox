@@ -11,6 +11,8 @@ inventory of authorship and licenses is in docs/ATTRIBUTION.md. In summary:
 - toolchain/musl (git submodule) is a fork of musl libc, Copyright (c) 2005-2020
   Rich Felker and contributors, MIT (see that submodule's COPYRIGHT file).
 - libco is by byuu (Near), released into the public domain.
+- extern/vulkan-headers is the Khronos Group's Vulkan headers and registry,
+  Apache-2.0 OR MIT, unmodified (see its LICENSE.md).
 - The LLVM libraries built by toolchain/libcxx (libc++, libc++abi, libunwind,
   compiler-rt) are the LLVM contributors' work, Apache-2.0 with the LLVM
   exception; they are fetched and built, not vendored here.

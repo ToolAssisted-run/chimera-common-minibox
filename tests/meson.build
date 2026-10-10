@@ -16,6 +16,9 @@ subdir('unit')
 # and the win64<->sysv64 boundary was only unit-tested in isolation.
 subdir('runner')
 
+# ---- the Vulkan bridge (its runner on every target; its guest needs the toolchain) ----
+subdir('vk')
+
 # ---- guest system tests (musl+emulibc are meson-built; native only) ----
 if build_guest_toolchain
   subdir('conformance')

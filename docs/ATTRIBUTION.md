@@ -64,6 +64,16 @@ Copyright (c) 2010 Serge Zaitsev, MIT License (full text in the file header and
 `extern/jsmn/LICENSE`). The guest kit's `source/guest/include/waterbox_settings.h`
 uses it to parse the host's settings channel for C cores.
 
+### Vulkan headers and registry - Apache-2.0 OR MIT (The Khronos Group)
+
+`extern/vulkan-headers` holds, unmodified, the part of KhronosGroup/Vulkan-Headers
+the Vulkan bridge needs: `vulkan_core.h`, `vk_platform.h`, the `vk_video` headers
+`vulkan_core.h` includes, and the registry `vk.xml` both halves of the bridge are
+generated from (`source/vk`). The tag and commit are in its `VERSION`; the
+licence texts are in its `LICENSE.md` and `LICENSES/`. Nothing of it is linked
+into a guest or a host: the headers are declarations, and the registry is read
+by the generator.
+
 ## Components fetched or built at build time (NOT vendored here)
 
 ### GNU libstdc++ - GPL-3.0 WITH GCC Runtime Library Exception

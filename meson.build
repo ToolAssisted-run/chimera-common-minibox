@@ -145,6 +145,7 @@ touch @5@
 endif
 
 subdir('source/guest')   # exposes the waterbox_guest_* variables (guest .wbx build)
+subdir('source/vk')      # the Vulkan bridge: generated halves, the host half's source
 
 # Tests are opt-in for subproject consumers; on by default for a standalone build.
 if not meson.is_subproject()
