@@ -65,7 +65,7 @@ static void test_mmap_movable_bestfit(void) {
 	CHECK_EQ(mb_block_munmap(b, h2), 0);
 	CHECK_EQ(mb_block_munmap(b, h4), 0);
 	mb_range req = { 0, 0x2000 };   /* want 2 pages -> should land in the 2-page hole */
-	mb_sword got = mb_block_mmap(b, req, MB_PROT_RW, all, false);
+	mb_sword got = mb_block_mmap(b, req, MB_PROT_RW, all, false, false);
 	CHECK_EQ(got, (mb_sword)(b->addr.start + 0x1000));
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
@@ -107,6 +107,31 @@ static void test_madvise_keeps_allocated(void) {
 	CHECK_EQ(mb_block_madvise_dontneed(b, one), 0);
 	CHECK(!freed(b, 4));            /* still allocated... */
 	CHECK_EQ(gp(b, 0x4000)[0], 0);  /* ...but zeroed */
+	CHECK(mb_block_maps_consistent(b));
+	mb_block_free(b);
+}
+
+/* A fixed mmap over allocated pages: v2 (zero_overlap false) keeps their
+ * bytes; v3 (true) hands them back zero-filled, Free pages in the range just
+ * get mapped - MMgc-style decommit (PROT_NONE) then recommit (RW). */
+static void test_mmap_fixed_overlap(void) {
+	mb_block *b = fresh(0x10000);
+	mb_range all = { b->addr.start, 0x10000 };
+	mb_range two = { b->addr.start, 0x2000 };
+	CHECK_EQ(mb_block_mmap_fixed(b, two, MB_PROT_RW, true), 0);
+	gp(b, 0x0000)[0] = 7;
+	gp(b, 0x1ff8)[7] = 8;
+	mb_range four = { b->addr.start, 0x4000 };
+	CHECK_EQ(mb_block_mmap(b, four, MB_PROT_RW, all, false, false), (mb_sword)four.start);
+	CHECK_EQ(gp(b, 0x0000)[0], 7);   /* v2: overlap keeps its bytes */
+	CHECK_EQ(gp(b, 0x1ff8)[7], 8);
+	CHECK(!freed(b, 2) && !freed(b, 3));
+	CHECK_EQ(mb_block_mmap(b, four, MB_PROT_NONE, all, false, true), (mb_sword)four.start);
+	CHECK_EQ(mb_block_mmap(b, four, MB_PROT_RW, all, false, true), (mb_sword)four.start);
+	CHECK_EQ(gp(b, 0x0000)[0], 0);   /* v3: zero-filled */
+	CHECK_EQ(gp(b, 0x1ff8)[7], 0);
+	CHECK(!freed(b, 0) && !freed(b, 3));
+	gp(b, 0x3000)[0] = 1;            /* and writable */
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
 }
@@ -445,7 +470,7 @@ static void test_mmap_placement_is_the_page_walks(void) {
 				: 1 + NEXT() % 700;                                 /* small */
 			const size_t want = reference_place(b, npages);
 			mb_range r = { 0, npages << MB_PAGESHIFT };
-			const mb_sword got = mb_block_mmap(b, r, MB_PROT_RW, arena, false);
+			const mb_sword got = mb_block_mmap(b, r, MB_PROT_RW, arena, false, false);
 			if (want == (size_t)-1) {
 				CHECK(got < 0);
 				refused++;
@@ -474,6 +499,7 @@ static void run_all(void) {
 	RUN(test_mprotect_free_enomem);
 	RUN(test_munmap_zeroes);
 	RUN(test_madvise_keeps_allocated);
+	RUN(test_mmap_fixed_overlap);
 	RUN(test_mremap_inplace);
 	RUN(test_mremap_maymove);
 	RUN(test_range_is_free);

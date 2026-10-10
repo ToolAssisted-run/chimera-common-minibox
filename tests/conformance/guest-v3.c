@@ -258,8 +258,13 @@ ECL_EXPORT int V3HintHonored(void) {
 	uint8_t *f2 = (uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_READ | PROT_WRITE,
 	                                 MAP_PRIVATE | MAP_ANONYMOUS | 0x10 /*FIXED*/, -1, 0);
 	if (f2 != f1) return 0;
+	if (f2[0] != 0) return 0;                      /* discarded: zero-filled */
+	/* decommit/recommit (PROT_NONE then RW, both MAP_FIXED) zero-fills too */
 	f2[0] = 0x22;
 	if (f1[0] != 0x22) return 0;
+	if ((uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | 0x10, -1, 0) != f1) return 0;
+	if ((uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | 0x10, -1, 0) != f1) return 0;
+	if (f1[0] != 0) return 0;
 	(void)h1;
 	return 1;
 }

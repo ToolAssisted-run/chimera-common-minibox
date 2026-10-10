@@ -283,7 +283,9 @@ void      mb_block_deactivate(mb_block *b);
 
 /* syscall-shaped memory ops; return 0 on success or -errno. */
 int  mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replace);
-mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace); /* addr or -errno */
+/* zero_overlap: a fixed request zero-fills pages it overlaps that are already
+ * allocated (spec v3 MAP_FIXED); false keeps their bytes (v2). */
+mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace, bool zero_overlap); /* addr or -errno */
 int  mb_block_mprotect(mb_block *b, mb_range addr, mb_prot prot);
 int  mb_block_munmap(mb_block *b, mb_range addr);
 int  mb_block_madvise_dontneed(mb_block *b, mb_range addr);
