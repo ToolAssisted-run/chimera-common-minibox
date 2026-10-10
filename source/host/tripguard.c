@@ -15,6 +15,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <signal.h>   /* ask_guest's mask, above the Linux half */
 #endif
 
 /* The block LIST changes only when a machine is created or destroyed, on the
@@ -120,9 +122,17 @@ static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
  * reads memory that may be exactly what is wrong). So a thread carries its
  * phase as well as its depth, and a fault that arrives in a phase that may not
  * nest, or deeper than any guest handler has business going, is said once and
- * passed on. The shared code below sets the phase on both hosts; on Linux the
- * signal is blocked for the handler's duration, so a fault in any phase is
- * fatal there and the phase only makes the last words precise.
+ * passed on. The shared code below sets the phase on both hosts. On Linux the
+ * signal is blocked for the handler's duration except while the guest's own
+ * handler runs (ask_guest unblocks it), so there too only a fault in the
+ * guest phase is served, and any other is said and fatal.
+ *
+ * A guest that dies inside its own handler leaves every handler frame at once:
+ * control goes to the escape, and the frames below never unwind. Whichever
+ * handler sends it there puts this thread's depth and phase back to none
+ * (leave_every_handler_frame), and on Linux the signal mask the first fault
+ * arrived with, or the next fault on this thread would find itself nested in
+ * a handler that is long gone.
  *
  * Per-thread storage: __thread on Linux, where the handler has the host's %fs
  * back before it reads anything. On Windows mingw's __thread is EMULATED
@@ -226,6 +236,11 @@ static bool drop_fs_for_test(void) {
  * protector for the same reason as below. */
 __attribute__((no_stack_protector))
 static bool insn_has_fs_prefix(uintptr_t rip) {
+#if defined(__aarch64__)
+	/* TPIDR_EL0 is never dropped by the OS: there is nothing to repair */
+	(void)rip;
+	return false;
+#endif
 	const uint8_t *p = (const uint8_t *)rip;
 	for (int i = 0; i < 5; i++) {
 		uint8_t b = p[i];
@@ -301,6 +316,29 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
+#ifndef _WIN32
+	/* ...and able to fault. The handler runs with every signal blocked, and a
+	 * fault while its own is blocked is not delivered: the kernel ends the
+	 * process. The guest's handler is guest code, which writes held pages -
+	 * its own thread locals, after an epoch has held them - and that write
+	 * has to be served like any other, as it is on Windows. So the signals a
+	 * guest instruction can raise are open while it runs (handler_inner lets
+	 * a fault in this phase nest), and shut again after.
+	 *
+	 * Opened BEFORE the guest's thread pointer goes in, and shut after the
+	 * host's is back: pthread_sigmask is host libc, and host libc under the
+	 * guest's %fs writes the guest's thread block. Its first call is bound
+	 * lazily, and glibc's resolver sets and clears its scope flag at %fs:0x1c
+	 * - on an x86-64 musl thread pointer, the high half of the main thread's
+	 * `next`, which the guest's next pthread_create followed to 0x720e130. */
+	sigset_t faults, was;
+	sigemptyset(&faults);
+	sigaddset(&faults, SIGSEGV);
+	sigaddset(&faults, SIGBUS);
+	sigaddset(&faults, SIGILL);
+	sigaddset(&faults, SIGFPE);
+	pthread_sigmask(SIG_UNBLOCK, &faults, &was);
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
 	 * handler put the host's back on entry, and guest code under it reads
@@ -317,6 +355,9 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
 #ifdef MB_HAVE_FSBASE
 	if (swap) mb_wrfsbase(host_fs);
+#endif
+#ifndef _WIN32
+	pthread_sigmask(SIG_SETMASK, &was, NULL);
 #endif
 	fault_phase_set(phase);
 	return handled;
@@ -350,21 +391,37 @@ static bool trip(uintptr_t addr) {
 	mb_block_track_lock(b);
 	bool tripped = false;
 	if (tracked_status(p->status)) {
-		/* Order matters: the epoch wants what the page held before THIS write,
-		 * and so does the baseline the first time round. Both read the same
-		 * bytes, so both must run before the write is let through. */
-		mb_block_epoch_capture(b, pi, mirror_of(b, page_start));
-		mb_page_maybe_snapshot(p, mirror_of(b, page_start));
-		/* And a state being taken in the background wants the same bytes: this
-		 * is the last moment they exist. One atomic exchange when no state is
-		 * being taken, which is almost always. */
-		mb_block_plan_capture(b, pi);
-		mb_block_note_dirty(b, pi, true);
-		mb_range r = { page_start, MB_PAGESIZE };
-		if (mb_pal_protect(r, mb_page_native_prot(p)) != 0) { __builtin_trap(); abort(); }
-		/* It is writable from here, so the next epoch has to hold it again.
-		 * Only a bit: this is a signal handler. */
-		mb_block_note_unheld(b, pi);
+		/* The write is let through by making the HOST page writable, and a host
+		 * page larger than the machine's holds a group of pages that share it
+		 * (mb_group_pages). Every page of the group still held is released with
+		 * this one, as if it were written too: once the host page is writable
+		 * none of them would fault again. One page per group on a 4 KiB host. */
+		const size_t n = mb_group_pages();
+		const size_t first = pi & ~(n - 1);
+		for (size_t qi = first; qi < first + n && qi < b->npages; qi++) {
+			mb_page *q = &b->pages[qi];
+			if (!tracked_status(q->status)) continue;
+			if (qi != pi) {
+				const mb_prot np = mb_page_native_prot(q);
+				if (np == MB_PROT_RW || np == MB_PROT_RWX || np == MB_PROT_RWSTACK) continue;   /* not held */
+			}
+			const uintptr_t q_start = b->addr.start + (qi << MB_PAGESHIFT);
+			/* Order matters: the epoch wants what the page held before THIS write,
+			 * and so does the baseline the first time round. Both read the same
+			 * bytes, so both must run before the write is let through. */
+			mb_block_epoch_capture(b, qi, mirror_of(b, q_start));
+			mb_page_maybe_snapshot(q, mirror_of(b, q_start));
+			/* And a state being taken in the background wants the same bytes: this
+			 * is the last moment they exist. One atomic exchange when no state is
+			 * being taken, which is almost always. */
+			mb_block_plan_capture(b, qi);
+			mb_block_note_dirty(b, qi, true);
+			/* It is writable from here, so the next epoch has to hold it again.
+			 * Only a bit: this is a signal handler. */
+			mb_block_note_unheld(b, qi);
+		}
+		(void)page_start;
+		if (mb_block_protect_group(b, pi) != 0) { __builtin_trap(); abort(); }
 		tripped = true;
 	}
 	mb_block_track_unlock(b);
@@ -524,7 +581,83 @@ void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
 #include <sys/mman.h>
 static struct sigaction g_old_sa;
 
+/* The interrupted context, per CPU: where it was, its stack, and whether the
+ * access that faulted was a write. */
+#if defined(__aarch64__)
+#define UC_PC(uc) ((uc)->uc_mcontext.pc)
+#define UC_SP(uc) ((uc)->uc_mcontext.sp)
+/* The kernel puts the fault's syndrome (ESR_EL1) in a record of its own in the
+ * signal frame's reserved area; a data abort's WnR bit (6) says write. Spelled
+ * out here because the kernel's header for it fights glibc's. */
+struct mb_a64_ctx { uint32_t magic, size; };
+#define MB_A64_ESR_MAGIC 0x45535201u
+static bool uc_write(const ucontext_t *uc) {
+	const unsigned char *p = (const unsigned char *)uc->uc_mcontext.__reserved;
+	const unsigned char *end = p + sizeof uc->uc_mcontext.__reserved;
+	while (p + sizeof(struct mb_a64_ctx) <= end) {
+		const struct mb_a64_ctx *h = (const struct mb_a64_ctx *)p;
+		if (h->magic == 0 || h->size == 0) break;
+		if (h->magic == MB_A64_ESR_MAGIC) {
+			uint64_t esr;
+			memcpy(&esr, p + sizeof *h, sizeof esr);
+			const unsigned ec = (unsigned)(esr >> 26) & 0x3f;
+			return (ec == 0x24 || ec == 0x25) && (esr & (1u << 6)) != 0;
+		}
+		p += h->size;
+	}
+	return false;
+}
+#elif defined(__x86_64__)
+#define UC_PC(uc) ((uc)->uc_mcontext.gregs[REG_RIP])
+#define UC_SP(uc) ((uc)->uc_mcontext.gregs[REG_RSP])
+static bool uc_write(const ucontext_t *uc) { return (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0; }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+
+static void say_uc_regs(const ucontext_t *uc) {
+#if defined(__aarch64__)
+	const unsigned long long *x = (const unsigned long long *)uc->uc_mcontext.regs;
+	mb_diag(" pc=%p sp=%p\n", (void *)uc->uc_mcontext.pc, (void *)uc->uc_mcontext.sp);
+	for (int i = 0; i < 31; i++) mb_diag(" x%d=%p%s", i, (void *)(uintptr_t)x[i], (i % 6 == 5 || i == 30) ? "\n" : "");
+	const uintptr_t ip = (uintptr_t)uc->uc_mcontext.pc;
+	if (ip < 0x10000 || !mb_page_readable(ip) || !mb_page_readable(ip + 15)) {
+		mb_diag(" code: (pc is not readable memory)\n");
+		return;
+	}
+	mb_diag(" code:");
+	for (int i = 0; i < 16; i++) mb_diag(" %02x", ((const unsigned char *)ip)[i]);
+	mb_diag("\n");
+#elif defined(__x86_64__)
+	say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
+	                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
+	                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
+	                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
+	                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
+	                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
+	                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
+	                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
+	                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+}
+
 static void handler_inner(int sig, siginfo_t *info, void *ucontext);
+
+/* the signal mask the outermost fault on this thread arrived with */
+static __thread sigset_t g_entry_mask;
+
+/* Control is going to the escape (a guest that died), which no handler frame
+ * below this one will see: the thread is out of every one of them. A death
+ * nested in the guest's own handler would otherwise leave the depth and the
+ * phase of the frame it abandoned, and sigreturn would install the mask that
+ * frame ran with - every signal but the fault signals blocked, for good. */
+static void leave_every_handler_frame(ucontext_t *uc) {
+	if (g_fault_depth > 0) uc->uc_sigmask = g_entry_mask;
+	g_fault_depth = 0;
+	g_fault_phase = MB_PHASE_NONE;
+}
 
 /* The host's %fs must be back before this touches anything.
  *
@@ -552,13 +685,12 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	 * No %fs instruction runs here unless the probe said they exist
 	 * (mb_fs_swap): on a host without them this whole block is skipped. */
 	const bool guest_rip = mb_fs_swap && mb_guest_ctx
-	                       && rip_in_guest((uintptr_t)((ucontext_t *)ucontext)
-	                                       ->uc_mcontext.gregs[REG_RIP]);
+	                       && rip_in_guest((uintptr_t)UC_PC((ucontext_t *)ucontext));
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	if (guest_rip && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 	g_guest_fs_at_fault = fs_at_fault;   /* under the host's base: a host thread local */
 	const uintptr_t fault = (uintptr_t)info->si_addr;
-	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP];
+	const uintptr_t rip = (uintptr_t)UC_PC((ucontext_t *)ucontext);
 	/* A %fs access with the base already lost is the repair, not a fault to
 	 * handle: reinstall and resume the instruction, exactly as the Windows
 	 * path does. Three facts have to hold together: the base is neither the
@@ -603,6 +735,11 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 		return;
 	}
 	handler_inner(sig, info, ucontext);
+	if (UC_PC((ucontext_t *)ucontext) == (uintptr_t)&mb_guarded_escape) {
+		/* a death: the escape puts the host's base back itself */
+		leave_every_handler_frame((ucontext_t *)ucontext);
+		return;
+	}
 	/* Back to the guest's, from the value the entry thunk recorded rather than
 	 * from whatever was in the register on the way in. Same value on a host
 	 * that preserves the base across a signal, and the right one on a host
@@ -611,14 +748,17 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	if (guest_rip && mb_guest_ctx->fs_swap) mb_restore_guest_fs(fs_at_fault);
 #else
 	handler_inner(sig, info, ucontext);
+	if (UC_PC((ucontext_t *)ucontext) == (uintptr_t)&mb_guarded_escape)
+		leave_every_handler_frame((ucontext_t *)ucontext);
 #endif
 }
 
 
 /* A fault INSIDE the fault handler, which is how this used to die in silence.
  *
- * sa_mask is sigfillset, so SIGSEGV is blocked while the handler runs; a second
- * one is then force-delivered with the default action and the process is gone
+ * sa_mask is sigfillset, so SIGSEGV is blocked while the handler runs (all but
+ * the guest's own handler, which ask_guest opens it for); a second one is then
+ * force-delivered with the default action and the process is gone
  * before a line of diagnosis reaches anyone - no banner, no minibox-diag.log,
  * nothing but "Segmentation fault". Both addresses are exactly what a person
  * needs, so they are said here, with write(2) and a hand-rolled formatter
@@ -696,17 +836,24 @@ static void sigsafe_report_nested(uintptr_t inner_fault, uintptr_t inner_rip) {
 static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
-	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
-	if (g_fault_depth > 0) {
-		sigsafe_report_nested(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+	bool write = uc_write(uc);
+	/* Nested in the handler: served only in the guest's own handler, whose
+	 * faults are guest faults (ask_guest opened the signal for exactly that),
+	 * and only so deep. Any other phase cannot get here with the signal
+	 * blocked, and is said all the same in case it ever does. */
+	if (g_fault_depth > 0 && (g_fault_phase != MB_PHASE_GUEST || g_fault_depth >= MB_FAULT_DEPTH_MOST)) {
+		sigsafe_report_nested(fault, (uintptr_t)UC_PC(uc));
 		signal(SIGSEGV, SIG_DFL);
 		return;  /* the instruction runs again and the default action takes it */
 	}
+	if (g_fault_depth == 0) {
+		g_outer_fault = fault;
+		g_outer_rip = (uintptr_t)UC_PC(uc);
+		g_entry_mask = uc->uc_sigmask;
+	}
 	g_fault_depth++;
-	g_outer_fault = fault;
-	g_outer_rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
-	trail_add(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP],
-	          (uintptr_t)uc->uc_mcontext.gregs[REG_RSP], write ? 1 : 0);
+	trail_add(fault, (uintptr_t)UC_PC(uc),
+	          (uintptr_t)UC_SP(uc), write ? 1 : 0);
 	trail_stage(1);
 	bool tripped = write && trip(fault);
 	trail_stage(2);
@@ -723,21 +870,21 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		 * end: it goes on to whoever had the signal before - a runtime turns such
 		 * faults into exceptions all day. Only a guest's own fault is one miniBox
 		 * can call unhandled (issue #82 read a handled exception as four crashes). */
-		const bool guest_code = code_in_guest((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+		const bool guest_code = code_in_guest((uintptr_t)UC_PC(uc));
 		const bool handler_follows = (g_old_sa.sa_flags & SA_SIGINFO)
 			|| (g_old_sa.sa_handler != SIG_DFL && g_old_sa.sa_handler != SIG_IGN);
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
 		if (guest_code)
 			mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
 			        (void *)fault, write ? "write" : "read/exec",
-			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        (void *)UC_PC(uc),
 			        owner ? "inside a registered block" : "OUTSIDE every registered block");
 		else
 			mb_diag("[tripguard] fault in host code, passed on %s: addr=%p %s rip=%p, %s",
 			        handler_follows ? "to the handler that was there before (it may well be handled)"
 			                        : "to the default action (the process ends)",
 			        (void *)fault, write ? "write" : "read/exec",
-			        (void *)uc->uc_mcontext.gregs[REG_RIP],
+			        (void *)UC_PC(uc),
 			        owner ? "inside a registered block" : "outside every registered block");
 		if (owner) {
 			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
@@ -746,29 +893,27 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		}
 		say_region(fault);
 		mb_diag(" [%d block(s) registered]\n", g_nblocks);
-		say_code_and_regs((const unsigned char *)uc->uc_mcontext.gregs[REG_RIP],
-		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
-		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
-		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
-		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
-		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
-		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
-		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
-		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
-		if (guest_code) say_guest_stack((uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
-		const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+		say_uc_regs(uc);
+		if (guest_code) say_guest_stack((uintptr_t)UC_SP(uc));
+		const uintptr_t rip = (uintptr_t)UC_PC(uc);
 		if (guest_can_die_here(rip)) {
 			/* a hlt in user mode arrives as this fault: it is musl's a_crash(),
 			 * which its allocator runs on finding the heap corrupt */
+#if defined(__aarch64__)
+			const bool halted = false;   /* aarch64's a_crash is udf #0xf4: SIGILL, handler_other */
+#elif defined(__x86_64__)
 			const bool halted = *(const unsigned char *)rip == 0xf4;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 			const bool escapable = halted
 				? mb_host_guest_death_in_handler(mb_guest_ctx,
 					"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
 				: mb_host_guest_death_in_handler(mb_guest_ctx,
 					"the core crashed: it %s address %p (at %p)", write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
-				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				UC_SP(uc) = mb_guest_ctx->esc_rsp;
+				UC_PC(uc) = (uintptr_t)&mb_guarded_escape;
 				rethrow = false;
 			}
 		}
@@ -812,28 +957,33 @@ static struct sigaction g_old_ill, g_old_fpe;
 
 static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	ucontext_t *uc = (ucontext_t *)ucontext;
-	const uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+	const uintptr_t rip = (uintptr_t)UC_PC(uc);
 	if (guest_can_die_here(rip)) {
 #ifdef MB_HAVE_FSBASE
 		/* host C from here on, which needs the host's %fs */
 		if (mb_guest_ctx->fs_swap && mb_guest_ctx->host_fs) mb_wrfsbase(mb_guest_ctx->host_fs);
 #endif
 		mb_diag_banner(sig == SIGILL ? "the guest ran an illegal instruction" : "the guest divided by zero");
-		say_code_and_regs((const unsigned char *)rip,
-		                  uc->uc_mcontext.gregs[REG_RSP], uc->uc_mcontext.gregs[REG_RBP],
-		                  uc->uc_mcontext.gregs[REG_RAX], uc->uc_mcontext.gregs[REG_RBX],
-		                  uc->uc_mcontext.gregs[REG_RCX], uc->uc_mcontext.gregs[REG_RDX],
-		                  uc->uc_mcontext.gregs[REG_RSI], uc->uc_mcontext.gregs[REG_RDI],
-		                  uc->uc_mcontext.gregs[REG_R8], uc->uc_mcontext.gregs[REG_R9],
-		                  uc->uc_mcontext.gregs[REG_R10], uc->uc_mcontext.gregs[REG_R11],
-		                  uc->uc_mcontext.gregs[REG_R12], uc->uc_mcontext.gregs[REG_R13],
-		                  uc->uc_mcontext.gregs[REG_R14], uc->uc_mcontext.gregs[REG_R15]);
-		const bool escapable = sig == SIGILL
+		say_uc_regs(uc);
+#if defined(__aarch64__)
+		/* musl's a_crash() on aarch64 (arch/waterbox_aarch64): udf #0xf4, the
+		 * halt its allocator runs on finding the heap corrupt */
+		const bool halted = sig == SIGILL && *(const uint32_t *)rip == 0x000000f4u;
+#elif defined(__x86_64__)
+		const bool halted = false;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+		const bool escapable = halted
+			? mb_host_guest_death_in_handler(mb_guest_ctx,
+				"the core stopped itself after finding its own memory corrupt (a halt at %p)", (void *)rip)
+			: sig == SIGILL
 			? mb_host_guest_death_in_handler(mb_guest_ctx, "the core ran an illegal instruction at %p", (void *)rip)
 			: mb_host_guest_death_in_handler(mb_guest_ctx, "the core divided by zero at %p", (void *)rip);
 		if (escapable) {
-				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
-				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				UC_SP(uc) = mb_guest_ctx->esc_rsp;
+				UC_PC(uc) = (uintptr_t)&mb_guarded_escape;
+				leave_every_handler_frame(uc);
 			return;
 		}
 	}
@@ -842,6 +992,71 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	else if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) signal(sig, SIG_DFL);   /* the instruction runs again and the default takes it */
 	else old->sa_handler(sig);
 }
+
+#ifdef MB_HAVE_FSBASE
+/* Every OTHER handler in the process, run under the host's thread pointer.
+ *
+ * Guest code with thread locals runs with the guest's %fs installed (on
+ * aarch64, TPIDR_EL0, which every guest has swapped in). A signal
+ * the host's own runtime sends itself can land there - Mono stops each thread
+ * for its garbage collector with one - and its handler, host code, then reads
+ * its thread-locals through the guest's pointer and dies: a PCSX2 core,
+ * interpreting for seconds at a time, took Chimera down that way at its first
+ * collection (mono's suspend_signal_handler, in
+ * mono_hazard_pointer_save_for_signal_handler).
+ *
+ * So the handlers already installed when miniBox starts - the runtime's -
+ * are wrapped: on the thread running a guest, with the guest's pointer in,
+ * the host's goes in for the handler and whatever was there comes back after.
+ * Anywhere else the handler is called as it was. The faults miniBox serves
+ * itself (SIGSEGV, SIGBUS, SIGILL, SIGFPE) are not wrapped here: those
+ * handlers already know.
+ *
+ * The wrapped handlers also take SA_ONSTACK, for the same reason miniBox's own
+ * do (mb_tripguard_ensure_altstack): without it the kernel puts the handler's
+ * frame on the stack the thread is on, which in guest code is the GUEST's -
+ * host data written into guest memory, and a frame that reaches a clean
+ * (write-protected) tracked page cannot be delivered at all. Mono's suspend
+ * handler waits in sigsuspend for the restart signal, and that signal's frame,
+ * a page further down the guest's stack, killed Chimera with a kernel SIGSEGV.
+ * On a thread with no alternate stack SA_ONSTACK changes nothing. */
+static struct sigaction g_foreign[NSIG];
+
+__attribute__((no_stack_protector))
+static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
+	const struct sigaction *old = &g_foreign[sig];
+	const uintptr_t tp = mb_rdfsbase();
+	mb_context *c = mb_guest_ctx;
+	/* the guest's pointer is in when this thread was stopped in guest code, or
+	 * holds one of the guest's pointers (a transition, between the swap and
+	 * the jump) - and is not the host's own */
+	const bool guest_tp = c && c->host_fs && tp != c->host_fs
+		&& (rip_in_guest((uintptr_t)UC_PC((ucontext_t *)ucontext))
+		    || tp == c->thread_area || (mb_early_tp && tp == mb_early_tp));
+	if (guest_tp) mb_wrfsbase(c->host_fs);
+	if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
+	else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
+	if (guest_tp) mb_wrfsbase(tp);
+}
+
+static void wrap_foreign_handlers(void) {
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (sig == SIGKILL || sig == SIGSTOP || sig == SIGSEGV || sig == SIGBUS
+		    || sig == SIGILL || sig == SIGFPE) continue;
+		struct sigaction old;
+		if (sigaction(sig, NULL, &old) != 0) continue;
+		const bool has_handler = (old.sa_flags & SA_SIGINFO)
+			? old.sa_sigaction != NULL
+			: old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN;
+		if (!has_handler) continue;
+		g_foreign[sig] = old;
+		struct sigaction sa = old;
+		sa.sa_sigaction = handler_foreign;
+		sa.sa_flags = old.sa_flags | SA_SIGINFO | SA_ONSTACK;
+		if (sigaction(sig, &sa, NULL) != 0) g_foreign[sig].sa_handler = SIG_DFL;
+	}
+}
+#endif
 
 static void initialize(void) {
 	trail_open();
@@ -860,6 +1075,9 @@ static void initialize(void) {
 	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
 		perror("miniBox sigaction"); abort();
 	}
+#ifdef MB_HAVE_FSBASE
+	wrap_foreign_handlers();
+#endif
 }
 
 #else
@@ -946,6 +1164,11 @@ __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	const DWORD last_error = GetLastError();
 	const LONG r = veh_fs(ep);
+	/* a death: out of every handler frame at once (see the phase notes) */
+	if (r == EXCEPTION_CONTINUE_EXECUTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)&mb_guarded_escape) {
+		fault_depth_set(0);
+		fault_phase_set(MB_PHASE_NONE);
+	}
 	SetLastError(last_error);
 	return r;
 }

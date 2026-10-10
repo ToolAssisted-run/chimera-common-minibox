@@ -18,6 +18,7 @@
 #include <windows.h>   /* GetCurrentThreadId: who holds the tracking lock */
 #else
 #include <pthread.h>   /* pthread_self, likewise */
+#include <unistd.h>    /* sysconf: the host page */
 #endif
 
 /* Phase 1 is Linux single-slice: at most one block occupies its 4GiB region at
@@ -219,6 +220,10 @@ void mb_block_track_lock(mb_block *b) {
 	while (__atomic_test_and_set(&b->track_lock, __ATOMIC_ACQUIRE)) {
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
+#elif defined(__aarch64__)
+		__asm__ volatile("yield");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	}
 	b->track_owner = self_id();
@@ -470,6 +475,7 @@ mb_block *mb_block_new(mb_range addr) {
 		fprintf(stderr, "miniBox: MemoryBlock must start on a 4G boundary\n");
 		return NULL;
 	}
+	mb_host_page_init();
 	mb_block *b = (mb_block *)calloc(1, sizeof(mb_block));
 	if (!b) return NULL;
 	b->npages = addr.size >> MB_PAGESHIFT;
@@ -622,10 +628,144 @@ void mb_block_free(mb_block *b) {
 	free(b);
 }
 
+/* ---- the host's page ------------------------------------------------------
+ *
+ * See mb_host_page_shift in minibox_internal.h. Asked once, before the first
+ * block exists, so the fault handler only ever reads it. A host page smaller
+ * than the machine's would be a new kind of computer; it is treated as the
+ * machine's, which protects in whole machine pages exactly as before. */
+unsigned mb_host_page_shift = MB_PAGESHIFT;
+/* The OS's real page, when MB_HOST_PAGE asks for grouping larger than it */
+static uintptr_t g_os_page = MB_PAGESIZE;
+
+void mb_host_page_init(void) {
+	static bool done = false;
+	if (done) return;
+	done = true;
+#ifdef _WIN32
+	SYSTEM_INFO si;
+	GetSystemInfo(&si);
+	uintptr_t size = si.dwPageSize;
+#else
+	long got = sysconf(_SC_PAGESIZE);
+	uintptr_t size = got > 0 ? (uintptr_t)got : MB_PAGESIZE;
+#endif
+	g_os_page = size;
+	/* Testing: behave as if the OS page were larger, which any host can do
+	 * (protecting a larger aligned range is always possible). This is how a 4
+	 * KiB machine runs the 16 and 64 KiB groupings; never smaller than real. */
+	const char *force = getenv("MB_HOST_PAGE");
+	if (force != NULL && *force != '\0') {
+		const uintptr_t want = (uintptr_t)strtoull(force, NULL, 0);
+		if (want > size) size = want;
+	}
+	unsigned shift = MB_PAGESHIFT;
+	while (((uintptr_t)1 << shift) < size) shift++;
+	if (((uintptr_t)1 << shift) != size) {
+		fprintf(stderr, "miniBox: the OS page (%llu bytes) is not a power of two; using %u\n",
+		        (unsigned long long)size, 1u << shift);
+	}
+	mb_host_page_shift = shift;
+}
+
+static bool prot_writable(mb_prot prot) {
+	return prot == MB_PROT_RW || prot == MB_PROT_RWX || prot == MB_PROT_RWSTACK;
+}
+
+/* A page tracked for writes: writable to the guest, so the host must hear of
+ * its first write (the status test tripguard's trip makes). */
+static bool status_tracked(uint8_t s) {
+	return s == MB_ST_RW || s == MB_ST_RWX || s == MB_ST_RWSTACK;
+}
+
+/* One protection for a whole host page, from what each machine page in it
+ * would be given alone (mb_page_native_prot).
+ *
+ * Read and execute are the UNION: a page that may be read or run must not
+ * fault for it, so a neighbour sharing its host page gets the same access.
+ * That is the price of a host page larger than the machine's - a guard page,
+ * a read-only page or a free page beside readable memory reads without
+ * faulting - and only a guest that touches memory it may not ever sees it.
+ * Or a guest that WANTS the fault: one that exports GuestFaultHandler watches
+ * pages it protected, and on a grouped host a watched page beside open memory
+ * is never watched. Such a guest is refused at creation (mb_host_new).
+ *
+ * Write is NOT a union. A tracked page held read-only (clean against the
+ * baseline, held by an epoch, owed to a planned state) must fault on its next
+ * write, or the write goes unrecorded and a savestate or a delta misses it.
+ * So the host page is writable only when some page in it wants writing and no
+ * page in it is held. A write to a page that wants writing then faults even
+ * though that page was not held; the handler releases every held page of the
+ * group as if each were written (trip in tripguard.c), after which nothing in
+ * the group is held and the write goes through. The pages released that way
+ * are recorded as written when they may not have been: a savestate or a delta
+ * carries them, with exactly the bytes they hold, so nothing is wrong - only
+ * larger.
+ *
+ * With one machine page per host page this is mb_page_native_prot. */
+/* A run of host pages as the OS may be asked to protect it: no further than
+ * the block's mapping, which the OS rounded up to ITS page. The same range
+ * unless MB_HOST_PAGE groups more widely than the OS pages. */
+static mb_range group_range(const mb_block *b, size_t first, size_t end) {
+	mb_range r = { b->addr.start + (first << MB_PAGESHIFT), (end - first) << MB_PAGESHIFT };
+	const uintptr_t mapped = (mb_range_end(b->addr) + g_os_page - 1) & ~(g_os_page - 1);
+	if (mb_range_end(r) > mapped) r.size = mapped - r.start;
+	return r;
+}
+
+static mb_prot group_native_prot(const mb_block *b, size_t first) {
+	const size_t n = mb_group_pages();
+	if (n == 1) return mb_page_native_prot(&b->pages[first]);
+	bool r = false, w = false, x = false, held = false;
+	for (size_t k = first; k < first + n && k < b->npages; k++) {
+		const mb_page *p = &b->pages[k];
+		const mb_prot prot = mb_page_native_prot(p);
+		switch (prot) {
+			case MB_PROT_NONE: break;
+			case MB_PROT_R: r = true; break;
+			case MB_PROT_RW: case MB_PROT_RWSTACK: r = w = true; break;
+			case MB_PROT_RX: r = x = true; break;
+			case MB_PROT_RWX: r = w = x = true; break;
+		}
+		if (status_tracked(p->status) && !prot_writable(prot)) held = true;
+	}
+	if (held) w = false;
+	if (x) return w ? MB_PROT_RWX : MB_PROT_RX;
+	if (w) return MB_PROT_RW;
+	return r ? MB_PROT_R : MB_PROT_NONE;
+}
+
+/* The grouped refresh: every host page touching [pstart, pstart+pcount),
+ * protected for its whole group and coalesced into runs. Linux only in
+ * practice (Windows pages are 4 KiB), so a block here is never lazy. */
+static void refresh_groups(mb_block *b, size_t pstart, size_t pcount) {
+	const size_t n = mb_group_pages();
+	size_t first = pstart & ~(n - 1);
+	size_t end = (pstart + pcount + n - 1) & ~(n - 1);
+	for (size_t k = pstart; k < pstart + pcount; k++) note_prot(b, k, mb_page_native_prot(&b->pages[k]));
+	size_t g = first;
+	while (g < end) {
+		const mb_prot prot = group_native_prot(b, g);
+		size_t h = g + n;
+		while (h < end && group_native_prot(b, h) == prot) h += n;
+		/* the block's last host page may run past its last machine page; the
+		 * OS mapped it whole, so protecting it whole is what it can do */
+		mb_pal_protect(group_range(b, g, h), prot);
+		g = h;
+	}
+}
+
+int mb_block_protect_group(mb_block *b, size_t pi) {
+	const size_t n = mb_group_pages();
+	const size_t first = pi & ~(n - 1);
+	return mb_pal_protect(group_range(b, first, first + n), group_native_prot(b, first));
+}
+
 /* ---- protection refresh (coalesced) ---- */
 
 static void refresh_range(mb_block *b, size_t pstart, size_t pcount) {
 	if (!b->swapped_in) return;
+	if (mb_group_pages() > 1) { refresh_groups(b, pstart, pcount); return; }
 	size_t i = pstart;
 	while (i < pstart + pcount) {
 		mb_prot prot = mb_page_native_prot(&b->pages[i]);
@@ -1602,6 +1742,10 @@ static bool plan_take(mb_block *b, size_t pi, bool wait) {
 		if (held == 0 || !wait) return false;
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
+#elif defined(__aarch64__)
+		__asm__ volatile("yield");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 	}
 }

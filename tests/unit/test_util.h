@@ -44,4 +44,27 @@ static intptr_t membuf_read(uintptr_t ud, uint8_t *data, uintptr_t n) {
 }
 static void membuf_free(membuf *m) { free(m->buf); m->buf = NULL; m->len = m->cap = m->pos = 0; }
 
+#ifdef MINIBOX_INTERNAL_H
+/* The host's page may hold several machine pages (mb_group_pages: 4 on a 16
+ * KiB kernel), and a write releases its whole group (memblock.c,
+ * group_native_prot): every held page of the host page is recorded as written.
+ * These say what a test may expect. With one machine page per host page they
+ * are the exact answers a 4 KiB host gives. */
+static inline int same_group(size_t a, size_t b) { return a / mb_group_pages() == b / mb_group_pages(); }
+/* pages an epoch counts for writes to these pages, every page of each host page
+ * being held when it was written */
+static inline long written_pages(const size_t *p, size_t n) {
+	const size_t g = mb_group_pages();
+	long count = 0;
+	for (size_t i = 0; i < n; i++) {
+		int seen = 0;
+		for (size_t j = 0; j < i; j++) if (p[j] / g == p[i] / g) seen = 1;
+		if (!seen) count += (long)g;
+	}
+	return count;
+}
+#define WRITTEN(...) written_pages((const size_t[]){ __VA_ARGS__ }, \
+	sizeof((const size_t[]){ __VA_ARGS__ }) / sizeof(size_t))
+#endif
+
 #endif

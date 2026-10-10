@@ -268,7 +268,15 @@ ECL_EXPORT int Init(void) {
 	 * mmap is not supported. */
 	{
 		errno = 0;
+#if defined(__aarch64__)
+		/* on aarch64 it is how musl sets its thread pointer (the host keeps
+		 * TPIDR_EL0); a null one is refused and the live one stays */
+		if (syscall(SYS_set_thread_area, 0) != -1 || errno != EINVAL) return 0;
+#elif defined(__x86_64__)
 		if (syscall(SYS_set_thread_area, 0) != -1 || errno != ENOSYS) return 0;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 		errno = 0;
 		if (syscall(SYS_mmap, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) != -1 || errno != EOPNOTSUPP) return 0;
 	}
@@ -308,6 +316,50 @@ ECL_EXPORT void Abort(void) {
  * scratch register carried into its savestates (run_guest checks both read 0).
  * Assembly, because a compiler owns r10 at every other point. brk(0) is the
  * syscall: it only reads, and the host always implements it. */
+#if defined(__aarch64__)
+/* aarch64: no single register carries the context. What a guest could find
+ * of the host is any scratch register that is neither an argument nor the
+ * answer, so each probe returns them all OR-ed together: x8-x18 on entry
+ * (x10 is the export's own address, a guest one, and left out), x1-x18 after
+ * a syscall and after a callback. */
+#define WBX_OR_SCRATCH(first) \
+	"\tmov x0, " first "\n" \
+	"\torr x0, x0, x9\n\torr x0, x0, x11\n\torr x0, x0, x12\n\torr x0, x0, x13\n" \
+	"\torr x0, x0, x14\n\torr x0, x0, x15\n\torr x0, x0, x16\n\torr x0, x0, x17\n\torr x0, x0, x18\n"
+__asm__(
+	".text\n"
+	".globl EntryR10\n.type EntryR10,%function\n"
+	"EntryR10:\n"
+	WBX_OR_SCRATCH("x8")
+	"\tret\n"
+	".globl SyscallR10\n.type SyscallR10,%function\n"
+	"SyscallR10:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tmov x0, #0\n"
+	"\tmov x8, #12\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\torr x8, x8, x1\n\torr x8, x8, x2\n\torr x8, x8, x3\n\torr x8, x8, x4\n"
+	"\torr x8, x8, x5\n\torr x8, x8, x6\n\torr x8, x8, x7\n\torr x8, x8, x10\n"
+	WBX_OR_SCRATCH("x8")
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n"
+	".globl ExtcallR10\n.type ExtcallR10,%function\n"
+	"ExtcallR10:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tadrp x1, g_log_cb\n"
+	"\tldr x1, [x1, #:lo12:g_log_cb]\n"
+	"\tcbz x1, 1f\n"
+	"\tmov x0, #0\n"
+	"\tblr x1\n"
+	"1:\n"
+	"\torr x8, x8, x1\n\torr x8, x8, x2\n\torr x8, x8, x3\n\torr x8, x8, x4\n"
+	"\torr x8, x8, x5\n\torr x8, x8, x6\n\torr x8, x8, x7\n\torr x8, x8, x10\n"
+	WBX_OR_SCRATCH("x8")
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n");
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl EntryR10\n.type EntryR10,@function\n"
@@ -340,6 +392,9 @@ __asm__(
 	"\tmov %r10, %rax\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 /* Faults with rsp pointing into a guard page: a heap page is protected to
  * PROT_NONE, rsp is pointed into it, and ud2 faults. The death report must
@@ -351,7 +406,13 @@ static uint8_t guard_area[8192] __attribute__((aligned(4096)));
 ECL_EXPORT void GuardFault(void) {
 	uintptr_t base = ((uintptr_t)guard_area + 0xFFF) & ~(uintptr_t)0xFFF;
 	if (mprotect((void *)base, 4096, PROT_NONE) != 0) return;
+#if defined(__aarch64__)
+	__asm__ volatile ("mov sp, %0\n\tudf #0" :: "r" (base + 2048) : "memory");
+#elif defined(__x86_64__)
 	__asm__ volatile ("mov %0, %%rsp\n\tud2" :: "r" (base + 2048) : "memory");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	__builtin_unreachable();
 }
 
@@ -388,6 +449,49 @@ ECL_EXPORT void WildWrite(void) {
 
 /* Instructions the compiler would not emit on request. Halt is exactly musl's
  * a_crash(), which its allocator runs when its own heap check fails. */
+#if defined(__aarch64__)
+/* aarch64: Halt is musl's a_crash() there (udf #0xf4), Ud2 a plain undefined
+ * instruction. There is no DivideByZero: an aarch64 integer division by zero
+ * answers 0 rather than trapping. FsProbe and ClobberAndProbe are x86-64's
+ * (a dropped %fs base); TPIDR_EL0 is never dropped. */
+__asm__(
+	".text\n"
+	".globl Halt\n.type Halt,%function\n"
+	"Halt:\n"
+	"\tudf #0xf4\n"
+	"\tret\n"
+	".globl Ud2\n.type Ud2,%function\n"
+	"Ud2:\n"
+	"\tudf #0\n"
+	"\tret\n"
+	".globl UnknownSyscall\n.type UnknownSyscall,%function\n"
+	"UnknownSyscall:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tmov x0, #1\n"
+	"\tmov x1, #2\n"
+	"\tmov x2, #3\n"
+	"\tmov x8, #4242\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n"
+	".local deadlock_word\n.comm deadlock_word,4,4\n"
+	".globl Deadlock\n.type Deadlock,%function\n"
+	"Deadlock:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tadrp x0, deadlock_word\n"
+	"\tadd x0, x0, #:lo12:deadlock_word\n"
+	"\tmov x1, #0\n"
+	"\tmov x2, #0\n"
+	"\tmov x3, #0\n"
+	"\tmov x8, #202\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n");
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl Halt\n.type Halt,@function\n"
@@ -449,5 +553,8 @@ __asm__(
 	"\tcall *%r10\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 int main(void) { return 0; }

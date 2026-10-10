@@ -196,23 +196,25 @@ static void park_other(mb_threads *t, uintptr_t addr, uint32_t tid) {
 
 /* ---- syscalls ---- */
 mb_sword mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
-                      uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid) {
+                      uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid,
+                      uintptr_t pthread_area) {
 	uint32_t tid = t->next_tid;
 	/* thread_area carries the musl pthread struct (words 12,13 are
 	 * stack_end/size). A NULL area is a foreign convention (musl's own
 	 * __clone, which speaks raw clone, not wbx_clone): refuse with EINVAL
 	 * instead of faulting the host on pthread[12]. */
-	if (thread_area == 0) return -EINVAL;
+	if (thread_area == 0 || pthread_area == 0) return -EINVAL;
 	/* the musl pthread struct: words 12,13 are stack_end and stack_size */
-	const uintptr_t *pthread = (const uintptr_t *)thread_area;
+	const uintptr_t *pthread = (const uintptr_t *)pthread_area;
 	uintptr_t stack_end = pthread[12], stack_size = pthread[13];
 	mb_range stack = { stack_end - stack_size, stack_size };
 	int rc = mb_block_mprotect(b, mb_range_align_expand(stack), MB_PROT_RWSTACK);
 	if (rc != 0) return rc;
-	/* set up the child's initial frame so guest_syscall's `pop rbp; ret` lands at guest_rip */
+	/* set up the child's initial frame so guest_syscall's `pop rbp; ret` lands at guest_rip
+	 * (aarch64: `ldp x29, x30, [sp], #16; ret`, the same two words in the same order) */
 	uintptr_t *child_stack = (uintptr_t *)(guest_rsp - 16);
-	child_stack[0] = 0;          /* rbp */
-	child_stack[1] = guest_rip;  /* ret target */
+	child_stack[0] = 0;          /* rbp / x29 */
+	child_stack[1] = guest_rip;  /* ret target / x30 */
 	*parent_tid = tid;
 	gthread g = { tid, T_RUNNABLE, sok(0), guest_rsp - 16, thread_area, child_tid, stack, { 0, 0 } };
 	insert_thread(t, g);

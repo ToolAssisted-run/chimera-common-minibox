@@ -30,11 +30,12 @@ waterbox_jsmn_dir     = meson.project_source_root() / 'extern' / 'jsmn'
 waterbox_linkscript  = meson.current_source_dir() / 'linkscript.T'
 
 # The frozen guest flags (BizHawk waterbox COMMONFLAGS; C, no C++/LTO).
+# (waterbox_cpu_flags and waterbox_common_flags: the top-level meson.build,
+# per guest CPU; on x86-64 they are exactly the list this used to spell out)
 waterbox_guest_cflags = [
   '-fvisibility=hidden', '-I' + waterbox_emulibc_dir,
   '-I' + waterbox_guestkit_inc, '-I' + waterbox_jsmn_dir,
-  '-Wall', '-mcmodel=large', '-mno-red-zone',
-  '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none',
+  '-Wall'] + waterbox_cpu_flags + waterbox_common_flags + [
   '-O2', '-DNDEBUG',
 ]
 waterbox_guest_ldflags = [
@@ -67,7 +68,7 @@ if waterbox_cpp_guest
   waterbox_guest_cxxflags = waterbox_guest_cflags + [
     '-specs', waterbox_sysroot / 'lib' / 'musl-gcc.specs',
     '-I' + waterbox_gxx_include,
-    '-I' + waterbox_gxx_include / 'x86_64-linux-musl',
+    '-I' + waterbox_gxx_include / waterbox_guest_triplet,
     '-fno-exceptions', '-fno-rtti',
   ]
   waterbox_guest_cxx_ldflags = [
@@ -89,6 +90,11 @@ if waterbox_cpp_guest
 endif
 
 # Emit a cross-file for consumers who want to build the guest as a cross project.
+waterbox_machine_args_quoted = []
+foreach f : waterbox_cpu_flags + waterbox_common_flags
+  waterbox_machine_args_quoted += '\'' + f + '\''
+endforeach
+waterbox_machine_args_ini = ', '.join(waterbox_machine_args_quoted)
 configure_file(
   input: 'waterbox-guest.ini.in',
   output: 'waterbox-guest.ini',
@@ -99,5 +105,7 @@ configure_file(
     'JSMN_INC': waterbox_jsmn_dir,
     'EMULIBC_OBJ': waterbox_emulibc_ct.full_path(),
     'LINKSCRIPT': waterbox_linkscript,
+    'MACHINE_ARGS': waterbox_machine_args_ini,
+    'CPU_FAMILY': host_machine.cpu_family(),
   },
 )

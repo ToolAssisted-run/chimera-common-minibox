@@ -13,12 +13,22 @@ concurrency:
 
 jobs:
   linux:
-    name: linux (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    name: linux ${{ matrix.arch }} (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        # A guest is machine code for the CPU it runs on, so every build is
+        # made and tested on each CPU miniBox runs: x86-64, and aarch64 on a
+        # 4 KiB-page arm runner (the same Ubuntu, so the same gcc). A 16 KiB
+        # host is covered by MB_HOST_PAGE, which any host can simulate.
+        arch: [x86_64, aarch64]
+        name: [c-guests, cpp-guests]
         include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
           # The default build: host + C guest toolchain (musl) + C guests.
           - name: c-guests
             setup_args: ''
@@ -65,15 +75,16 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: meson-logs-${{ matrix.name }}
+          name: meson-logs-${{ matrix.arch }}-${{ matrix.name }}
           path: build/ci/meson-logs/
 
       # A guest .wbx is a static ELF the host maps itself, so it is
       # OS-INDEPENDENT: the same binary a Linux job builds is what the Windows
       # jobs run. That is what makes guest coverage on Windows possible at all,
-      # since the guest toolchain is Linux-only.
+      # since the guest toolchain is Linux-only. It is NOT CPU-independent:
+      # the Windows jobs are x86-64, so theirs is the x86-64 build's.
       - name: Upload the guest for the Windows jobs
-        if: matrix.name == 'c-guests'
+        if: matrix.name == 'c-guests' && matrix.arch == 'x86_64'
         uses: actions/upload-artifact@v4
         with:
           name: guest-wbx

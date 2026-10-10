@@ -15,7 +15,8 @@ int  mb_threads_spec(const mb_threads *t);
 
 /* NR_WBX_CLONE(thread_area, child_rsp, child_rip, child_tid, parent_tid) */
 mb_sword      mb_threads_spawn(mb_threads *t, mb_block *b, uintptr_t thread_area,
-                           uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid);
+                           uintptr_t guest_rsp, uintptr_t guest_rip, uintptr_t child_tid, uint32_t *parent_tid,
+                           uintptr_t pthread_area);   /* the musl pthread struct (== thread_area on x86-64) */
 uintptr_t mb_threads_exit(mb_threads *t, mb_context *c);
 uintptr_t mb_threads_yield(mb_threads *t, mb_context *c);
 uint32_t  mb_threads_set_tid_address(mb_threads *t, uintptr_t addr);

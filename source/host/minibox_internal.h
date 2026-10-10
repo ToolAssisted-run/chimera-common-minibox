@@ -395,6 +395,12 @@ const mb_layout *mb_tripguard_layout(void);
 /* ---- context.c: host<->guest transitions (interop.bin at 0x35f00000000) ---- */
 #define MB_ORG            0x35f00000000ull
 #define MB_CALLBACK_SLOTS 64
+#if defined(__aarch64__)
+/* aarch64: the one word the interop blob reads the running context from, in
+ * place of x86-64's gs:0x18 (interop_aarch64.S). 64 KiB past MB_ORG, so it is
+ * a page of its own on every host the blob's code page is not. */
+#define MB_INTEROP_SLOT   (MB_ORG + 0x10000ull)
+#endif
 
 /* The interop blob and the guest are ALWAYS sysv64, whatever the host is. On a
  * Windows host, every function pointer that the blob calls, or that calls into
@@ -480,6 +486,19 @@ bool mb_host_guest_death_in_handler(mb_context *c, const char *fmt, ...);
  * (it shows up much later as the guest's own malloc returning a bad pointer). */
 static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("rdfsbase %0" : "=r"(v) :: "memory"); return v; }
 static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("wrfsbase %0" :: "r"(v) : "memory"); }
+#elif defined(__aarch64__)
+/* aarch64 has one thread pointer, TPIDR_EL0, and both glibc and the guest's
+ * musl live on it: there is no spare segment register to give the guest the
+ * way C guests have %gs on x86-64. So EVERY aarch64 guest is a swapping guest
+ * - fs_swap is always on - and "%fs" below means TPIDR_EL0. User mode may
+ * always read and write it, so the probe always says yes. */
+#define MB_HAVE_FSBASE 1
+static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v) :: "memory"); return v; }
+static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("msr tpidr_el0, %0" :: "r"(v) : "memory"); }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+#ifdef MB_HAVE_FSBASE
 bool mb_fsbase_ok(void);
 /* Plain global, not a call: the dispatcher must decide whether to swap BEFORE
  * it may safely call anything (it is entered on the guest's %fs). */
@@ -614,6 +633,23 @@ bool    mb_block_track_held_here(const mb_block *b);
 void    mb_block_note_dirty(mb_block *b, size_t pi, bool dirty);
 /* Do the packed maps say what the page array says? For tests. */
 bool    mb_block_maps_consistent(const mb_block *b);
+
+/* ---- the host's page (memblock.c) ----
+ *
+ * MB_PAGESIZE is the MACHINE's page, which the guest sees and which the spec
+ * fixes at 4 KiB on every host. The host's own page - the smallest thing the
+ * OS will protect - is asked of the OS at runtime and may be larger: 16 KiB on
+ * Apple silicon, 64 KiB on some aarch64 kernels. Then one host page holds a
+ * GROUP of machine pages that share one protection, and memblock protects by
+ * group (see group_native_prot). On a 4 KiB host a group is one page and every
+ * path is exactly what it was. mb_host_page_init runs at the first block's
+ * creation, outside any handler; afterwards these are plain reads. */
+extern unsigned mb_host_page_shift;   /* log2 of the host page, >= MB_PAGESHIFT */
+void    mb_host_page_init(void);
+static inline size_t mb_group_pages(void) { return (size_t)1 << (mb_host_page_shift - MB_PAGESHIFT); }
+/* Give the host page holding machine page pi the protection its whole group
+ * calls for. What the fault handler does after letting a write through. 0 ok. */
+int     mb_block_protect_group(mb_block *b, size_t pi);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

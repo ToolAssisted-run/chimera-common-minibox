@@ -43,16 +43,35 @@ extern const unsigned int  mb_interop_bin_len;
 
 static bool g_interop_ready = false;
 
+/* A range grown to whole HOST pages (mb_host_page_shift): what the OS maps and
+ * protects, which on a 16 KiB or 64 KiB host is more than the machine's page. */
+static mb_range host_page_expand(mb_range r) {
+	const uintptr_t m = ((uintptr_t)1 << mb_host_page_shift) - 1;
+	mb_range o; o.start = r.start & ~m; o.size = ((mb_range_end(r) + m) & ~m) - o.start; return o;
+}
+
 static void init_interop_area(void) {
 	if (g_interop_ready) return;
+	mb_host_page_init();
 	mb_range want = { MB_ORG, mb_interop_bin_len };
 	mb_range got;
-	if (mb_pal_map_anon(mb_range_align_expand(want), MB_PROT_RW, &got) != 0) {
+	if (mb_pal_map_anon(host_page_expand(want), MB_PROT_RW, &got) != 0) {
 		fprintf(stderr, "miniBox: failed to map interop area at %llx\n", (unsigned long long)MB_ORG);
 		abort();
 	}
 	memcpy((void *)MB_ORG, mb_interop_bin, mb_interop_bin_len);
-	mb_pal_protect(mb_range_align_expand(want), MB_PROT_RX);
+	mb_pal_protect(host_page_expand(want), MB_PROT_RX);
+#ifdef MB_INTEROP_SLOT
+	/* the word the aarch64 blob finds the running context in (interop_aarch64.S) */
+	mb_range slot = { MB_INTEROP_SLOT, sizeof(uintptr_t) };
+	if (mb_pal_map_anon(host_page_expand(slot), MB_PROT_RW, &got) != 0) {
+		fprintf(stderr, "miniBox: failed to map the interop slot at %llx\n", (unsigned long long)MB_INTEROP_SLOT);
+		abort();
+	}
+#endif
+	/* aarch64 does not keep its instruction cache coherent with stores: code
+	 * written as data has to be published before it is run (x86-64: nothing) */
+	__builtin___clear_cache((char *)MB_ORG, (char *)(MB_ORG + mb_interop_bin_len));
 #ifdef _WIN32
 	/* register the hand-written unwind info so host SEH can unwind across the
 	 * guest stack-switch (the table lives at RUNTIME_TABLE_ADDR in interop.bin) */
@@ -64,16 +83,17 @@ static void init_interop_area(void) {
 	g_interop_ready = true;
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
 /* Per-host-thread mini-TLS block reached via [gs:0x18] (index 3). Windows uses
- * the TEB's SubSystemTib field at gs:0x18 directly, so no setup is needed. */
+ * the TEB's SubSystemTib field at gs:0x18 directly, so no setup is needed.
+ * (aarch64 has no gs: its blob reads the context from MB_INTEROP_SLOT.) */
 static __thread uintptr_t g_tib[4];
 #endif
 
 
 void mb_prepare_thread(void) {
 	init_interop_area();
-#ifndef _WIN32
+#if !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
 	uintptr_t gs = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs) == 0 && gs == 0) {
 		syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, (uintptr_t)&g_tib[0]);
@@ -149,7 +169,13 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
-#else
+#elif defined(__aarch64__)
+/* TPIDR_EL0 is always the user's to read and write. */
+bool mb_fsbase_ok(void) {
+	mb_fs_swap = true;
+	return true;
+}
+#elif defined(__x86_64__)
 #ifndef HWCAP2_FSGSBASE
 #define HWCAP2_FSGSBASE (1u << 1)
 #endif
@@ -162,6 +188,8 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 #endif
 
@@ -243,6 +271,24 @@ static void emit8(uint8_t **p, uint8_t v) { *(*p)++ = v; }
 static void emit32(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4); *p += 4; }
 static void emit64(uint8_t **p, uintptr_t v) { memcpy(*p, &v, 8); *p += 8; }
 
+#if defined(__aarch64__)
+/* The few aarch64 instructions the thunks are made of. Literals are loaded
+ * pc-relative from the end of the thunk, so a thunk needs no relocation. */
+#define A64_X16 16
+#define A64_X17 17
+#define A64_SP  31
+static uint32_t a64_ldr_lit(unsigned rt, int32_t off) { return 0x58000000u | (((uint32_t)(off / 4) & 0x7ffffu) << 5) | rt; }
+static uint32_t a64_ldr(unsigned rt, unsigned rn, uint32_t off) { return 0xf9400000u | ((off / 8) << 10) | (rn << 5) | rt; }
+static uint32_t a64_str(unsigned rt, unsigned rn, uint32_t off) { return 0xf9000000u | ((off / 8) << 10) | (rn << 5) | rt; }
+static uint32_t a64_br(unsigned rn) { return 0xd61f0000u | (rn << 5); }
+static uint32_t a64_blr(unsigned rn) { return 0xd63f0000u | (rn << 5); }
+static uint32_t a64_ret(void) { return 0xd65f03c0u; }
+static uint32_t a64_msr_tpidr(unsigned rt) { return 0xd51bd040u | rt; }
+static uint32_t a64_stp_pre16(unsigned rt, unsigned rt2) { return 0xa9800000u | (0x7eu << 15) | (rt2 << 10) | (A64_SP << 5) | rt; } /* [sp, #-16]! */
+static uint32_t a64_ldp_post16(unsigned rt, unsigned rt2) { return 0xa8c00000u | (0x02u << 15) | (rt2 << 10) | (A64_SP << 5) | rt; } /* [sp], #16 */
+static void emit32le(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4); *p += 4; }
+#endif
+
 uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	for (size_t i = 0; i < t->count; i++)
 		if (t->entries[i] == guest_entry) return t->ptrs[i];
@@ -264,12 +310,29 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 	 * through - is one routine in guarded.S, entered with r10 = context and
 	 * r11 = the guest function, the arguments untouched. The context also goes
 	 * where the fault handlers read it: to repair %fs, and to find that record. */
+#if defined(__aarch64__)
+	/* The same, with the context in x9 and the guest function in x10
+	 * (guarded_aarch64.S); a branch, so x30 stays the caller's. */
+	emit32le(&p, a64_ldr_lit(9, 24));                         /*  0: ldr x9, ctx */
+	emit32le(&p, a64_ldr_lit(10, 28));                        /*  4: ldr x10, entry */
+	emit32le(&p, a64_ldr_lit(11, 32));                        /*  8: ldr x11, &mb_guest_ctx */
+	emit32le(&p, a64_str(9, 11, 0));                          /* 12: str x9, [x11] */
+	emit32le(&p, a64_ldr_lit(11, 32));                        /* 16: ldr x11, guarded */
+	emit32le(&p, a64_br(11));                                 /* 20: br x11 */
+	emit64(&p, (uintptr_t)c);                                 /* 24 */
+	emit64(&p, guest_entry);                                  /* 32 */
+	emit64(&p, (uintptr_t)&mb_guest_ctx);                     /* 40 */
+	emit64(&p, (uintptr_t)&mb_guarded_call);                  /* 48 */
+#elif defined(__x86_64__)
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);            /* mov r10, ctx */
 	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, guest_entry);              /* mov r11, entry */
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd0);                      /* mov rax, r10 */
 	emit8(&p, 0x48); emit8(&p, 0xa3); emit64(&p, (uintptr_t)&mb_guest_ctx); /* mov [abs], rax */
 	emit8(&p, 0x48); emit8(&p, 0xb8); emit64(&p, (uintptr_t)&mb_guarded_call); /* mov rax, guarded */
 	emit8(&p, 0xff); emit8(&p, 0xe0);                                       /* jmp rax */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
 		 * later as a call into the middle of an instruction. */
@@ -277,6 +340,7 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		        (size_t)(p - (uint8_t *)addr), THUNK_SIZE);
 		abort();
 	}
+	__builtin___clear_cache((char *)addr, (char *)p);   /* aarch64: publish the code */
 	t->entries[t->count] = guest_entry;
 	t->ptrs[t->count] = addr;
 	t->count++;
@@ -331,6 +395,24 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	 * across a fault, and a GL callback takes plenty) would otherwise have the
 	 * loss faithfully restored. Stack: entry rsp%16==8, push -> 0, call -> the
 	 * callee sees 8. r10 is caller-saved, hence the push rather than a reload. */
+#if defined(__aarch64__)
+	/* x16/x17 are the call's scratch (AAPCS64's intra-procedure-call
+	 * registers); the guest's arguments in x0-x7 pass through untouched and
+	 * the callback's answer comes back in x0. */
+	emit32le(&p, a64_ldr_lit(A64_X16, 40));                                    /*  0: ldr x16, ctx */
+	emit32le(&p, a64_stp_pre16(A64_X16, 30));                                  /*  4: stp x16, x30, [sp, #-16]! */
+	emit32le(&p, a64_ldr(A64_X17, A64_X16, (uint32_t)offsetof(mb_context, host_fs))); /*  8: ldr x17, [x16, host_fs] */
+	emit32le(&p, a64_msr_tpidr(A64_X17));                                      /* 12: msr tpidr_el0, x17 */
+	emit32le(&p, a64_ldr_lit(A64_X17, 32));                                    /* 16: ldr x17, cb */
+	emit32le(&p, a64_blr(A64_X17));                                            /* 20: blr x17 */
+	emit32le(&p, a64_ldp_post16(A64_X16, 30));                                 /* 24: ldp x16, x30, [sp], #16 */
+	emit32le(&p, a64_ldr(A64_X17, A64_X16, 0));                                /* 28: ldr x17, [x16] (thread_area, live) */
+	emit32le(&p, a64_msr_tpidr(A64_X17));                                      /* 32: msr tpidr_el0, x17 */
+	emit32le(&p, a64_ret());                                                   /* 36: ret */
+	emit64(&p, (uintptr_t)c);                                                  /* 40 */
+	emit64(&p, cb);                                                            /* 48 */
+	__builtin___clear_cache((char *)addr, (char *)p);
+#elif defined(__x86_64__)
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
 	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
 	emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x82);
@@ -344,6 +426,9 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
 	emit8(&p, 0xc3);                                                   /* ret */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	t->ext_entries[t->ext_count] = cb;
 	t->ext_ptrs[t->ext_count] = addr;
 	t->ext_count++;

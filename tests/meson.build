@@ -20,6 +20,9 @@ subdir('runner')
 if build_guest_toolchain
   subdir('conformance')
   subdir('threads')
+  if host_machine.system() == 'linux'
+    subdir('foreign_signal')
+  endif
   # C++ guests need the (optional) C++ guest toolchain
   if waterbox_cpp_guest
     subdir('cpp')

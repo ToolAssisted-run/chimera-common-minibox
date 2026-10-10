@@ -31,8 +31,8 @@ static void test_dirty_offset(void) {
 	CHECK(!dirty(b, 3));
 	gp(b, 0x3005)[0] = 42;         /* write into page 3 */
 	CHECK(dirty(b, 3));
-	CHECK(!dirty(b, 2));
-	CHECK(!dirty(b, 4));
+	CHECK_EQ(dirty(b, 2), same_group(2, 3));   /* only its host page's neighbours */
+	CHECK_EQ(dirty(b, 4), same_group(4, 3));
 	CHECK_EQ(gp(b, 0x3005)[0], 42);
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
@@ -241,6 +241,18 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 	/* Put the stack pointer near the top of the stack page and write through it. */
 	volatile uint8_t *sp = gp(b, 0x9000 - 64);
 	uint64_t got = 0;
+#if defined(__aarch64__)
+	__asm__ __volatile__(
+		"mov x11, sp\n\t"
+		"mov sp, %1\n\t"
+		"mov x12, #0x5a\n\t"
+		"str x12, [sp, #-16]!\n\t"
+		"ldr %0, [sp], #16\n\t"
+		"mov sp, x11\n\t"
+		: "=&r"(got)
+		: "r"(sp)
+		: "x11", "x12", "memory", "cc");
+#elif defined(__x86_64__)
 	__asm__ __volatile__(
 		"mov %%rsp, %%r11\n\t"
 		"mov %1, %%rsp\n\t"
@@ -251,6 +263,9 @@ static void test_write_with_sp_in_a_declared_stack(void) {
 		: "=r"(got)
 		: "r"(sp)
 		: "r11", "rax", "memory", "cc");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 	CHECK_EQ(got, 0x5aull);   /* the push and pop actually happened */
 	CHECK(dirty(b, 8));       /* and the write is in the state, not lost */

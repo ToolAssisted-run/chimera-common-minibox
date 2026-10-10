@@ -347,7 +347,17 @@ it could have (no-access, or read-only on a write). A nonzero return means the
 guest changed the protection and the access is retried; zero, or no export, is
 an unhandled fault as before. Faults on tracked clean pages (dirty-page
 tracking) and on free pages are never the guest's. The handler runs whatever
-the guest puts in it, so the host's alternate signal stack is 1 MiB.
+the guest puts in it, so the host's alternate signal stack is 1 MiB. It may
+itself fault on a tracked clean page - its own thread locals, held by an
+epoch - and that fault is served as any other; a fault it does not handle is
+the guest's death, as anywhere in guest code.
+
+The machine's page is 4 KiB on every host, and a host whose own page is larger
+(16 KiB on Apple silicon) protects the machine pages that share one host page
+together. A page the guest protects beside one it left open is then not
+protected, and the access the handler is waiting for never faults. Such a host
+cannot keep this section, so it refuses a guest that exports
+GuestFaultHandler at creation, saying why, rather than run it differently.
 
 ## Answered instead of fatal (spec v2.2, additive)
 

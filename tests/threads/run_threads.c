@@ -1,9 +1,13 @@
+#define _GNU_SOURCE   /* sigset_t and pthread_sigmask under -std=c11 */
 /* Drives the pthreaded guest through the host: proves green threads, futex-
  * backed mutexes/condvars, join, and a savestate taken with threads present. */
 #include "minibox.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <signal.h>
+#endif
 
 typedef struct { FILE *f; } fr_t;
 static intptr_t file_read(uintptr_t ud, uint8_t *d, uintptr_t s){return (intptr_t)fread(d,1,s,((fr_t*)ud)->f);}
@@ -20,6 +24,10 @@ typedef uint64_t (*run1_fn)(uint64_t);
 static uintptr_t proc(mb_host *h, const char *n){mb_return r;wbx_get_proc_addr(h,n,&r);if(r.error_message[0]){fprintf(stderr,"proc %s:%s\n",n,r.error_message);exit(2);}return r.data;}
 
 int main(int argc, char **argv) {
+	/* --refused: run where the host page groups machine pages (MB_HOST_PAGE),
+	 * and the guest, which exports GuestFaultHandler, must be refused there */
+	const bool refused = argc > 1 && strcmp(argv[1], "--refused") == 0;
+	if (refused) { argc--; argv++; }
 	const char *path = argc > 1 ? argv[1] : "guest_threads.wbx";
 	FILE *f = fopen(path, "rb");
 	if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
@@ -28,6 +36,15 @@ int main(int argc, char **argv) {
 	mb_return r;
 	wbx_create_host(&layout, "guest_threads.wbx", file_read, (uintptr_t)&fr, &r);
 	fclose(f);
+	if (refused) {
+		const char *said = (const char *)r.error_message;
+		printf("create -> %s\n", said[0] ? said : "(a host, not refused)");
+		CHECK(strstr(said, "GuestFaultHandler") != NULL);
+		CHECK(strstr(said, "4 KiB pages") != NULL);
+		if (!said[0]) wbx_destroy_host((mb_host *)r.data, &r);
+		if (fails == 0) printf("run_threads --refused: all checks passed\n");
+		return fails ? 1 : 0;
+	}
 	if (r.error_message[0]) { fprintf(stderr, "create: %s\n", r.error_message); return 1; }
 	mb_host *h = (mb_host *)r.data;
 
@@ -37,6 +54,7 @@ int main(int argc, char **argv) {
 	run1_fn RunCondvar = (run1_fn)proc(h, "RunCondvar");
 	run_fn RunTls = (run_fn)proc(h, "RunTls");
 	run_fn RunGuestFault = (run_fn)proc(h, "RunGuestFault");
+	run_fn RunGuestFaultDeath = (run_fn)proc(h, "RunGuestFaultDeath");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -55,7 +73,7 @@ int main(int argc, char **argv) {
 		printf("RunTls -> %#llx (expect 0: thread locals zeroed, initialised, apart from the stack)\n", (unsigned long long)tls);
 		CHECK(tls == 0);
 		const uint64_t gf = RunGuestFault();
-		printf("RunGuestFault -> %#llx (expect 0: the guest's fault handler runs as guest code)\n", (unsigned long long)gf);
+		printf("RunGuestFault -> %#llx (expect 0: the guest's fault handler runs as guest code, and may fault)\n", (unsigned long long)gf);
 		CHECK(gf == 0);
 	}
 
@@ -72,6 +90,31 @@ int main(int argc, char **argv) {
 	wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
 	CHECK(!r.error_message[0]);
 	CHECK(RunThreads() == after_save);
+
+	/* A guest that dies inside its own fault handler: the machine dies and the
+	 * host lives on, with this thread out of every handler frame - its signal
+	 * mask what it was, and the next fault on it not taken for one nested in a
+	 * handler that is gone. */
+	{
+#ifndef _WIN32
+		sigset_t mask_before, mask_after;
+		pthread_sigmask(SIG_BLOCK, NULL, &mask_before);
+#endif
+		RunGuestFaultDeath();
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("RunGuestFaultDeath -> dead=%llu: %s\n", (unsigned long long)r.data, why);
+		CHECK(r.data == 1);
+		CHECK(strstr(why, "crashed") != NULL);
+#ifndef _WIN32
+		pthread_sigmask(SIG_BLOCK, NULL, &mask_after);
+		for (int sig = 1; sig < 32; sig++) CHECK(sigismember(&mask_before, sig) == sigismember(&mask_after, sig));
+#endif
+		st.pos = 0;
+		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(RunThreads() == after_save);   /* faults again, outside any handler */
+	}
 
 	wbx_deactivate_host(h, &r); wbx_destroy_host(h, &r);
 	free(st.b);
