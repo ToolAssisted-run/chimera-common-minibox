@@ -15,6 +15,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <signal.h>   /* ask_guest's mask, above the Linux half */
 #endif
 
 /* The block LIST changes only when a machine is created or destroyed, on the
@@ -120,9 +122,17 @@ static uintptr_t mirror_of(const mb_block *b, uintptr_t guest) {
  * reads memory that may be exactly what is wrong). So a thread carries its
  * phase as well as its depth, and a fault that arrives in a phase that may not
  * nest, or deeper than any guest handler has business going, is said once and
- * passed on. The shared code below sets the phase on both hosts; on Linux the
- * signal is blocked for the handler's duration, so a fault in any phase is
- * fatal there and the phase only makes the last words precise.
+ * passed on. The shared code below sets the phase on both hosts. On Linux the
+ * signal is blocked for the handler's duration except while the guest's own
+ * handler runs (ask_guest unblocks it), so there too only a fault in the
+ * guest phase is served, and any other is said and fatal.
+ *
+ * A guest that dies inside its own handler leaves every handler frame at once:
+ * control goes to the escape, and the frames below never unwind. Whichever
+ * handler sends it there puts this thread's depth and phase back to none
+ * (leave_every_handler_frame), and on Linux the signal mask the first fault
+ * arrived with, or the next fault on this thread would find itself nested in
+ * a handler that is long gone.
  *
  * Per-thread storage: __thread on Linux, where the handler has the host's %fs
  * back before it reads anything. On Windows mingw's __thread is EMULATED
@@ -301,6 +311,29 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
+#ifndef _WIN32
+	/* ...and able to fault. The handler runs with every signal blocked, and a
+	 * fault while its own is blocked is not delivered: the kernel ends the
+	 * process. The guest's handler is guest code, which writes held pages -
+	 * its own thread locals, after an epoch has held them - and that write
+	 * has to be served like any other, as it is on Windows. So the signals a
+	 * guest instruction can raise are open while it runs (handler_inner lets
+	 * a fault in this phase nest), and shut again after.
+	 *
+	 * Opened BEFORE the guest's thread pointer goes in, and shut after the
+	 * host's is back: pthread_sigmask is host libc, and host libc under the
+	 * guest's %fs writes the guest's thread block. Its first call is bound
+	 * lazily, and glibc's resolver sets and clears its scope flag at %fs:0x1c
+	 * - on an x86-64 musl thread pointer, the high half of the main thread's
+	 * `next`, which the guest's next pthread_create followed to 0x720e130. */
+	sigset_t faults, was;
+	sigemptyset(&faults);
+	sigaddset(&faults, SIGSEGV);
+	sigaddset(&faults, SIGBUS);
+	sigaddset(&faults, SIGILL);
+	sigaddset(&faults, SIGFPE);
+	pthread_sigmask(SIG_UNBLOCK, &faults, &was);
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
 	 * handler put the host's back on entry, and guest code under it reads
@@ -317,6 +350,9 @@ static bool ask_guest(uintptr_t addr, bool write) {
 	const bool handled = g_guest_fault((uint64_t)addr, write ? 1 : 0) != 0;
 #ifdef MB_HAVE_FSBASE
 	if (swap) mb_wrfsbase(host_fs);
+#endif
+#ifndef _WIN32
+	pthread_sigmask(SIG_SETMASK, &was, NULL);
 #endif
 	fault_phase_set(phase);
 	return handled;
@@ -526,6 +562,20 @@ static struct sigaction g_old_sa;
 
 static void handler_inner(int sig, siginfo_t *info, void *ucontext);
 
+/* the signal mask the outermost fault on this thread arrived with */
+static __thread sigset_t g_entry_mask;
+
+/* Control is going to the escape (a guest that died), which no handler frame
+ * below this one will see: the thread is out of every one of them. A death
+ * nested in the guest's own handler would otherwise leave the depth and the
+ * phase of the frame it abandoned, and sigreturn would install the mask that
+ * frame ran with - every signal but the fault signals blocked, for good. */
+static void leave_every_handler_frame(ucontext_t *uc) {
+	if (g_fault_depth > 0) uc->uc_sigmask = g_entry_mask;
+	g_fault_depth = 0;
+	g_fault_phase = MB_PHASE_NONE;
+}
+
 /* The host's %fs must be back before this touches anything.
  *
  * While a guest with its own thread pointer runs, %fs is the GUEST's - that is
@@ -603,6 +653,11 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 		return;
 	}
 	handler_inner(sig, info, ucontext);
+	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP] == (uintptr_t)&mb_guarded_escape) {
+		/* a death: the escape puts the host's base back itself */
+		leave_every_handler_frame((ucontext_t *)ucontext);
+		return;
+	}
 	/* Back to the guest's, from the value the entry thunk recorded rather than
 	 * from whatever was in the register on the way in. Same value on a host
 	 * that preserves the base across a signal, and the right one on a host
@@ -611,14 +666,17 @@ static void handler(int sig, siginfo_t *info, void *ucontext) {
 	if (guest_rip && mb_guest_ctx->fs_swap) mb_restore_guest_fs(fs_at_fault);
 #else
 	handler_inner(sig, info, ucontext);
+	if ((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP] == (uintptr_t)&mb_guarded_escape)
+		leave_every_handler_frame((ucontext_t *)ucontext);
 #endif
 }
 
 
 /* A fault INSIDE the fault handler, which is how this used to die in silence.
  *
- * sa_mask is sigfillset, so SIGSEGV is blocked while the handler runs; a second
- * one is then force-delivered with the default action and the process is gone
+ * sa_mask is sigfillset, so SIGSEGV is blocked while the handler runs (all but
+ * the guest's own handler, which ask_guest opens it for); a second one is then
+ * force-delivered with the default action and the process is gone
  * before a line of diagnosis reaches anyone - no banner, no minibox-diag.log,
  * nothing but "Segmentation fault". Both addresses are exactly what a person
  * needs, so they are said here, with write(2) and a hand-rolled formatter
@@ -697,14 +755,21 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	uintptr_t fault = (uintptr_t)info->si_addr;
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	bool write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
-	if (g_fault_depth > 0) {
+	/* Nested in the handler: served only in the guest's own handler, whose
+	 * faults are guest faults (ask_guest opened the signal for exactly that),
+	 * and only so deep. Any other phase cannot get here with the signal
+	 * blocked, and is said all the same in case it ever does. */
+	if (g_fault_depth > 0 && (g_fault_phase != MB_PHASE_GUEST || g_fault_depth >= MB_FAULT_DEPTH_MOST)) {
 		sigsafe_report_nested(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
 		signal(SIGSEGV, SIG_DFL);
 		return;  /* the instruction runs again and the default action takes it */
 	}
+	if (g_fault_depth == 0) {
+		g_outer_fault = fault;
+		g_outer_rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+		g_entry_mask = uc->uc_sigmask;
+	}
 	g_fault_depth++;
-	g_outer_fault = fault;
-	g_outer_rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
 	trail_add(fault, (uintptr_t)uc->uc_mcontext.gregs[REG_RIP],
 	          (uintptr_t)uc->uc_mcontext.gregs[REG_RSP], write ? 1 : 0);
 	trail_stage(1);
@@ -834,6 +899,7 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 		if (escapable) {
 				uc->uc_mcontext.gregs[REG_RSP] = (greg_t)mb_guest_ctx->esc_rsp;
 				uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&mb_guarded_escape;
+				leave_every_handler_frame(uc);
 			return;
 		}
 	}
@@ -946,6 +1012,11 @@ __attribute__((no_stack_protector))
 static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	const DWORD last_error = GetLastError();
 	const LONG r = veh_fs(ep);
+	/* a death: out of every handler frame at once (see the phase notes) */
+	if (r == EXCEPTION_CONTINUE_EXECUTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)&mb_guarded_escape) {
+		fault_depth_set(0);
+		fault_phase_set(MB_PHASE_NONE);
+	}
 	SetLastError(last_error);
 	return r;
 }
