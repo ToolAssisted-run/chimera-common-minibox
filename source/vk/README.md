@@ -119,6 +119,15 @@ The shaders are kept compiled (`tests/vk/triangle-spv.h`, sources and how to
 remake them in `tests/vk/shaders`), so the test needs no shader compiler. It
 is skipped (77) on a machine with no Vulkan device.
 
+Where it has run (2026-10-10): on Linux against llvmpipe (Mesa 25.2.8), by
+`meson test`; and by hand on Windows against a GeForce GTX 1060 (Vulkan
+1.4.312), the runner cross-built with mingw and the guest the Linux build's
+own file. On both the bridged run is the direct run byte for byte - the
+card rounds the two half-way colour channels down where llvmpipe rounds
+them up, in both runs alike - and the flush, invalidate and stale-handle
+builds fail there with the messages they fail with here. The fourth broken
+build was not run on the card: it is meant to die inside the driver.
+
 Not yet tested: a secondary command buffer, a texture sampled, a compute
-pipeline, a sparse binding, a real graphics card, and a Windows host beyond
-compiling.
+pipeline, a sparse binding. Nothing runs the Windows test by itself: CI
+builds no guest there, and a runner has no card.
