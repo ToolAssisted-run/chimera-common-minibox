@@ -13,12 +13,13 @@ ECL_EXPORT int Install(uint64_t bridge)
 
 ECL_EXPORT int Run(void)
 {
-	vkt_run(chimera_vk_lookup, &g_result);
+	vkt_run(chimera_vk_lookup, &g_result, 1);
 	return g_result.failed_at;
 }
 
 /* 0 the step that failed, 1 its VkResult, 2 the pixel, 3 the image's hash,
- * 4 the copied buffer's hash, 5 the bytes a second mapping gave back */
+ * 4 the copied buffer's hash, 5 the bytes a second mapping gave back, 6 a
+ * pixel the triangle covers, 7 one it does not, 8 the drawn image's hash */
 ECL_EXPORT uint64_t Value(int which)
 {
 	switch (which) {
@@ -28,6 +29,9 @@ ECL_EXPORT uint64_t Value(int which)
 	case 3: return g_result.image_hash;
 	case 4: return g_result.copy_hash;
 	case 5: return g_result.round_trip;
+	case 6: return g_result.drawn_inside;
+	case 7: return g_result.drawn_outside;
+	case 8: return g_result.drawn_hash;
 	default: return 0;
 	}
 }

@@ -14,7 +14,7 @@ run_vk = executable('run_vk', ['run_vk.c', vk_bridge_host_src, vk_bridge_gen[0],
 
 # The same runner with one thing in the host half broken on purpose, each a
 # test that must FAIL: a gate that cannot go red proves nothing.
-vk_breaks = ['FLUSH', 'INVALIDATE', 'STALE']
+vk_breaks = ['FLUSH', 'INVALIDATE', 'STALE', 'EMPTY_WRITE']
 run_vk_broken = {}
 foreach b : vk_breaks
   run_vk_broken += {b: executable('run_vk_broken_' + b.to_lower(),

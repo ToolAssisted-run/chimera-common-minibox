@@ -7,12 +7,17 @@
  * copied to another. That is an instance, a device, memory of both kinds, a
  * mapping in each direction, a render pass, a framebuffer, command buffers, a
  * queue and a fence - every kind of handle crossing the bridge, in structures
- * and in arrays. */
+ * and in arrays.
+ *
+ * Then a draw, with two shaders kept compiled (triangle-spv.h): a pipeline, a
+ * descriptor set whose write carries two pointers to nothing beside the one
+ * that counts, push constants, a vertex buffer and a second command buffer. */
 #pragma once
 
 #include <vulkan/vulkan_core.h>
 #include <stdint.h>
 #include <string.h>
+#include "triangle-spv.h"
 
 typedef void *(*vkt_lookup)(const char *name);
 
@@ -23,6 +28,9 @@ struct vkt_result {
 	uint64_t image_hash;    /* every byte of it */
 	uint64_t copy_hash;     /* every byte of the buffer that was written and copied */
 	uint32_t round_trip;    /* bytes that came back from a second mapping as they were flushed */
+	uint32_t drawn_inside;  /* a pixel the triangle covers */
+	uint32_t drawn_outside; /* one it does not */
+	uint64_t drawn_hash;    /* every byte of the drawn image */
 };
 
 #define VKT_SIDE 64
@@ -45,10 +53,38 @@ static int vkt_memory_type(const VkPhysicalDeviceMemoryProperties *props, uint32
 }
 
 #define VKT(name) ((PFN_##name)get(#name))
+
+/* A buffer the host can see, bound and mapped. */
+static VkResult vkt_buffer(vkt_lookup get, VkDevice dev, const VkPhysicalDeviceMemoryProperties *mem,
+                           VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *buffer, VkDeviceMemory *memory,
+                           void **mapped)
+{
+	VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage,
+	                           .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+	VkResult r = VKT(vkCreateBuffer)(dev, &bci, NULL, buffer);
+	if (r != VK_SUCCESS)
+		return r;
+	VkMemoryRequirements req;
+	VKT(vkGetBufferMemoryRequirements)(dev, *buffer, &req);
+	const int type = vkt_memory_type(mem, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+	if (type < 0)
+		return VK_ERROR_FEATURE_NOT_PRESENT;
+	VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+	                             .memoryTypeIndex = (uint32_t)type };
+	r = VKT(vkAllocateMemory)(dev, &mai, NULL, memory);
+	if (r != VK_SUCCESS)
+		return r;
+	r = VKT(vkBindBufferMemory)(dev, *buffer, *memory, 0);
+	if (r != VK_SUCCESS)
+		return r;
+	return VKT(vkMapMemory)(dev, *memory, 0, VK_WHOLE_SIZE, 0, mapped);
+}
 #define VKT_STEP(n, expr) do { r = (expr); if (r != VK_SUCCESS) { out->failed_at = (n); out->vk_result = (int)r; return; } } while (0)
 #define VKT_NEED(n, cond) do { if (!(cond)) { out->failed_at = (n); out->vk_result = 0; return; } } while (0)
 
-static void vkt_run(vkt_lookup get, struct vkt_result *out)
+/* through_bridge: also do what only the bridge may be asked - what a driver
+ * asked directly would die of. */
+static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 {
 	VkResult r;
 	memset(out, 0, sizeof *out);
@@ -227,6 +263,144 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out)
 	for (uint32_t i = 0; i < VKT_BYTES; i++)
 		out->round_trip += ((uint8_t *)mapped)[i] == (uint8_t)(i * 7u + (i >> 8));
 	VKT(vkUnmapMemory)(dev, buf_mem[1]);
+
+	/* ---- a pipeline, a descriptor set and a draw ---- */
+	VkShaderModuleCreateInfo vsci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof vkt_vert_spv, .pCode = vkt_vert_spv };
+	VkShaderModuleCreateInfo fsci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = sizeof vkt_frag_spv, .pCode = vkt_frag_spv };
+	VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+	VKT_STEP(60, VKT(vkCreateShaderModule)(dev, &vsci, NULL, &vs));
+	VKT_STEP(61, VKT(vkCreateShaderModule)(dev, &fsci, NULL, &fs));
+
+	VkDescriptorSetLayoutBinding binding = { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		/* ignored for a uniform buffer, and so allowed to be anything */
+		.pImmutableSamplers = (const VkSampler *)(uintptr_t)0x10 };
+	VkDescriptorSetLayoutCreateInfo dslci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1, .pBindings = &binding };
+	VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+	VKT_STEP(62, VKT(vkCreateDescriptorSetLayout)(dev, &dslci, NULL, &set_layout));
+	VkPushConstantRange push = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16 };
+	VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+		.pSetLayouts = &set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &push };
+	VkPipelineLayout layout = VK_NULL_HANDLE;
+	VKT_STEP(63, VKT(vkCreatePipelineLayout)(dev, &plci, NULL, &layout));
+
+	VkDescriptorPoolSize pool_size = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
+	VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+		.poolSizeCount = 1, .pPoolSizes = &pool_size };
+	VkDescriptorPool dpool = VK_NULL_HANDLE;
+	VKT_STEP(64, VKT(vkCreateDescriptorPool)(dev, &dpci, NULL, &dpool));
+	VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &set_layout };
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	VKT_STEP(65, VKT(vkAllocateDescriptorSets)(dev, &dsai, &set));
+
+	VkBuffer ubo = VK_NULL_HANDLE, vbo = VK_NULL_HANDLE;
+	VkDeviceMemory ubo_mem = VK_NULL_HANDLE, vbo_mem = VK_NULL_HANDLE;
+	void *ubo_bytes = NULL, *vbo_bytes = NULL;
+	VKT_STEP(66, vkt_buffer(get, dev, &mem, 256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ubo, &ubo_mem, &ubo_bytes));
+	VKT_STEP(67, vkt_buffer(get, dev, &mem, 256, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vbo, &vbo_mem, &vbo_bytes));
+	const float colour[4] = { 0.5f, 0.25f, 0.0f, 0.5f };
+	const float corners[6] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f };   /* the upper left half */
+	memcpy(ubo_bytes, colour, sizeof colour);
+	memcpy(vbo_bytes, corners, sizeof corners);
+	VkMappedMemoryRange written[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = ubo_mem, .offset = 0, .size = VK_WHOLE_SIZE },
+		{ .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = vbo_mem, .offset = 0, .size = VK_WHOLE_SIZE },
+	};
+	VKT_STEP(68, VKT(vkFlushMappedMemoryRanges)(dev, 2, written));
+
+	/* Only the array the descriptor's type names is read; the other two
+	 * point at nothing, as a renderer's may. */
+	VkDescriptorBufferInfo ubo_info = { ubo, 0, 16 };
+	VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+		.descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &ubo_info,
+		.pImageInfo = (const VkDescriptorImageInfo *)(uintptr_t)0x10,
+		.pTexelBufferView = (const VkBufferView *)(uintptr_t)0x10 };
+	VKT(vkUpdateDescriptorSets)(dev, 1, &write, 0, NULL);
+	if (through_bridge) {
+		/* A write with a count and no array at all is a null pointer a driver
+		 * follows. The bridge must refuse it and leave the set as it was. */
+		VkWriteDescriptorSet nothing = write;
+		nothing.pBufferInfo = NULL;
+		VKT(vkUpdateDescriptorSets)(dev, 1, &nothing, 0, NULL);
+	}
+
+	VkPipelineShaderStageCreateInfo stages[2] = {
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		  .module = vs, .pName = "main" },
+		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		  .module = fs, .pName = "main" },
+	};
+	VkVertexInputBindingDescription vbind = { 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+	VkVertexInputAttributeDescription vattr = { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+	VkPipelineVertexInputStateCreateInfo vin = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		.vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vbind,
+		.vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &vattr };
+	VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+	VkViewport viewport = { 0.0f, 0.0f, VKT_SIDE, VKT_SIDE, 0.0f, 1.0f };
+	VkRect2D scissor = { { 0, 0 }, { VKT_SIDE, VKT_SIDE } };
+	VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		.viewportCount = 1, .pViewports = &viewport, .scissorCount = 1, .pScissors = &scissor };
+	VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+		.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+	VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+	VkPipelineColorBlendAttachmentState blend_att = { .colorWriteMask = 0xf };
+	VkPipelineColorBlendStateCreateInfo blend = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.attachmentCount = 1, .pAttachments = &blend_att };
+	VkGraphicsPipelineCreateInfo gpci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2,
+		.pStages = stages, .pVertexInputState = &vin, .pInputAssemblyState = &ia, .pViewportState = &vp,
+		.pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &blend, .layout = layout,
+		.renderPass = pass, .subpass = 0 };
+	VkPipeline pipeline = VK_NULL_HANDLE;
+	VKT_STEP(69, VKT(vkCreateGraphicsPipelines)(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipeline));
+
+	VkCommandBuffer draw = VK_NULL_HANDLE;
+	VKT_STEP(70, VKT(vkAllocateCommandBuffers)(dev, &cbai, &draw));
+	VKT_NEED(71, draw != cmd);
+	VKT_STEP(72, VKT(vkMapMemory)(dev, buf_mem[0], 0, VK_WHOLE_SIZE, 0, &image_bytes));   /* before the device works */
+	VkCommandBufferBeginInfo draw_begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+	VKT_STEP(73, VKT(vkBeginCommandBuffer)(draw, &draw_begin));
+	VkClearValue black = { .color = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } } };
+	rpbi.pClearValues = &black;
+	VKT(vkCmdBeginRenderPass)(draw, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+	VKT(vkCmdBindPipeline)(draw, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	VKT(vkCmdBindDescriptorSets)(draw, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+	const float add[4] = { 0.25f, 0.25f, 0.5f, 0.5f };
+	VKT(vkCmdPushConstants)(draw, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof add, add);
+	const VkDeviceSize zero = 0;
+	VKT(vkCmdBindVertexBuffers)(draw, 0, 1, &vbo, &zero);
+	VKT(vkCmdDraw)(draw, 3, 1, 0, 0);
+	VKT(vkCmdEndRenderPass)(draw);
+	VKT(vkCmdCopyImageToBuffer)(draw, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf[0], 1, &region);
+	VKT_STEP(74, VKT(vkEndCommandBuffer)(draw));
+	VKT_STEP(75, VKT(vkResetFences)(dev, 1, &fence));
+	submit.pCommandBuffers = &draw;
+	VKT_STEP(76, VKT(vkQueueSubmit)(queue, 1, &submit, fence));
+	VKT_STEP(77, VKT(vkWaitForFences)(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000));
+	VKT_STEP(78, VKT(vkInvalidateMappedMemoryRanges)(dev, 1, back));
+	memcpy(&out->drawn_inside, (const uint8_t *)image_bytes + (8 * VKT_SIDE + 8) * 4, 4);
+	memcpy(&out->drawn_outside, (const uint8_t *)image_bytes + (60 * VKT_SIDE + 60) * 4, 4);
+	out->drawn_hash = vkt_hash(image_bytes, VKT_BYTES);
+	VKT(vkUnmapMemory)(dev, buf_mem[0]);
+
+	VKT(vkDestroyPipeline)(dev, pipeline, NULL);
+	VKT(vkUnmapMemory)(dev, ubo_mem);
+	VKT(vkUnmapMemory)(dev, vbo_mem);
+	VKT(vkDestroyBuffer)(dev, ubo, NULL);
+	VKT(vkDestroyBuffer)(dev, vbo, NULL);
+	VKT(vkFreeMemory)(dev, ubo_mem, NULL);
+	VKT(vkFreeMemory)(dev, vbo_mem, NULL);
+	VKT(vkDestroyDescriptorPool)(dev, dpool, NULL);     /* and the set with it */
+	VKT(vkDestroyPipelineLayout)(dev, layout, NULL);
+	VKT(vkDestroyDescriptorSetLayout)(dev, set_layout, NULL);
+	VKT(vkDestroyShaderModule)(dev, vs, NULL);
+	VKT(vkDestroyShaderModule)(dev, fs, NULL);
 
 	VKT(vkDestroyFence)(dev, fence, NULL);
 	VKT(vkFreeCommandBuffers)(dev, pool, 1, &cmd);

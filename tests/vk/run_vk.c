@@ -107,7 +107,7 @@ int main(int argc, char **argv)
 
 	/* ---- directly ---- */
 	struct vkt_result direct;
-	vkt_run(native_lookup, &direct);
+	vkt_run(native_lookup, &direct, 0);
 	EXPECT(direct.failed_at == 0, "the direct run failed at step %d (VkResult %d)", direct.failed_at, direct.vk_result);
 	if (direct.failed_at)
 		return 1;
@@ -176,8 +176,26 @@ int main(int argc, char **argv)
 	       "a second mapping gave back %u of %u bytes directly, %u through the bridge",
 	       direct.round_trip, (unsigned)VKT_BYTES, (unsigned)value(5));
 
+	fprintf(stderr, "direct : drawn inside %08x outside %08x image %016llx\n", direct.drawn_inside,
+		direct.drawn_outside, (unsigned long long)direct.drawn_hash);
+	fprintf(stderr, "bridged: drawn inside %08x outside %08x image %016llx\n", (uint32_t)value(6),
+		(uint32_t)value(7), (unsigned long long)value(8));
+	/* the triangle is the uniform's colour plus the push constant's:
+	 * (0.5, 0.25, 0, 0.5) + (0.25, 0.25, 0.5, 0.5) = (0.75, 0.5, 0.5, 1) */
+	px = (const uint8_t *)&direct.drawn_inside;
+	EXPECT((px[0] == 0xbf || px[0] == 0xc0) && (px[1] == 0x7f || px[1] == 0x80) &&
+	       (px[2] == 0x7f || px[2] == 0x80) && px[3] == 0xff,
+	       "the direct run's triangle is %02x %02x %02x %02x, not the uniform plus the push constant",
+	       px[0], px[1], px[2], px[3]);
+	EXPECT(direct.drawn_outside == 0xff000000u, "the direct run drew outside the triangle (%08x)", direct.drawn_outside);
+	EXPECT((uint32_t)value(6) == direct.drawn_inside, "the triangle's colour differs through the bridge");
+	EXPECT((uint32_t)value(7) == direct.drawn_outside, "the pixel outside the triangle differs through the bridge");
+	EXPECT(value(8) == direct.drawn_hash, "the drawn image differs through the bridge");
+
+	/* one call in the run is wrong on purpose - a descriptor write with nothing
+	 * to read - and it, and only it, must have been refused */
 	long last = -1;
-	EXPECT(chimera_vk_host_refused(&last) == 0, "%lu calls were refused in a correct run (last opcode %ld)",
+	EXPECT(chimera_vk_host_refused(&last) == 1, "%lu calls were refused where one was meant to be (last opcode %ld)",
 	       chimera_vk_host_refused(NULL), last);
 
 	/* ---- a handle from before a load ---- */
@@ -204,7 +222,8 @@ int main(int argc, char **argv)
 	/* and the new context works, with the same result */
 	const int failed_again = run();
 	EXPECT(failed_again == 0, "after a load the run failed at step %d (VkResult %d)", failed_again, (int)(int64_t)value(1));
-	EXPECT(value(3) == direct.image_hash && value(4) == pattern_hash, "after a load the results differ");
+	EXPECT(value(3) == direct.image_hash && value(4) == pattern_hash && value(8) == direct.drawn_hash,
+	       "after a load the results differ");
 
 	wbx_deactivate_host(g_host, &r);
 	chimera_vk_host_shutdown();

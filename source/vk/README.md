@@ -97,13 +97,28 @@ time - so a machine without Vulkan runs everything else.
 ## The test
 
 `tests/vk`: one test (`vktest.h`) run twice - against the driver directly, and
-from a guest through the bridge - and compared byte for byte; then a handle
-kept across a load, which must be refused while the new context's own handle
-in the same place in the table is not. It needs no shader, so no shader
-compiler. Three more builds of the runner each break one thing in the host
-half on purpose (`VKB_TEST_BREAK_*`: a flush that writes nothing, an
-invalidate that reads nothing, a handle taken from any context) and must fail.
+from a guest through the bridge - and compared byte for byte. It clears an
+image with a render pass, writes a buffer through a mapping and has the
+device copy it, and then draws: two shaders, a pipeline, a descriptor set, push
+constants, a vertex buffer, a second command buffer. The pointers a driver
+ignores - a primary buffer's inheritance info, a uniform binding's immutable
+samplers, the two arrays of a descriptor write its type does not name - point
+at nothing, on purpose. Then a handle kept across a load, which must be
+refused while the new context's own handle in the same place in the table is
+not.
 
-It is skipped (77) on a machine with no Vulkan device. Not yet tested: a
-pipeline and a draw, a descriptor set, a secondary command buffer, a real
-graphics card, and a Windows host beyond compiling.
+Four more builds of the runner each break one thing in the host half on
+purpose (`VKB_TEST_BREAK_*`) and must fail: a flush that writes nothing (the
+copied buffer and the triangle's colour both go wrong), an invalidate that
+reads nothing, a handle taken from any context, and a descriptor write with
+no array passed on to the driver - which kills the process inside the driver,
+and is what the refusal is for. In the unbroken run that write is refused,
+and it is the one refused call the run is allowed.
+
+The shaders are kept compiled (`tests/vk/triangle-spv.h`, sources and how to
+remake them in `tests/vk/shaders`), so the test needs no shader compiler. It
+is skipped (77) on a machine with no Vulkan device.
+
+Not yet tested: a secondary command buffer, a texture sampled, a compute
+pipeline, a sparse binding, a real graphics card, and a Windows host beyond
+compiling.

@@ -84,6 +84,15 @@ MEMBER_VALID_WHEN = {
     ("VkSubpassDescription2", "pResolveAttachments"): None,
 }
 
+# What a structure must have for a driver to be handed it at all, where the
+# registry cannot say so: a line of C run after the structure is translated,
+# which sets vkb_bad to refuse the call. A descriptor write with a count and
+# none of its three arrays is a null pointer the driver will follow.
+STRUCT_REFUSED_WHEN = {
+    "VkWriteDescriptorSet":
+        "d->descriptorCount && !d->pImageInfo && !d->pBufferInfo && !d->pTexelBufferView && !d->pNext",
+}
+
 # Structures never followed: a parameter of this type is replaced by NULL.
 NULLED_PARAM_TYPES = {"VkAllocationCallbacks"}
 
@@ -321,6 +330,10 @@ def gen_translator(reg, name, out):
                         "\t\td->%s = c;\n\t} else d->%s = NULL;"
                         % (cond, t, f.name, count, t, count, t, f.name, f.name))
     out.extend(body)
+    if name in STRUCT_REFUSED_WHEN:
+        out.append("#ifndef VKB_TEST_BREAK_EMPTY_WRITE    /* a test build: nothing is refused here */")
+        out.append("\tif (%s) vkb_bad = 1;" % STRUCT_REFUSED_WHEN[name])
+        out.append("#endif")
     out.append("}\n")
 
 
