@@ -93,6 +93,13 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	                          .apiVersion = VK_API_VERSION_1_0 };
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
 	VkInstance instance = VK_NULL_HANDLE;
+	/* Which version is this: the one command a renderer calls before it has
+	 * an instance. (A 1.0 loader has no such command; every one since has.) */
+	if (VKT(vkEnumerateInstanceVersion)) {
+		uint32_t version = 0;
+		VKT_STEP(90, VKT(vkEnumerateInstanceVersion)(&version));
+		VKT_NEED(91, version >= VK_API_VERSION_1_0);
+	}
 	VKT_NEED(1, VKT(vkCreateInstance));
 	VKT_STEP(2, VKT(vkCreateInstance)(&ici, NULL, &instance));
 

@@ -30,6 +30,9 @@ if build_guest_toolchain
   vk_guest_wbx = custom_target('vk-guest.wbx',
     input: ['guest.c', vk_bridge_guest_src, vk_bridge_gen[1], vk_bridge_gen[0]],
     output: 'vk-guest.wbx',
+    # the test itself is a header both runs include: without this the guest
+    # kept the old test while the direct run had the new one
+    depend_files: files('vktest.h', 'triangle-spv.h'),
     command: [
       waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
       '-std=c11', '-D_GNU_SOURCE',

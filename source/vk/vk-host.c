@@ -356,6 +356,11 @@ static void load_functions(int device_level)
 				fn = gdpa(s_device, vkb_fn_names[i].name);
 		} else {
 			fn = s_gipa(s_instance, vkb_fn_names[i].name);
+			/* A command that needs no instance (vkEnumerateInstanceVersion)
+			 * is asked for with none: a loader since 1.2.193 answers NULL
+			 * for it when given one. */
+			if (!fn)
+				fn = s_gipa(NULL, vkb_fn_names[i].name);
 		}
 		*slot = (void *)fn;
 	}
@@ -1033,6 +1038,11 @@ uintptr_t VKB_GUEST_ABI chimera_vk_host_dispatch(uintptr_t op, uintptr_t a, uint
 	}
 	if (!s_gipa || !a)
 		return (uintptr_t)vkb_refuse(op, 0);
+	/* The one generated command a renderer calls before it has an instance:
+	 * which version is this. The table is filled when an instance is made. */
+	if (op == VK_OP_vkEnumerateInstanceVersion && !vkb_fn.vkEnumerateInstanceVersion)
+		vkb_fn.vkEnumerateInstanceVersion =
+			(PFN_vkEnumerateInstanceVersion)s_gipa(NULL, "vkEnumerateInstanceVersion");
 	vkb_begin();
 	return (uintptr_t)vkb_dispatch_generated(op, (void *)a);
 }
