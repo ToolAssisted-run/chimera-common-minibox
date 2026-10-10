@@ -228,6 +228,12 @@ uintptr_t mb_threads_exit(mb_threads *t, mb_context *c) {
 	if (addr != 0) { *(uint32_t *)addr = 0; uint32_t tid; bool more; unpark_one(t, addr, &tid, &more); }
 	TDBG("exit tid=%u\n",t->active_tid);
 	uint32_t dead = t->active_tid;
+	/* off the runnable list before choosing the next thread: still marked
+	 * runnable, the dying thread is the one swap_to_next picks when every
+	 * other thread is in a timed wait, so the v3 fast-forward to the
+	 * earliest deadline never runs and a live machine is declared dead.
+	 * Parked with no deadline and in no queue, it can't be picked or woken. */
+	self->state = T_WAITING;
 	uintptr_t ret = swap_to_next(t, c, sok(0));
 	if (t->active_tid == dead) mb_host_guest_death(c, "the core's last thread exited");
 	remove_thread(t, dead);
