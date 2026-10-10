@@ -114,17 +114,26 @@ ECL_EXPORT uint64_t RunTls(void) {
  * ran under the guest's %fs it read the host's thread locals and its
  * mprotect arrived with a base the dispatcher refuses. */
 static _Thread_local volatile uint32_t t_faults;   /* changed by the handler, under the compiler's feet */
-static volatile uintptr_t g_watched;
+static volatile uintptr_t g_watched, g_fatal;
+/* A page of its own that nothing but the handler writes, so that after sealing
+ * it is a tracked clean page: the handler's write to it faults INSIDE the
+ * handler, and that fault has to be served as any other. */
+static volatile uint32_t g_handler_page[1024] __attribute__((aligned(4096)));
 
 ECL_EXPORT int GuestFaultHandler(uint64_t addr, uint64_t is_write) {
 	(void)is_write;
+	if (g_fatal && addr >= g_fatal && addr < g_fatal + 4096) {
+		*(volatile uint32_t *)(uintptr_t)8 = 1;   /* dies in here: a fault no one handles */
+		return 0;
+	}
 	if (!g_watched || addr < g_watched || addr >= g_watched + 4096) return 0;
 	t_faults++;
+	g_handler_page[0]++;
 	return mprotect((void *)g_watched, 4096, PROT_READ | PROT_WRITE) == 0;
 }
 
 /* 0 when right: the write lands, and the handler counted it in THIS thread's
- * thread local */
+ * thread local, and on its own held page */
 ECL_EXPORT uint64_t RunGuestFault(void) {
 	/* volatile: the write must happen while the page is watched, not be
 	 * moved past the store that stops watching it */
@@ -132,13 +141,25 @@ ECL_EXPORT uint64_t RunGuestFault(void) {
 	if (page == MAP_FAILED) return 0xff;
 	page[0] = 1;
 	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
-	const uint32_t before = t_faults;
+	const uint32_t before = t_faults, before_page = g_handler_page[0];
 	g_watched = (uintptr_t)page;
 	page[1] = 0x5a;   /* faults; the handler opens the page and it is retried */
 	g_watched = 0;
 	uint64_t bad = 0;
 	if (page[1] != 0x5a) bad |= 1;
 	if (t_faults != before + 1) bad |= 2;
+	if (g_handler_page[0] != before_page + 1) bad |= 4;
 	munmap((void *)page, 4096);
 	return bad;
+}
+
+/* Never returns: the handler dies inside itself (a fault nested in the
+ * guest's handler that nothing handles), which is the machine's death. */
+ECL_EXPORT uint64_t RunGuestFaultDeath(void) {
+	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) return 0xff;
+	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	g_fatal = (uintptr_t)page;
+	page[1] = 0x5a;
+	return 0xfd;
 }

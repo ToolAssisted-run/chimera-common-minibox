@@ -374,7 +374,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * overlap, in both versions. MAP_FIXED_NOREPLACE keeps today's
 			 * rule in both. */
 			if (mb_threads_spec(h->threads) == 3 && a1 != 0 && !no_replace && (flags & MAP_FIXED) == 0 && !mb_block_range_is_free(h->block, r)) r.start = 0;
-			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace);
+			/* v3: MAP_FIXED over allocated pages hands them back zero-filled, as
+			 * Linux does (a runtime that decommits and recommits with MAP_FIXED
+			 * relies on it); v2 keeps their bytes. */
+			mb_sword res = mb_block_mmap(h->block, r, prot, h->layout.mmap_arena, no_replace,
+			                             mb_threads_spec(h->threads) == 3);
 			/* A request bigger than the whole arena is not a tight fit, it is a
 			 * mistake - a corrupted size, or a reservation nobody sized against
 			 * this machine. Either way the guest is about to be handed NULL and

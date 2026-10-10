@@ -158,6 +158,8 @@ static int v3_flow(const char *guest) {
 	CHECK(((int_fn)proc(h, "V3TimedWaitExpires"))() == 1);
 	CHECK(((int_fn)proc(h, "V3WaitBitset"))() == 1);
 	STAGE("v3 waiter order + ties");	CHECK(((int_fn)proc(h, "V3WaitOrder"))() == 1);
+	STAGE("v3 thread exit while the rest wait timed");
+	CHECK(((int_fn)proc(h, "V3ExitDuringTimedWait"))() == 1);
 	STAGE("v3 memory + files");
 	CHECK(((int_fn)proc(h, "V3MremapMoves"))() == 1);
 	CHECK(((int_fn)proc(h, "V3HintHonored"))() == 1);

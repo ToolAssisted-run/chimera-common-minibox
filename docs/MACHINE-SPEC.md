@@ -347,7 +347,10 @@ it could have (no-access, or read-only on a write). A nonzero return means the
 guest changed the protection and the access is retried; zero, or no export, is
 an unhandled fault as before. Faults on tracked clean pages (dirty-page
 tracking) and on free pages are never the guest's. The handler runs whatever
-the guest puts in it, so the host's alternate signal stack is 1 MiB.
+the guest puts in it, so the host's alternate signal stack is 1 MiB. It may
+itself fault on a tracked clean page - its own thread locals, held by an
+epoch - and that fault is served as any other; a fault it does not handle is
+the guest's death, as anywhere in guest code.
 
 ## Answered instead of fatal (spec v2.2, additive)
 
@@ -425,7 +428,14 @@ instruction stream.
   MAP_FIXED_NOREPLACE) is honoured when those pages are Free, and the call is
   placed best-fit otherwise. (v2 maps every bare hint fixed at the address.)
   MAP_FIXED maps at the address, discarding overlap, in both versions;
-  MAP_FIXED_NOREPLACE keeps today's EEXIST rule in both.
+  MAP_FIXED_NOREPLACE keeps today's EEXIST rule in both. Discarding differs
+  in what the overlap then holds: under v3, pages in the range that were
+  already allocated come back zero-filled, as on Linux (each is zeroed and
+  undirtied exactly as MADV_DONTNEED does; Free pages in the range are simply
+  mapped). A runtime that decommits with `mmap(PROT_NONE, MAP_FIXED)` and
+  recommits with `mmap(RW, MAP_FIXED)` relies on this. Under v2 the overlap
+  keeps its bytes and only its protection changes. brk growth and the loader
+  only ever map Free pages, so neither is affected.
 - **mremap**: without MREMAP_MAYMOVE (1) the in-place rule is v2's (EEXIST
   when blocked). With MAYMOVE the mapping relocates to a best-fit free range
   (contents copied, old range freed) and returns the new address.

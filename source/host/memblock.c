@@ -920,19 +920,35 @@ static void get_stack_epoch(mb_block *b) {
 
 /* ---- allocation ops ---- */
 
-static int mmap_fixed_impl(mb_block *b, mb_range addr, mb_prot prot, bool no_replace) {
+static void free_pages(mb_block *b, size_t ps, size_t pcount, bool advise_only);
+
+/* zero_overlap (spec v3 MAP_FIXED): pages already allocated in the range come
+ * back zero-filled, as a fresh mapping would - the same zeroing and dirty
+ * bookkeeping as MADV_DONTNEED, run by allocated stretch. Without it (v2, brk,
+ * the loader) the overlap keeps its bytes and only its protection changes. */
+static int mmap_fixed_impl(mb_block *b, mb_range addr, mb_prot prot, bool no_replace, bool zero_overlap) {
 	size_t pcount, ps = validate(b, addr, &pcount);
 	if (ps == (size_t)-1) return -EINVAL;
 	if (no_replace)
 		for (size_t i = ps; i < ps + pcount; i++)
 			if (b->pages[i].status != MB_ST_FREE) return -EEXIST;
+	if (zero_overlap) {
+		get_stack_dirty_range(b, ps, pcount);
+		for (size_t i = ps; i < ps + pcount;) {
+			if (b->pages[i].status == MB_ST_FREE) { i++; continue; }
+			size_t j = i;
+			while (j < ps + pcount && b->pages[j].status != MB_ST_FREE) j++;
+			free_pages(b, i, j - i, true);
+			i = j;
+		}
+	}
 	set_protections(b, ps, pcount, prot_status(prot));
 	return 0;
 }
 
 int mb_block_mmap_fixed(mb_block *b, mb_range addr, mb_prot prot, bool no_replace) {
 	mb_block_track_lock(b);
-	const int r = mmap_fixed_impl(b, addr, prot, no_replace);
+	const int r = mmap_fixed_impl(b, addr, prot, no_replace, false);
 	mb_block_track_unlock(b);
 	return r;
 }
@@ -1017,7 +1033,7 @@ static size_t find_free_pages(mb_block *b, size_t arena_start, size_t arena_coun
 	return best;
 }
 
-static mb_sword mmap_impl(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace) {
+static mb_sword mmap_impl(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace, bool zero_overlap) {
 	if (addr.size == 0) return -EINVAL;
 	if (addr.start == 0) {
 		if (addr.size != mb_align_down(addr.size)) return -EINVAL;
@@ -1061,14 +1077,14 @@ static mb_sword mmap_impl(mb_block *b, mb_range addr, mb_prot prot, mb_range are
 		set_protections(b, ps, addr.size >> MB_PAGESHIFT, prot_status(prot));
 		return (mb_sword)(b->addr.start + (ps << MB_PAGESHIFT));
 	} else {
-		int r = mmap_fixed_impl(b, addr, prot, no_replace);
+		int r = mmap_fixed_impl(b, addr, prot, no_replace, zero_overlap);
 		return r != 0 ? r : (mb_sword)addr.start;
 	}
 }
 
-mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace) {
+mb_sword mb_block_mmap(mb_block *b, mb_range addr, mb_prot prot, mb_range arena, bool no_replace, bool zero_overlap) {
 	mb_block_track_lock(b);
-	const mb_sword r = mmap_impl(b, addr, prot, arena, no_replace);
+	const mb_sword r = mmap_impl(b, addr, prot, arena, no_replace, zero_overlap);
 	mb_block_track_unlock(b);
 	return r;
 }

@@ -169,6 +169,41 @@ ECL_EXPORT int V3WaitOrder(void) {
 	return 1;
 }
 
+/* ---- a thread exits while every other thread is in a timed wait ----
+ * X (detached, so nobody joins it) waits for the flag main sets just before
+ * it parks with a deadline, then exits. At X's exit the only other thread
+ * is parked with a deadline: the clock must fast-forward to it and main
+ * must answer ETIMEDOUT exactly there, not have the machine declared dead
+ * because the exiting thread was the last one runnable. */
+static volatile int go_x, done_x;
+static int fut_m;
+static void *exiter(void *arg) {
+	(void)arg;
+	while (!go_x) syscall(SYS_sched_yield);   /* yields don't tick */
+	done_x = 1;
+	return 0;
+}
+
+ECL_EXPORT int V3ExitDuringTimedWait(void) {
+	pthread_attr_t at;
+	pthread_t tx;
+	pthread_attr_init(&at);
+	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&tx, &at, exiter, 0) != 0) return 0;
+	pthread_attr_destroy(&at);
+	struct timespec to = { 0, 1000000 };
+	uint64_t dl = vnow() + 1000000;
+	go_x = 1;
+	errno = 0;
+	long r = syscall(SYS_futex, &fut_m, 0 /*WAIT*/, 0, &to, NULL, 0);
+	int e = errno;
+	uint64_t obs = vnow();
+	if (r != -1 || e != ETIMEDOUT_LINUX) return 0;
+	if (!done_x) return 0;                    /* X ran to its exit meanwhile */
+	if (obs != dl + TICK_NS) return 0;        /* woke exactly at the deadline */
+	return 1;
+}
+
 /* ---- save/load in the middle of a timed wait (runner-orchestrated) ----
  * SetupWaiter parks W (deadline recorded for the runner); ExpireStep advances
  * past it, joins, and reports the clock W saw. The runner saves between the
@@ -258,8 +293,13 @@ ECL_EXPORT int V3HintHonored(void) {
 	uint8_t *f2 = (uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_READ | PROT_WRITE,
 	                                 MAP_PRIVATE | MAP_ANONYMOUS | 0x10 /*FIXED*/, -1, 0);
 	if (f2 != f1) return 0;
+	if (f2[0] != 0) return 0;                      /* discarded: zero-filled */
+	/* decommit/recommit (PROT_NONE then RW, both MAP_FIXED) zero-fills too */
 	f2[0] = 0x22;
 	if (f1[0] != 0x22) return 0;
+	if ((uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | 0x10, -1, 0) != f1) return 0;
+	if ((uint8_t *)syscall(SYS_mmap, f1, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | 0x10, -1, 0) != f1) return 0;
+	if (f1[0] != 0) return 0;
 	(void)h1;
 	return 1;
 }
