@@ -909,6 +909,77 @@ static void handler_other(int sig, siginfo_t *info, void *ucontext) {
 	else old->sa_handler(sig);
 }
 
+#ifdef MB_HAVE_FSBASE
+/* Every OTHER handler in the process, run under the host's thread pointer.
+ *
+ * Guest code with thread locals runs with the guest's %fs installed. A signal
+ * the host's own runtime sends itself can land there - Mono stops each thread
+ * for its garbage collector with one - and its handler, host code, then reads
+ * its thread-locals through the guest's pointer and dies: a PCSX2 core,
+ * interpreting for seconds at a time, took Chimera down that way at its first
+ * collection (mono's suspend_signal_handler, in
+ * mono_hazard_pointer_save_for_signal_handler).
+ *
+ * So the handlers already installed when miniBox starts - the runtime's -
+ * are wrapped: on the thread running a guest, with the guest's pointer in,
+ * the host's goes in for the handler and whatever was there comes back after.
+ * Anywhere else the handler is called as it was. The faults miniBox serves
+ * itself (SIGSEGV, SIGBUS, SIGILL, SIGFPE) are not wrapped here: those
+ * handlers already know.
+ *
+ * The wrapped handlers also take SA_ONSTACK, for the same reason miniBox's own
+ * do (mb_tripguard_ensure_altstack): without it the kernel puts the handler's
+ * frame on the stack the thread is on, which in guest code is the GUEST's -
+ * host data written into guest memory, and a frame that reaches a clean
+ * (write-protected) tracked page cannot be delivered at all. Mono's suspend
+ * handler waits in sigsuspend for the restart signal, and that signal's frame,
+ * a page further down the guest's stack, killed Chimera with a kernel SIGSEGV.
+ * On a thread with no alternate stack SA_ONSTACK changes nothing. */
+static struct sigaction g_foreign[NSIG];
+
+__attribute__((no_stack_protector))
+static void handler_foreign(int sig, siginfo_t *info, void *ucontext) {
+	const struct sigaction *old = &g_foreign[sig];
+	/* No %fs instruction unless the probe said they exist (mb_fs_swap), as in
+	 * handler() above. Where the OS keeps rdfsbase from userspace it is an
+	 * illegal instruction, and this runs for every wrapped signal on every
+	 * thread of the process, guest or not: unguarded it would take the
+	 * frontend down at its runtime's first signal. On such a host no guest
+	 * ever owns %fs, so there is nothing to put back either. */
+	const bool swaps = mb_fs_swap;
+	const uintptr_t tp = swaps ? mb_rdfsbase() : 0;
+	mb_context *c = mb_guest_ctx;
+	/* the guest's pointer is in when this thread was stopped in guest code, or
+	 * holds one of the guest's pointers (a transition, between the swap and
+	 * the jump) - and is not the host's own */
+	const bool guest_tp = swaps && c && c->host_fs && tp != c->host_fs
+		&& (rip_in_guest((uintptr_t)((ucontext_t *)ucontext)->uc_mcontext.gregs[REG_RIP])
+		    || tp == c->thread_area || (mb_early_tp && tp == mb_early_tp));
+	if (guest_tp) mb_wrfsbase(c->host_fs);
+	if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
+	else if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) old->sa_handler(sig);
+	if (guest_tp) mb_wrfsbase(tp);
+}
+
+static void wrap_foreign_handlers(void) {
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (sig == SIGKILL || sig == SIGSTOP || sig == SIGSEGV || sig == SIGBUS
+		    || sig == SIGILL || sig == SIGFPE) continue;
+		struct sigaction old;
+		if (sigaction(sig, NULL, &old) != 0) continue;
+		const bool has_handler = (old.sa_flags & SA_SIGINFO)
+			? old.sa_sigaction != NULL
+			: old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN;
+		if (!has_handler) continue;
+		g_foreign[sig] = old;
+		struct sigaction sa = old;
+		sa.sa_sigaction = handler_foreign;
+		sa.sa_flags = old.sa_flags | SA_SIGINFO | SA_ONSTACK;
+		if (sigaction(sig, &sa, NULL) != 0) g_foreign[sig].sa_handler = SIG_DFL;
+	}
+}
+#endif
+
 static void initialize(void) {
 	trail_open();
 	mb_tripguard_ensure_altstack();
@@ -926,6 +997,9 @@ static void initialize(void) {
 	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
 		perror("miniBox sigaction"); abort();
 	}
+#ifdef MB_HAVE_FSBASE
+	wrap_foreign_handlers();
+#endif
 }
 
 #else
