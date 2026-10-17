@@ -15,13 +15,13 @@ ar = 'ar'
 strip = 'strip'
 
 [built-in options]
-c_args = ['-fvisibility=hidden', '-I@EMULIBC_INC@', '-I@GUESTKIT_INC@', '-I@JSMN_INC@', '-Wall', '-mcmodel=large', '-mno-red-zone', '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none', '-O2', '-DNDEBUG']
+c_args = ['-fvisibility=hidden', '-I@EMULIBC_INC@', '-I@GUESTKIT_INC@', '-I@JSMN_INC@', '-Wall', @MACHINE_ARGS@, '-O2', '-DNDEBUG']
 c_link_args = ['-static', '-no-pie', '-Wl,--eh-frame-hdr,-O2', '-T', '@LINKSCRIPT@']
 
 [host_machine]
 system = 'linux'
-cpu_family = 'x86_64'
-cpu = 'x86_64'
+cpu_family = '@CPU_FAMILY@'
+cpu = '@CPU_FAMILY@'
 endian = 'little'
 
 [properties]

@@ -18,3 +18,13 @@ test('threads', run_threads,
   suite: 'system',
   timeout: 120,
 )
+
+# A host whose page is larger than the machine's (forced here, so any host runs
+# it) cannot deliver the faults GuestFaultHandler waits for, and must refuse a
+# guest that exports it, saying why (MACHINE-SPEC, guest fault forwarding).
+test('threads-grouped-refused', run_threads,
+  args: ['--refused', guest_threads_wbx],
+  env: ['MB_HOST_PAGE=16384'],
+  suite: 'system',
+  timeout: 60,
+)

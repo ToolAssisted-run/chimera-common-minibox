@@ -40,8 +40,34 @@ if build_guest_toolchain
   # stack, where the bytes below rsp do not survive it (docs/RED-ZONE.md). So no
   # guest code, libc included, may keep anything below rsp. The same flag sits
   # in the musl-gcc specs (*cc1) for everything compiled through them.
-  musl_cflags = '-Werror -fvisibility=hidden -mcmodel=large -mno-red-zone ' + \
-                '-mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none'
+  #
+  # The guest runs directly on the host's CPU, so it is built for that CPU: the
+  # x86-64 machine the spec describes, or the aarch64 one (arch/waterbox_aarch64
+  # in musl). waterbox_cpu_flags are each CPU's frozen code-generation flags:
+  #   x86-64   large code model (the guest sits above 2 GiB and the small model
+  #            cannot reach it), no red zone, no CET;
+  #   aarch64  the default small model (addressing is pc-relative: any base
+  #            works), no return-address signing (keyed per process - a signed
+  #            pointer in a savestate is another pointer in the next process),
+  #            no outline atomics (they ask the CPU what it has), and the
+  #            arithmetic of the x86-64 machine: no fused multiply-add, signed
+  #            char. The same flags sit in the musl-gcc specs (*cc1).
+  if host_machine.cpu_family() == 'aarch64'
+    waterbox_musl_target = 'waterbox_aarch64'
+    waterbox_guest_triplet = 'aarch64-linux-musl'
+    waterbox_cpu_flags = ['-mbranch-protection=none', '-mno-outline-atomics', '-ffp-contract=off', '-fsigned-char']
+  elif host_machine.cpu_family() == 'x86_64'
+    waterbox_musl_target = 'waterbox'
+    waterbox_guest_triplet = 'x86_64-linux-musl'
+    waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone']
+  else
+    error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
+  endif
+  waterbox_common_flags = ['-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie']
+  if host_machine.cpu_family() == 'x86_64'
+    waterbox_common_flags += ['-fcf-protection=none']
+  endif
+  musl_cflags = ' '.join(['-Werror', '-fvisibility=hidden'] + waterbox_cpu_flags + waterbox_common_flags)
 
   # Phase 1: configure musl out-of-tree. Writes config.mak + a Makefile symlink
   # into the build root (the custom_target cwd).
@@ -50,7 +76,7 @@ if build_guest_toolchain
     command: [
       find_program(musl_src / 'configure'),
       '--srcdir=' + musl_src,
-      '--target=waterbox', '--build=waterbox', '--disable-shared',
+      '--target=' + waterbox_musl_target, '--build=' + waterbox_musl_target, '--disable-shared',
       '--prefix=' + waterbox_sysroot,
       '--bindir=' + meson.current_build_dir(),      # musl-gcc -> a trackable build-root path
       '--libdir=' + waterbox_sysroot / 'lib',
@@ -67,7 +93,8 @@ if build_guest_toolchain
   # own outputs are invisible to ninja and a fixed header silently ships as a
   # stale libc.a (cost a day chasing "Rust file IO is broken" - it was not).
   musl_dep_files = run_command('sh', '-c',
-    'find ' + musl_src / 'arch/waterbox' + ' ' + musl_src / 'src' + ' -name "*.h" -o -name "*.c" -o -name "*.s" 2>/dev/null',
+    'find ' + musl_src / 'arch' / waterbox_musl_target + ' ' + musl_src / 'src' + ' ' + musl_src / 'crt' + ' ' + musl_src / 'tools' +
+    ' -name "*.h" -o -name "*.c" -o -name "*.s" -o -name "*.S" -o -name "*.sh" 2>/dev/null',
     check: false).stdout().strip().split('\n')
   waterbox_musl_gcc = custom_target('musl-gcc',
     input: musl_config,
@@ -102,7 +129,7 @@ if build_guest_toolchain
     gcc_srcdir = cpp_dir / 'src' / 'gcc-' + gcc_version
     musl_specs = waterbox_sysroot / 'lib' / 'musl-gcc.specs'
     # Same frozen guest flags the .wbx itself is compiled with.
-    wbx_flags = '-mcmodel=large -mno-red-zone -mstack-protector-guard=global -fno-stack-protector -fno-pic -fno-pie -fcf-protection=none -O2'
+    wbx_flags = ' '.join(waterbox_cpu_flags + waterbox_common_flags + ['-O2'])
 
     waterbox_libstdcxx = custom_target('libstdcxx',
       input: waterbox_musl_gcc,           # needs the guest musl headers/libs first
@@ -117,28 +144,39 @@ V=@1@
 mkdir -p $D/src $D/build $D/gthr-inc
 # The matching GCC source, fetched once. Several mirrors are tried: ftp.gnu.org
 # is regularly unreachable from CI runners (connect timeouts), so it is last.
-if [ ! -f $D/gcc-$V.tar.xz ]; then for U in "https://mirrors.kernel.org/gnu/gcc/gcc-$V/gcc-$V.tar.xz" "https://ftpmirror.gnu.org/gcc/gcc-$V/gcc-$V.tar.xz" "https://gcc.gnu.org/pub/gcc/releases/gcc-$V/gcc-$V.tar.xz" "https://ftp.gnu.org/gnu/gcc/gcc-$V/gcc-$V.tar.xz"; do echo "fetching $U"; if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 25 -o $D/gcc-$V.tar.xz.part "$U"; then mv $D/gcc-$V.tar.xz.part $D/gcc-$V.tar.xz; break; fi; done; fi
-if [ ! -f $D/gcc-$V.tar.xz ]; then echo "could not download the GCC $V source from any mirror" >&2; exit 1; fi
+# A distribution GCC may report a version no release carries: Fedora's 16.2.1
+# is a snapshot of the 16.2 branch, after 16.2.0. Its release (x.y.0) is then
+# the source, and the tree is stamped with the host's version below, so the
+# headers land under include/c++/$V as every consumer expects.
+for S in $V $(echo $V | sed "s/[.][0-9]*$/.0/"); do if [ ! -f $D/gcc-$S.tar.xz ]; then for U in "https://mirrors.kernel.org/gnu/gcc/gcc-$S/gcc-$S.tar.xz" "https://ftpmirror.gnu.org/gcc/gcc-$S/gcc-$S.tar.xz" "https://gcc.gnu.org/pub/gcc/releases/gcc-$S/gcc-$S.tar.xz" "https://ftp.gnu.org/gnu/gcc/gcc-$S/gcc-$S.tar.xz"; do echo "fetching $U"; if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 25 -o $D/gcc-$S.tar.xz.part "$U"; then mv $D/gcc-$S.tar.xz.part $D/gcc-$S.tar.xz; break; fi; done; fi; if [ -f $D/gcc-$S.tar.xz ]; then break; fi; done
+if [ ! -f $D/gcc-$S.tar.xz ]; then echo "could not download the GCC $V source (or its release) from any mirror" >&2; exit 1; fi
 # Extract the whole tree: libstdc++-v3 reaches into enough sibling directories
 # (config-ml.in, libbacktrace, gcc/BASE-VER, include, ...) that a curated member
 # list is fragile and would rot across GCC versions. The tree is transient - it
 # is deleted after install below, leaving only the tarball and the sysroot.
-if [ ! -d $D/src/gcc-$V/libstdc++-v3 ]; then tar xf $D/gcc-$V.tar.xz -C $D/src; fi
+if [ ! -d $D/src/gcc-$S/libstdc++-v3 ]; then tar xf $D/gcc-$S.tar.xz -C $D/src; fi
+echo $V > $D/src/gcc-$S/gcc/BASE-VER
+# (CFLAGS -std=gnu17: GCC 15 and later compile C as C23, where musl's old-style
+# `char *basename();` means no arguments and clashes with libiberty's prototype
+# in the few C files libstdc++ builds - libbacktrace, for <stacktrace>.)
 # the gthreads configure test needs gthr-default.h, which configure itself only
 # generates at the END - pre-seed it, else threads come out off and the C++20
 # tzdb.cc build fails ("mutex does not name a type").
 echo '#include "gthr-posix.h"' > $D/gthr-inc/gthr-default.h
 cd $D/build
-if [ ! -f Makefile ]; then CC="gcc -specs @2@" CXX="g++ -specs @2@" CFLAGS="@3@ -I$D/gthr-inc" CXXFLAGS="@3@ -I$D/gthr-inc" $D/src/gcc-$V/libstdc++-v3/configure --host=x86_64-linux-musl --build=x86_64-pc-linux-gnu --prefix=@4@ --disable-shared --enable-static --disable-multilib --disable-libstdcxx-pch --disable-nls; fi
+if [ ! -f Makefile ]; then CC="gcc -specs @2@" CXX="g++ -specs @2@" CFLAGS="@3@ -std=gnu17 -I$D/gthr-inc" CXXFLAGS="@3@ -I$D/gthr-inc" $D/src/gcc-$S/libstdc++-v3/configure --host=@6@ --build=$(gcc -dumpmachine) --prefix=@4@ --disable-shared --enable-static --disable-multilib --disable-libstdcxx-pch --disable-nls; fi
 make -j"$(nproc)"
 make install
+# libstdc++ installs into the compiler's multilib directory, which is lib64 on
+# Fedora (lib on Debian); everything that links a guest looks in lib
+if [ -d @4@/lib64 ]; then mv @4@/lib64/* @4@/lib/; rmdir @4@/lib64; fi
 # everything needed now lives in the sysroot; reclaim the ~1.1GB source tree and
 # the build tree (the tarball is kept so a rebuild does not re-download)
 cd $D
 rm -rf $D/src $D/build
 touch @5@
 '''.format(cpp_dir, gcc_version, musl_specs, wbx_flags, waterbox_sysroot,
-           meson.current_build_dir() / 'libstdcxx-installed.stamp')],
+           meson.current_build_dir() / 'libstdcxx-installed.stamp', waterbox_guest_triplet)],
     )
     waterbox_gxx_include = waterbox_sysroot / 'include' / 'c++' / gcc_version
   endif

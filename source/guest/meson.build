@@ -30,11 +30,12 @@ waterbox_jsmn_dir     = meson.project_source_root() / 'extern' / 'jsmn'
 waterbox_linkscript  = meson.current_source_dir() / 'linkscript.T'
 
 # The frozen guest flags (BizHawk waterbox COMMONFLAGS; C, no C++/LTO).
+# (waterbox_cpu_flags and waterbox_common_flags: the top-level meson.build,
+# per guest CPU; on x86-64 they are exactly the list this used to spell out)
 waterbox_guest_cflags = [
   '-fvisibility=hidden', '-I' + waterbox_emulibc_dir,
   '-I' + waterbox_guestkit_inc, '-I' + waterbox_jsmn_dir,
-  '-Wall', '-mcmodel=large', '-mno-red-zone',
-  '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none',
+  '-Wall'] + waterbox_cpu_flags + waterbox_common_flags + [
   '-O2', '-DNDEBUG',
 ]
 waterbox_guest_ldflags = [
@@ -43,10 +44,14 @@ waterbox_guest_ldflags = [
 
 # emulibc.o is a meson build artifact, compiled with the just-built musl-gcc.
 # Passing the musl-gcc custom_target as command[0] makes ninja build musl first.
+# Built by default, and musl with it: cores outside this tree link the kit, and
+# a plain build has to leave it ready for them. Meson 1.3 built it anyway,
+# because the guest tests use it; Meson 1.10 and later do not.
 waterbox_emulibc_ct = custom_target('emulibc.c.o',
   input: waterbox_emulibc_dir / 'emulibc.c',
   output: 'emulibc.c.o',
   command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
 )
 waterbox_emulibc_obj = waterbox_emulibc_ct
 
@@ -67,7 +72,7 @@ if waterbox_cpp_guest
   waterbox_guest_cxxflags = waterbox_guest_cflags + [
     '-specs', waterbox_sysroot / 'lib' / 'musl-gcc.specs',
     '-I' + waterbox_gxx_include,
-    '-I' + waterbox_gxx_include / 'x86_64-linux-musl',
+    '-I' + waterbox_gxx_include / waterbox_guest_triplet,
     '-fno-exceptions', '-fno-rtti',
   ]
   waterbox_guest_cxx_ldflags = [
@@ -85,10 +90,16 @@ if waterbox_cpp_guest
     output: 'cxxglue.c.o',
     command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
     depends: waterbox_libstdcxx,
+    build_by_default: true,   # and libstdc++ with it, as emulibc above
   )
 endif
 
 # Emit a cross-file for consumers who want to build the guest as a cross project.
+waterbox_machine_args_quoted = []
+foreach f : waterbox_cpu_flags + waterbox_common_flags
+  waterbox_machine_args_quoted += '\'' + f + '\''
+endforeach
+waterbox_machine_args_ini = ', '.join(waterbox_machine_args_quoted)
 configure_file(
   input: 'waterbox-guest.ini.in',
   output: 'waterbox-guest.ini',
@@ -99,5 +110,7 @@ configure_file(
     'JSMN_INC': waterbox_jsmn_dir,
     'EMULIBC_OBJ': waterbox_emulibc_ct.full_path(),
     'LINKSCRIPT': waterbox_linkscript,
+    'MACHINE_ARGS': waterbox_machine_args_ini,
+    'CPU_FAMILY': host_machine.cpu_family(),
   },
 )
