@@ -312,4 +312,13 @@ int mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len) {
 
 uintptr_t mb_pal_release_unit(mb_handle h) { return h.pieces ? MB_PAL_PIECE : 0; }
 
+int mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write) {
+	mb_range in = { 0, size };
+	if (mb_pal_map_anon(in, MB_PROT_RWX, exec) != 0) return -1;
+	*write = *exec;
+	return 0;
+}
+
+void mb_pal_unmap_code(mb_range exec, mb_range write) { (void)write; mb_pal_unmap_anon(exec); }
+
 #endif

@@ -145,17 +145,28 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 	static const char *const eds2_name = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
 	static const char *const line_name = VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME;
 	int has_props2 = 0, has_push = 0, has_sync2 = 0, has_templ = 0, has_eds2 = 0, has_line = 0;
-	const char *dev_ext[6];
+	const char *dev_ext[7];
 	uint32_t dev_ext_count = 0;
 	count_ext = 512;
 	r = VKT(vkEnumerateInstanceExtensionProperties)(NULL, &count_ext, ext);
 	VKT_NEED(92, r == VK_SUCCESS || r == VK_INCOMPLETE);
 	for (uint32_t i = 0; i < count_ext; i++)
 		has_props2 |= strcmp(ext[i].extensionName, props2_name) == 0;
-	if (has_props2) {
-		ici.enabledExtensionCount = 1;
-		ici.ppEnabledExtensionNames = &props2_name;
+	const char *inst_ext[2];
+	if (has_props2)
+		inst_ext[ici.enabledExtensionCount++] = props2_name;
+#ifdef __APPLE__
+	/* asked directly, MoltenVK is listed only to an instance that asks for
+	 * portability drivers (through the bridge, the host asks) */
+	int has_portability = 0, has_subset = 0;
+	for (uint32_t i = 0; !through_bridge && i < count_ext; i++)
+		has_portability |= strcmp(ext[i].extensionName, "VK_KHR_portability_enumeration") == 0;
+	if (has_portability) {
+		inst_ext[ici.enabledExtensionCount++] = "VK_KHR_portability_enumeration";
+		ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 	}
+#endif
+	ici.ppEnabledExtensionNames = inst_ext;
 	/* Which version is this: the one command a renderer calls before it has
 	 * an instance. (A 1.0 loader has no such command; every one since has.) */
 	if (VKT(vkEnumerateInstanceVersion)) {
@@ -220,6 +231,13 @@ static void vkt_run(vkt_lookup get, struct vkt_result *out, int through_bridge)
 		dev_ext[dev_ext_count++] = eds2_name;
 	if (has_line)
 		dev_ext[dev_ext_count++] = line_name;
+#ifdef __APPLE__
+	/* a device that implements a subset of Vulkan is created saying so */
+	for (uint32_t i = 0; has_portability && i < count_ext; i++)
+		has_subset |= strcmp(ext[i].extensionName, "VK_KHR_portability_subset") == 0;
+	if (has_subset)
+		dev_ext[dev_ext_count++] = "VK_KHR_portability_subset";
+#endif
 	if (has_push) {
 		/* how many may be pushed: a structure chained to the device's
 		 * properties, which the driver fills in where it lies */

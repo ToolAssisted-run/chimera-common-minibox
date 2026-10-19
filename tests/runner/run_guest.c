@@ -30,7 +30,11 @@
  * change it. */
 static uintptr_t host_fs_base(void) {
 	uintptr_t v = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__APPLE__)
+	/* macOS: TPIDRRO_EL0, where libc keeps this thread's state (TPIDR_EL0
+	 * holds the CPU number, and changes as the thread moves) */
+	__asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (v));
+#elif defined(__aarch64__)
 	/* aarch64: TPIDR_EL0, where glibc keeps this thread's state */
 	__asm__ volatile ("mrs %0, tpidr_el0" : "=r" (v));
 #elif defined(__x86_64__)

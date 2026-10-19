@@ -694,6 +694,39 @@ static void create_instance_there(void *p)
 	}
 }
 
+#ifdef __APPLE__
+static int has_instance_extension(const char *name)
+{
+	PFN_vkEnumerateInstanceExtensionProperties list =
+		(PFN_vkEnumerateInstanceExtensionProperties)s_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+	uint32_t n = 0;
+	if (!list || list(NULL, &n, NULL) < 0 || n == 0)
+		return 0;
+	VkExtensionProperties *have = calloc(n, sizeof *have);
+	int found = 0;
+	if (have && list(NULL, &n, have) >= 0)
+		for (uint32_t i = 0; i < n && !found; i++)
+			found = strcmp(have[i].extensionName, name) == 0;
+	free(have);
+	return found;
+}
+
+static int has_device_extension(VkPhysicalDevice phys, const char *name)
+{
+	uint32_t n = 0;
+	if (!vkb_fn.vkEnumerateDeviceExtensionProperties
+	    || vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) < 0 || n == 0)
+		return 0;
+	VkExtensionProperties *have = calloc(n, sizeof *have);
+	int found = 0;
+	if (have && vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, have) >= 0)
+		for (uint32_t i = 0; i < n && !found; i++)
+			found = strcmp(have[i].extensionName, name) == 0;
+	free(have);
+	return found;
+}
+#endif
+
 static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateInstance_args *a)
 {
 	PFN_vkCreateInstance create = (PFN_vkCreateInstance)s_gipa(NULL, "vkCreateInstance");
@@ -707,6 +740,20 @@ static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateIns
 	for (uint32_t i = 0; i < info.enabledExtensionCount; i++)
 		if (!ALLOWED_INSTANCE(info.ppEnabledExtensionNames[i]))
 			return (uint64_t)(int64_t)VK_ERROR_EXTENSION_NOT_PRESENT;
+#ifdef __APPLE__
+	/* MoltenVK is a "portability" driver, which the loader lists only to an
+	 * instance that asks for them. The guest cannot see the difference: the
+	 * flag and the extension are the host's, as the device's subset is. */
+	const char *with_portability[64];
+	if (info.enabledExtensionCount < 63 && has_instance_extension("VK_KHR_portability_enumeration")) {
+		for (uint32_t i = 0; i < info.enabledExtensionCount; i++)
+			with_portability[i] = info.ppEnabledExtensionNames[i];
+		with_portability[info.enabledExtensionCount] = "VK_KHR_portability_enumeration";
+		info.ppEnabledExtensionNames = with_portability;
+		info.enabledExtensionCount++;
+		info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+	}
+#endif
 	struct create_instance_call call = { create, &info, VK_ERROR_INITIALIZATION_FAILED };
 	on_own_thread(create_instance_there, &call);
 	const VkResult r = call.r;
@@ -776,6 +823,18 @@ static uint64_t vkb_special_vkCreateDevice(uint64_t op, struct vkb_vkCreateDevic
 			return (uint64_t)(int64_t)VK_ERROR_EXTENSION_NOT_PRESENT;
 	if (vkb_bad)
 		return vkb_refuse(op, (uint64_t)(int64_t)VK_ERROR_INITIALIZATION_FAILED);
+#ifdef __APPLE__
+	/* a device that implements only a subset of Vulkan (MoltenVK) has to be
+	 * created saying it knows: the spec requires the extension enabled */
+	const char *with_subset[256];
+	if (info.enabledExtensionCount < 255 && has_device_extension(phys, "VK_KHR_portability_subset")) {
+		for (uint32_t i = 0; i < info.enabledExtensionCount; i++)
+			with_subset[i] = info.ppEnabledExtensionNames[i];
+		with_subset[info.enabledExtensionCount] = "VK_KHR_portability_subset";
+		info.ppEnabledExtensionNames = with_subset;
+		info.enabledExtensionCount++;
+	}
+#endif
 	VkDevice device = VK_NULL_HANDLE;
 	struct create_device_call call = { phys, &info, &device, VK_ERROR_INITIALIZATION_FAILED };
 	on_own_thread(create_device_there, &call);
@@ -1387,16 +1446,41 @@ void chimera_vk_host_state_loaded(void)
 	mint_context_id();
 }
 
+void *chimera_vk_host_open_loader(void)
+{
+#ifdef _WIN32
+	return (void *)LoadLibraryA("vulkan-1.dll");
+#elif defined(__APPLE__)
+	/* No loader is the system's on macOS: an app carries its own (and
+	 * MoltenVK) in its bundle, and a development machine has Homebrew's,
+	 * which dlopen does not look for by name. */
+	static const char *const paths[] = {
+		"libvulkan.1.dylib",
+		"@executable_path/../Frameworks/libvulkan.1.dylib",
+		"@rpath/libvulkan.1.dylib",
+		"/opt/homebrew/lib/libvulkan.1.dylib",
+		"/usr/local/lib/libvulkan.1.dylib",
+	};
+	for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+		void *lib = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+		if (lib)
+			return lib;
+	}
+	return NULL;
+#else
+	return dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
 int chimera_vk_host_init(char *err, int errlen)
 {
 	if (s_gipa)
 		return 0;
+	s_lib = chimera_vk_host_open_loader();
 #ifdef _WIN32
-	s_lib = LoadLibraryA("vulkan-1.dll");
 	if (s_lib)
 		s_gipa = (PFN_vkGetInstanceProcAddr)(void *)GetProcAddress(s_lib, "vkGetInstanceProcAddr");
 #else
-	s_lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
 	if (s_lib)
 		s_gipa = (PFN_vkGetInstanceProcAddr)dlsym(s_lib, "vkGetInstanceProcAddr");
 #endif

@@ -1,14 +1,25 @@
-/* Platform abstraction layer, macOS x86-64. pal_linux.c's interface, on Mach.
+/* Platform abstraction layer, macOS, on x86-64 and on Apple silicon.
+ * pal_linux.c's interface, on Mach.
  *
  * A block is ONE set of pages seen twice: at the guest's fixed address,
- * protection-managed, and at the host's always-writable mirror. Linux makes
- * that a memfd mapped twice. macOS has no memfd, and a view of shared memory
- * that has been writable will not later run code, so the "handle" here is a
- * first view nobody touches, which owns the pages, and every view mapped
- * from it is a mach_vm_remap of it (copy = FALSE): both views see every
- * write, and each has a protection of its own. Measured on macOS 27 under
- * Rosetta 2: a write through one view is seen by the other, and a view made
- * RX runs what the other view wrote. */
+ * where it runs, and wherever the host keeps its own view. On Linux that is
+ * a memfd mapped twice. macOS has no memfd, and will not run code from a view
+ * of shared memory that has ever been writable anywhere (mprotect to RX
+ * answers EACCES, measured on macOS 27), and guest code is exactly that. So
+ * the "handle" here is a first view nobody touches, which owns the pages,
+ * and every view mapped from it is a mach_vm_remap of it (copy = FALSE): both
+ * views see every write, and each has a protection of its own. Measured on
+ * macOS 27, natively on Apple silicon and under Rosetta 2: a write through
+ * one view is seen by the other, and a view made RX runs what the other view
+ * wrote.
+ *
+ * On Apple silicon nothing is ever writable and executable at once: mmap and
+ * mprotect refuse PROT_WRITE|PROT_EXEC outside MAP_JIT memory, and MAP_JIT
+ * memory cannot be placed at a fixed address or remapped. Code the host
+ * writes at run time (the thunks) is therefore written through a second,
+ * writable view (mb_pal_map_code), on both CPUs, so that the two Macs run the
+ * same way; guest pages the guest asks to be RWX are memblock's business (see
+ * mb_page_native_prot). */
 #if defined(__APPLE__)
 #include "minibox_internal.h"
 #include <errno.h>
@@ -23,7 +34,7 @@ static int prot_to_native(mb_prot prot) {
 		case MB_PROT_R:       return PROT_READ;
 		case MB_PROT_RW:      return PROT_READ | PROT_WRITE;
 		case MB_PROT_RX:      return PROT_READ | PROT_EXEC;
-		case MB_PROT_RWX:     return PROT_READ | PROT_WRITE | PROT_EXEC;
+		case MB_PROT_RWX:     return PROT_READ | PROT_WRITE | PROT_EXEC;   /* refused on Apple silicon */
 		case MB_PROT_RWSTACK: return PROT_READ | PROT_WRITE;
 	}
 	return PROT_NONE;
@@ -103,5 +114,27 @@ int mb_pal_commit(mb_handle h, mb_range addr, mb_prot prot) {
  * pieces). */
 uintptr_t mb_pal_release_unit(mb_handle h) { (void)h; return 0; }
 int mb_pal_release(mb_handle h, uintptr_t offset, uintptr_t len) { (void)h; (void)offset; (void)len; return -1; }
+
+/* Code the host writes and the guest runs: one set of pages, an RX view to
+ * run and an RW view to write (pal_linux.c's gives one RWX view as both). */
+int mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write) {
+	mb_range in = { 0, size };
+	if (mb_pal_map_anon(in, MB_PROT_RW, write) != 0) return -1;
+	uintptr_t at;
+	if (remap(write->start, size, 0, &at) != 0) { mb_pal_unmap_anon(*write); return -1; }
+	if (mprotect((void *)at, size, PROT_READ | PROT_EXEC) != 0) {
+		munmap((void *)at, size);
+		mb_pal_unmap_anon(*write);
+		return -1;
+	}
+	exec->start = at;
+	exec->size = size;
+	return 0;
+}
+
+void mb_pal_unmap_code(mb_range exec, mb_range write) {
+	munmap((void *)exec.start, exec.size);
+	munmap((void *)write.start, write.size);
+}
 
 #endif

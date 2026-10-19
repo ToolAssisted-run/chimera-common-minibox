@@ -19,6 +19,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 /* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
  * (see sample_fn) */
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -386,7 +390,7 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	 * (aarch64 has no direction flag.) */
 #if defined(__x86_64__)
 	__asm__ volatile("cld" ::: "memory");
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	/* entered on the guest's gs block; everything below is host C and libc,
 	 * which find their thread through the OS's (minibox_internal.h). Inline
 	 * asm, nothing called before it. */
@@ -448,7 +452,7 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	/* the guest's back: whichever guest thread runs on from here, they share
 	 * one set, as every other register this boundary does not swap */
 	mb_fpu_set(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	mb_gs_set(gs_block);
 #endif
 	return res;
@@ -1320,8 +1324,11 @@ static void *sample_fn(void *arg) {
 		if (h && h->active) {
 			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
 			uint64_t words[12];
-#ifdef __APPLE__
-			const ssize_t got = -1;   /* no process_vm_readv */
+#if defined(__APPLE__)
+			/* Mach's equivalent: an unmapped page is an error, not a fault */
+			mach_vm_size_t read = 0;
+			const ssize_t got = mach_vm_read_overwrite(mach_task_self(), rsp, sizeof words,
+				(mach_vm_address_t)(uintptr_t)words, &read) == KERN_SUCCESS ? (ssize_t)read : -1;
 #else
 			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
 			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);

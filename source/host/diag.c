@@ -73,6 +73,8 @@ void mb_diag_banner(const char *what) {
 
 #if defined(_WIN32)
 #define MB_TARGET_OS "windows"
+#elif defined(__APPLE__)
+#define MB_TARGET_OS "macos"
 #else
 #define MB_TARGET_OS "linux"
 #endif

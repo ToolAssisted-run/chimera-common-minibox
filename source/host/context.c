@@ -13,7 +13,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stddef.h>
-#ifndef __APPLE__
+#if defined(__linux__)
 #include <sys/auxv.h>
 #endif
 #else
@@ -110,7 +110,7 @@ uintptr_t *mb_thread_block(void) { return g_tib; }
 #endif
 
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 #include <pthread.h>
 /* This thread's gs base as the OS has it: &pthread_self()->tsd[0]. Nothing
  * reads it directly, so it is found the way it is laid out - a pthread key's
@@ -293,7 +293,7 @@ static uintptr_t call_guest_simple_fs(uintptr_t entry, mb_context *c) {
 	/* the context the fault handlers judge a fault against is the one running
 	 * now - for every guest, as the entry thunks set it */
 	mb_guest_ctx = c;
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	/* the guest runs on its own gs (minibox_internal.h): in for the call,
 	 * and the OS's back before any host code */
 	mb_gs_to_guest();
@@ -347,7 +347,10 @@ uintptr_t mb_get_callback_ptr(uintptr_t slot) {
 #define THUNK_ARENA (16u * MB_PAGESIZE)
 #define THUNK_CAP (THUNK_ARENA / THUNK_SIZE)
 struct mb_thunks {
-	mb_range mem;
+	mb_range mem;      /* where the thunks run */
+	mb_range wmem;     /* where they are written: mem itself, or (macOS, which
+	                      maps nothing writable and executable at once) a
+	                      writable view of the same pages */
 	uintptr_t entries[THUNK_CAP];
 	uintptr_t ptrs[THUNK_CAP];
 	size_t count;
@@ -359,14 +362,13 @@ struct mb_thunks {
 
 mb_thunks *mb_thunks_new(void) {
 	mb_thunks *t = (mb_thunks *)calloc(1, sizeof(mb_thunks));
-	mb_range in = { 0, THUNK_ARENA };
-	if (mb_pal_map_anon(in, MB_PROT_RWX, &t->mem) != 0) { free(t); return NULL; }
+	if (mb_pal_map_code(THUNK_ARENA, &t->mem, &t->wmem) != 0) { free(t); return NULL; }
 	return t;
 }
 
 void mb_thunks_free(mb_thunks *t) {
 	if (!t) return;
-	mb_pal_unmap_anon(t->mem);
+	mb_pal_unmap_code(t->mem, t->wmem);
 	free(t);
 }
 
@@ -398,7 +400,8 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
+	uint8_t *const wbase = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	uint8_t *p = wbase;
 	/* The thunk only says which call this is. Everything a call needs - the %fs
 	 * swap a Rust guest wants, the escape record a guest that dies returns
 	 * through - is one routine in guarded.S, entered with r10 = context and
@@ -427,14 +430,14 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 #else
 #error "miniBox runs on x86-64 and aarch64 only"
 #endif
-	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
+	if ((size_t)(p - wbase) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
 		 * later as a call into the middle of an instruction. */
 		fprintf(stderr, "miniBox: thunk of %zu bytes does not fit THUNK_SIZE %d\n",
-		        (size_t)(p - (uint8_t *)addr), THUNK_SIZE);
+		        (size_t)(p - wbase), THUNK_SIZE);
 		abort();
 	}
-	__builtin___clear_cache((char *)addr, (char *)p);   /* aarch64: publish the code */
+	__builtin___clear_cache((char *)addr, (char *)addr + (p - wbase));   /* aarch64: publish the code */
 	t->entries[t->count] = guest_entry;
 	t->ptrs[t->count] = addr;
 	t->count++;
@@ -486,7 +489,9 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
+	/* written through the thunks' writable view (mb_pal_map_code) */
+	uint8_t *const w = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	uint8_t *p = w;
 	/* Every guest's callbacks are wrapped for the floating-point control
 	 * words (see mb_context): the guest's are kept in the context and the
 	 * host's loaded for the callback, then the guest's loaded again - a host
@@ -507,7 +512,7 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	const bool swap_fs = mb_fs_swap && c->fs_swap;
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
 	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	/* the callback runs on the OS's gs (minibox_internal.h); mb_gs_to_host
 	 * keeps every register, the arguments among them */
 	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_host); /* mov r11, mb_gs_to_host */
@@ -532,7 +537,7 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);             /* mov rax, [r10] (thread_area, live) */
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	}
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 	/* back on the guest's gs, with the callback's result (r11) kept */
 	emit8(&p, 0x41); emit8(&p, 0x53);                                  /* push r11: the result, across the call */
 	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_guest); /* mov r11, mb_gs_to_guest */
@@ -542,7 +547,7 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
 #endif
 	emit8(&p, 0xc3);                                                   /* ret */
-	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) abort();           /* the size was checked above for THUNK_SIZE */
+	if ((size_t)(p - w) > THUNK_SIZE) abort();                         /* the size was checked above for THUNK_SIZE */
 	t->ext_entries[t->ext_count] = cb;
 	t->ext_ptrs[t->ext_count] = addr;
 	t->ext_count++;

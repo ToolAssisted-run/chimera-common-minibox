@@ -32,15 +32,21 @@ subdir('source/host')
 build_guest_toolchain = not meson.is_cross_build()
 
 # The compiler guests are built with: one that makes ELF for the machine's CPU,
-# whatever the host's own objects are. By default the host's gcc; -Dguest_cc
-# names another (a cross gcc, for a host whose own compiler does not make ELF).
+# whatever the host's own objects are. On Linux that is the host's gcc. On
+# macOS the host's compiler makes Mach-O, so it is a cross gcc - Homebrew's
+# aarch64-elf-gcc (bare metal: the guest brings its own libc, musl, and needs
+# only gcc's libgcc). -Dguest_cc names another.
 waterbox_guest_cc = get_option('guest_cc')
 if build_guest_toolchain and waterbox_guest_cc == ''
-  waterbox_guest_cc = 'gcc'
+  if host_machine.system() == 'darwin'
+    waterbox_guest_cc = host_machine.cpu_family() + '-elf-gcc'
+  else
+    waterbox_guest_cc = 'gcc'
+  endif
 endif
 if build_guest_toolchain and not find_program(waterbox_guest_cc, required: false).found()
-  # the host still builds and its unit tests still run; a guest built
-  # elsewhere runs through it (tests/runner)
+  # (macOS: brew install aarch64-elf-gcc) - the host still builds and its unit
+  # tests still run; a guest built on Linux runs through it (tests/runner)
   warning('no guest compiler (' + waterbox_guest_cc + '): the guest toolchain, the guests and their tests are skipped')
   build_guest_toolchain = false
 endif

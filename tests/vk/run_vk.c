@@ -59,6 +59,13 @@ static int failures;
 static int first_device_name(char *out, size_t size)
 {
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+#ifdef __APPLE__
+	/* MoltenVK is listed only to an instance that asks for portability drivers */
+	static const char *const portability[] = { "VK_KHR_portability_enumeration" };
+	ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+	ici.enabledExtensionCount = 1;
+	ici.ppEnabledExtensionNames = portability;
+#endif
 	VkInstance instance = VK_NULL_HANDLE;
 	PFN_vkCreateInstance create = (PFN_vkCreateInstance)native_lookup("vkCreateInstance");
 	if (!create || create(&ici, NULL, &instance) != VK_SUCCESS)
@@ -88,11 +95,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "SKIP: %s\n", err);
 		return 77;
 	}
-#ifdef _WIN32
-	s_native_lib = (void *)LoadLibraryA("vulkan-1.dll");
-#else
-	s_native_lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-#endif
+	s_native_lib = chimera_vk_host_open_loader();
 	char device[256] = "";
 	if (!s_native_lib || !first_device_name(device, sizeof device)) {
 		fprintf(stderr, "SKIP: this machine's Vulkan loader has no device\n");

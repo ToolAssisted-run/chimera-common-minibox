@@ -588,6 +588,24 @@ bool mb_page_readable(uintptr_t p) {
 	if (mbi.State != MEM_COMMIT) return false;
 	return (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 }
+#elif defined(__APPLE__)
+/* Mach's own answer, which is one trap and no allocation - safe in the
+ * fault handler as /proc is on Linux. A page counts when the region that
+ * holds it starts at or below it and lets it be read. */
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+bool mb_page_readable(uintptr_t p) {
+	mach_vm_address_t addr = p;
+	mach_vm_size_t size = 0;
+	vm_region_basic_info_data_64_t info;
+	mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object = MACH_PORT_NULL;
+	if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+	                   (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+		return false;
+	if (addr > p) return false;   /* the next region up: p itself is unmapped */
+	return (info.protection & VM_PROT_READ) != 0;
+}
 #elif defined(__linux__)
 /* Raw open/read only: no stdio, no allocation - this runs inside the fault
  * handler (and stdio already bit us once, with RPCS3). A page counts when
@@ -683,7 +701,7 @@ static void say_guest_stack(uintptr_t rsp) {
 void mb_tripguard_say_guest_stack(uintptr_t rsp) { say_guest_stack(rsp); }
 
 #ifndef _WIN32
-/* ---- Linux: SIGSEGV via sigaction, chaining to the previous handler ---- */
+/* ---- Linux and macOS: SIGSEGV via sigaction, chaining to the previous handler ---- */
 #include <signal.h>
 #ifdef __APPLE__
 #include <sys/ucontext.h>
@@ -735,13 +753,31 @@ typedef uint64_t greg_t;
 #define MB_GREG_ERR .gregs[REG_ERR]
 #endif
 #include <sys/mman.h>
+/* What had the fault signals before. macOS reports a write to a mapped page
+ * that is read-only - every trip - as SIGBUS, and an access to no mapping as
+ * SIGSEGV; Linux says SIGSEGV for both. */
 static struct sigaction g_old_segv;
-static struct sigaction g_old_bus;   /* macOS: a protection fault is SIGBUS */
-#define g_old_sa (*(sig == SIGBUS ? &g_old_bus : &g_old_segv))
+static struct sigaction g_old_bus;
+static struct sigaction *old_fault_action(int sig) { return sig == SIGBUS ? &g_old_bus : &g_old_segv; }
 
 /* The interrupted context, per CPU: where it was, its stack, and whether the
  * access that faulted was a write. */
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__APPLE__)
+#define UC_PC(uc) ((uc)->uc_mcontext->__ss.__pc)
+#define UC_SP(uc) ((uc)->uc_mcontext->__ss.__sp)
+/* Darwin hands the handler the fault's syndrome as it is: a data abort's WnR
+ * bit (6) says write. */
+static bool uc_write(const ucontext_t *uc) {
+	const uint32_t esr = uc->uc_mcontext->__es.__esr;
+	const unsigned ec = (esr >> 26) & 0x3f;
+	return (ec == 0x24 || ec == 0x25) && (esr & (1u << 6)) != 0;
+}
+/* an instruction abort: the fault was fetching code */
+static bool uc_exec(const ucontext_t *uc) {
+	const unsigned ec = (uc->uc_mcontext->__es.__esr >> 26) & 0x3f;
+	return ec == 0x20 || ec == 0x21;
+}
+#elif defined(__aarch64__)
 #define UC_PC(uc) ((uc)->uc_mcontext.pc)
 #define UC_SP(uc) ((uc)->uc_mcontext.sp)
 /* The kernel puts the fault's syndrome (ESR_EL1) in a record of its own in the
@@ -775,10 +811,18 @@ static bool uc_write(const ucontext_t *uc) { return (uc->uc_mcontext MB_GREG_ERR
 
 static void say_uc_regs(const ucontext_t *uc) {
 #if defined(__aarch64__)
+#if defined(__APPLE__)
+	/* x0-x28, then fp (x29) and lr (x30) under their own names */
+	unsigned long long x[31];
+	for (int i = 0; i < 29; i++) x[i] = uc->uc_mcontext->__ss.__x[i];
+	x[29] = uc->uc_mcontext->__ss.__fp;
+	x[30] = uc->uc_mcontext->__ss.__lr;
+#else
 	const unsigned long long *x = (const unsigned long long *)uc->uc_mcontext.regs;
-	mb_diag(" pc=%p sp=%p\n", (void *)uc->uc_mcontext.pc, (void *)uc->uc_mcontext.sp);
+#endif
+	mb_diag(" pc=%p sp=%p\n", (void *)(uintptr_t)UC_PC(uc), (void *)(uintptr_t)UC_SP(uc));
 	for (int i = 0; i < 31; i++) mb_diag(" x%d=%p%s", i, (void *)(uintptr_t)x[i], (i % 6 == 5 || i == 30) ? "\n" : "");
-	const uintptr_t ip = (uintptr_t)uc->uc_mcontext.pc;
+	const uintptr_t ip = (uintptr_t)UC_PC(uc);
 	if (ip < 0x10000 || !mb_page_readable(ip) || !mb_page_readable(ip + 15)) {
 		mb_diag(" code: (pc is not readable memory)\n");
 		return;
@@ -1138,7 +1182,7 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	 * blocked, and is said all the same in case it ever does. */
 	if (g_fault_depth > 0 && (g_fault_phase != MB_PHASE_GUEST || g_fault_depth >= MB_FAULT_DEPTH_MOST)) {
 		sigsafe_report_nested(fault, (uintptr_t)UC_PC(uc));
-		signal(SIGSEGV, SIG_DFL);
+		signal(sig, SIG_DFL);
 		return;  /* the instruction runs again and the default action takes it */
 	}
 	if (g_fault_depth == 0) {
@@ -1150,7 +1194,15 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	trail_add(fault, (uintptr_t)UC_PC(uc),
 	          (uintptr_t)UC_SP(uc), write ? 1 : 0);
 	trail_stage(1);
+#if defined(__APPLE__) && defined(__aarch64__)
+	/* a page the guest may write and run, mapped for the other one (memblock's
+	 * os_prot): not a fault of anybody's, only the flip macOS needs */
+	mb_block *wx = owner_of(fault);
+	bool tripped = wx != NULL && mb_block_wx_flip(wx, fault, uc_exec(uc), write);
+	tripped = tripped || (write && trip(fault));
+#else
 	bool tripped = write && trip(fault);
+#endif
 	trail_stage(2);
 	bool asked = tripped ? false : send_to_guest(uc, fault, write, !rip_in_guest((uintptr_t)UC_PC(uc)));
 	trail_stage(3);
@@ -1166,8 +1218,9 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 		 * faults into exceptions all day. Only a guest's own fault is one miniBox
 		 * can call unhandled (issue #82 read a handled exception as four crashes). */
 		const bool guest_code = code_in_guest((uintptr_t)UC_PC(uc));
-		const bool handler_follows = (g_old_sa.sa_flags & SA_SIGINFO)
-			|| (g_old_sa.sa_handler != SIG_DFL && g_old_sa.sa_handler != SIG_IGN);
+		const struct sigaction *old = old_fault_action(sig);
+		const bool handler_follows = (old->sa_flags & SA_SIGINFO)
+			|| (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN);
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
 		if (guest_code)
 			mb_diag("[tripguard] unhandled fault: addr=%p %s rip=%p, %s",
@@ -1221,13 +1274,14 @@ static void handler_inner(int sig, siginfo_t *info, void *ucontext) {
 	}
 	g_fault_depth--;
 	if (rethrow) {
-		if (g_old_sa.sa_flags & SA_SIGINFO)
-			g_old_sa.sa_sigaction(sig, info, ucontext);
-		else if (g_old_sa.sa_handler == SIG_DFL || g_old_sa.sa_handler == SIG_IGN) {
+		const struct sigaction *old = old_fault_action(sig);
+		if (old->sa_flags & SA_SIGINFO)
+			old->sa_sigaction(sig, info, ucontext);
+		else if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) {
 			signal(sig, SIG_DFL);
 			raise(sig);
 		} else
-			g_old_sa.sa_handler(sig);
+			old->sa_handler(sig);
 	}
 }
 
@@ -1562,7 +1616,8 @@ static void initialize(void) {
 	if (sigaction(SIGILL, &other, &g_old_ill) != 0 || sigaction(SIGFPE, &other, &g_old_fpe) != 0) {
 		perror("miniBox sigaction"); abort();
 	}
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__APPLE__)
+	/* (on macOS SIGBUS is a fault signal, installed above) */
 	if (sigaction(SIGBUS, &other, &g_old_bus) != 0) { perror("miniBox sigaction"); abort(); }
 #endif
 #if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)

@@ -103,6 +103,12 @@ void     mb_pal_unmap_handle(mb_handle h, mb_range addr);
 int      mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out);
 void     mb_pal_unmap_anon(mb_range addr);
 int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
+/* Memory for code the host writes at run time (the thunks): `exec` runs it,
+ * `write` is where it is written. One RWX mapping on Linux and Windows
+ * (write == exec); on macOS, which refuses a page both writable and
+ * executable, two views of the same pages, RX and RW. */
+int      mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write); /* 0 ok */
+void     mb_pal_unmap_code(mb_range exec, mb_range write);
 /* Lazy blocks (handle.lazy): back a range of a reserved section with the given
  * protection. On Linux nothing is ever lazy and this is mprotect. */
 int      mb_pal_commit(mb_handle h, mb_range addr, mb_prot prot);   /* 0 ok */
@@ -136,6 +142,10 @@ typedef struct {
 	mb_snap_kind snap_kind;
 	uint8_t *snap_data;  /* MB_PAGESIZE bytes when snap_kind==DATA, else NULL */
 	bool uncommitted;    /* lazy blocks only: neither view is backed yet (reads as zero) */
+	/* macOS only, and read for the first page of a host page: a host page
+	 * the guest may both write and run is mapped RX when set, RW when not -
+	 * whichever access it last faulted for (mb_block_wx_flip). */
+	bool wx_exec;
 	/* ---- epochs (see mb_block_epoch_begin) ----
 	 * dirty says "changed since the baseline", which only ever grows.
 	 * epoch_dirty says "changed since a MOMENT", so a caller can ask what one
@@ -707,7 +717,7 @@ extern bool mb_fs_swap;
 extern uintptr_t mb_early_tp;
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
 /* ---- %gs on macOS ------------------------------------------------------
  *
  * The guest reaches its context through [gs:0x18] (and the blob keeps its
@@ -924,6 +934,11 @@ static inline size_t mb_group_pages(void) { return (size_t)1 << (mb_host_page_sh
 /* Give the host page holding machine page pi the protection its whole group
  * calls for. What the fault handler does after letting a write through. 0 ok. */
 int     mb_block_protect_group(mb_block *b, size_t pi);
+/* macOS, which maps nothing writable and executable at once: a fault on a
+ * host page the guest may both write and run, for the access its mapping
+ * does not allow right now. Remaps it for that access and answers true; false
+ * for every other fault. Elsewhere always false. From the fault handler. */
+bool    mb_block_wx_flip(mb_block *b, uintptr_t addr, bool exec, bool write);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

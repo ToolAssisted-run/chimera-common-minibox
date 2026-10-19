@@ -26,7 +26,8 @@ docs/ATTRIBUTION.md has the full component-by-component breakdown.
 ## Layout
 
 - `source/host/` - the sandbox host, in C. This is the product: builds
-  `libminiboxhost` on Linux (validated) and Windows (cross-compiled via
+  `libminiboxhost` on Linux (validated), macOS on Apple silicon (validated;
+  `pal_darwin.c`) and Windows (cross-compiled via
   mingw-w64; see `source/host/mingw-w64.ini`). A from-scratch C port of BizHawk's
   Rust waterboxhost (the historical reference, in the BizHawk repo and this
   repo's git history); no Rust or nightly toolchain is needed.
@@ -63,6 +64,22 @@ meson setup build/meson-cpp -Dguest_cpp=true
 meson setup   build/meson-windows --cross-file source/host/mingw-w64.ini
 ninja compile -C build/meson-windows
 ```
+
+On macOS (Apple silicon) the host's own compiler makes Mach-O, so guests are
+built with a cross gcc - Homebrew's bare-metal one, which needs nothing but
+its libgcc (the guest brings musl). Without it the host and its unit tests
+still build, and a guest built on Linux runs through it (`tests/runner`).
+The Vulkan bridge uses Homebrew's loader and MoltenVK when they are there.
+
+```
+brew install meson ninja aarch64-elf-gcc   # (vulkan-loader molten-vk: the bridge's tests)
+meson setup build/meson-macos             # -Dguest_cc=<gcc> names another guest compiler
+meson test  -C build/meson-macos
+```
+
+macOS keeps nothing of the guest's in TPIDR_EL0 or x18, so an aarch64 guest
+uses neither: see MACHINE-SPEC.md, "aarch64". Its pages are 16 KiB, so a guest
+that exports GuestFaultHandler is refused there, as on Asahi Linux.
 
 ## Consumption
 
