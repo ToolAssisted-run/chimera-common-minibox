@@ -35,6 +35,7 @@ Two fixed absolute regions exist regardless of the guest:
 | `0x35f00000200` | `call_guest_impl` entry |
 | `0x35f00000300` | extcall thunk table (64 slots x 16 bytes) |
 | `0x36f00000000` | conventional guest ELF load base (the guest is linked here) |
+| `0x36ef0000000` | aarch64 only: the guest's thread pointer, one 8-byte word (see "aarch64") |
 
 The interop area is a fixed 2088-byte machine-code blob (`context/interop.bin`,
 assembled from `interop.s`); it is the SAME bytes in every implementation and is
@@ -475,6 +476,13 @@ thunk, so that its own system calls (unprotecting the page) work. Before
 ended the process (Chimera issue 280). Not observable to a guest that handles
 its faults: it is now called where it used to kill the host.
 
+The machine's page is 4 KiB on every host, and a host whose own page is larger
+(16 KiB on Apple silicon) protects the machine pages that share one host page
+together. A page the guest protects beside one it left open is then not
+protected, and the access the handler is waiting for never faults. Such a host
+cannot keep this section, so it refuses a guest that exports
+GuestFaultHandler at creation, saying why, rather than run it differently.
+
 A frontend that only READS guest memory - its memory tools, between frames,
 on a thread of its own - does not go through the guest's view at all
 (2026-10-18). Read there, a page the guest protected faults, the handler runs
@@ -716,3 +724,68 @@ The revision is independent of the machine-spec version: v2 and v3 cores alike
 get the corrected answers once rebuilt. A rebuilt core is a new package, with
 its own hash, so a project pinned to the old package keeps the old answers.
 
+
+## aarch64 (2026-10-19)
+
+The sections above describe the x86-64 machine. The aarch64 machine is the
+same machine for an aarch64 guest on an aarch64 host - layout, syscall
+numbers, savestate - except where its CPU makes it differ. A package carries
+code for one CPU and must run on every OS a host is built for (Linux, macOS,
+Windows), so the aarch64 machine keeps clear of what those OSes disagree on:
+
+- **x18 is not the guest's.** It is the platform register: Linux lends it to
+  code, Windows keeps the thread's TEB in it, and macOS zeroes it when it
+  likes. Guest code is built with `-ffixed-x18` (the guest kit's flags and its
+  musl-gcc specs) and must neither read nor write it.
+- **TPIDR_EL0 is not the guest's either.** macOS writes the CPU number into
+  it at every context switch, so nothing the guest leaves there survives. The
+  guest's thread pointer is instead the 8-byte word at `0x36ef0000000`, 256
+  MiB below the link base (an `adrp` in the first 3.75 GiB of the image
+  reaches it). The host maps it read-write, keeps it, and writes it on every
+  entry into guest code and on every return from a system call; it is not part
+  of guest memory and is not savestated (the thread pointer of each guest
+  thread is, as before). The guest reads it and never writes it: it sets its
+  thread pointer with set_thread_area (205), as on x86-64's host side.
+  - musl reads the word directly (`__pthread_self`).
+  - Compiled code knows only `mrs xN, tpidr_el0`, so the guest kit rewrites
+    every one of those once the image is linked (`wbx-tp-rewrite.py`, run by
+    `waterbox_guest_link`): each becomes a branch to a three-instruction
+    trampoline (`adrp xN, 0x36ef0000000; ldr xN, [xN]; b back`) in a segment
+    of its own (section `.wbx_tp`) after everything else the image loads. An
+    `msr tpidr_el0` in guest code is refused.
+  - So a rewritten aarch64 image contains no TPIDR_EL0 access at all, and runs
+    the same on every OS.
+- **Exported calls, system calls and callbacks** follow AAPCS64: the guest
+  calls `guest_syscall` (0x35f00000080) with `blr`, the number in x8 and the
+  arguments in x0-x5; on entering an export every vector register reads zero,
+  and so do x19-x28 and the frame pointer, and after a syscall or a callback
+  every scratch register but x0 does (interop_aarch64.S, guarded_aarch64.S).
+- **The floating-point control words** (section 9) are FPCR alone, which a
+  guest starts at 0 (round to nearest, no flush-to-zero, no default NaN: what
+  Linux gives a process and musl assumes). It is loaded and kept at the same
+  boundaries as x86-64's words, and GuestFpuState1 carries it in the MXCSR
+  field, with 0 for the x87 word. FPSR, which holds the cumulative exception
+  flags MXCSR keeps on x86-64, is not swapped: a guest that reads its flags
+  after a syscall or a callback may find the host's added.
+- **The guest's fault handler** runs on the faulting thread's stack, as on
+  x86-64, from a trampoline in the host (guarded_aarch64.S). aarch64 cannot
+  branch back to the faulting instruction without a register to hold its
+  address, so the trampoline ends in a `udf` whose SIGILL the host answers by
+  putting every general register, sp, the flags and the pc back; the vector
+  registers, FPSR and FPCR the trampoline puts back itself.
+- **Faults.** A jump to an address that is not a multiple of 4 is a SIGBUS on
+  aarch64 (a SIGSEGV on x86-64); in guest code it is the guest's death like
+  any other crash. The interop context word (0x35f00010000, x86-64's gs:0x18)
+  is set while a thread is in a guest call and cleared while it runs host
+  code, so a fault outside the guest's memory is judged the same way.
+- **Pages.** The machine's page is 4 KiB here too. A host whose pages are
+  larger (16 KiB: macOS, Asahi Linux; 64 KiB) protects whole host pages, so a
+  guest that exports GuestFaultHandler is refused there (see "Guest fault
+  forwarding"). macOS also maps nothing writable and executable at once: a
+  page the guest maps RWX is backed as RW or RX, whichever it last needed,
+  which the guest cannot tell from RWX.
+
+An aarch64 image built before the thread-pointer slot (2026-10-19) still reads
+TPIDR_EL0, where no host keeps the guest's pointer any more, and is refused at
+load (an image with no `.wbx_tp` section that reads the register). Rebuilt
+with the current guest kit, the same source is a different package.

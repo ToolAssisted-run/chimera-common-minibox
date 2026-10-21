@@ -437,6 +437,21 @@ const mb_layout *mb_tripguard_layout(void);
 /* ---- context.c: host<->guest transitions (interop.bin at 0x35f00000000) ---- */
 #define MB_ORG            0x35f00000000ull
 #define MB_CALLBACK_SLOTS 64
+#if defined(__aarch64__)
+/* aarch64: the one word the interop blob reads the running context from, in
+ * place of x86-64's gs:0x18 (interop_aarch64.S). 64 KiB past MB_ORG, so it is
+ * a page of its own on every host the blob's code page is not. */
+#define MB_INTEROP_SLOT   (MB_ORG + 0x10000ull)
+/* aarch64: the guest's thread pointer, one word at a fixed address (MACHINE-
+ * SPEC, "aarch64"). Not TPIDR_EL0: macOS writes the CPU number there at every
+ * context switch, so no value of the guest's survives in it. Guest code reads
+ * this word instead - musl directly, and every `mrs xN, tpidr_el0` the
+ * compiler emitted through the trampolines wbx-tp-rewrite.py links in - and
+ * only the host writes it. 256 MiB below the guest's link base, so an adrp in
+ * the first 3.75 GiB of the image reaches it; 64 KiB-aligned, so it is a page
+ * of its own on every host. */
+#define MB_TP_SLOT        0x36ef0000000ull
+#endif
 
 /* The interop blob and the guest are ALWAYS sysv64, whatever the host is. On a
  * Windows host, every function pointer that the blob calls, or that calls into
@@ -528,6 +543,7 @@ static inline int mb_stop_due(mb_context *c) {
 	return 1;
 }
 
+#if defined(__x86_64__)
 #define MB_GUEST_FCW_START   0x037F
 #define MB_GUEST_MXCSR_START 0x1F80
 
@@ -539,6 +555,27 @@ static inline void mb_fpu_get(uint16_t *fcw, uint32_t *mxcsr) {
 static inline void mb_fpu_set(const uint16_t *fcw, const uint32_t *mxcsr) {
 	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(*fcw), "m"(*mxcsr));
 }
+#elif defined(__aarch64__)
+/* aarch64 has one control register, FPCR (rounding, flush-to-zero, default
+ * NaN; its upper half is reserved), kept in the MXCSR field; the x87 word
+ * field is always 0. A guest starts at 0: round to nearest, no flushing, what
+ * Linux gives a new process and what musl assumes. */
+#define MB_GUEST_FCW_START   0
+#define MB_GUEST_MXCSR_START 0
+
+static inline void mb_fpu_get(uint16_t *fcw, uint32_t *mxcsr) {
+	uint64_t v;
+	__asm__ volatile("mrs %0, fpcr" : "=r"(v));
+	*fcw = 0;
+	*mxcsr = (uint32_t)v;
+}
+static inline void mb_fpu_set(const uint16_t *fcw, const uint32_t *mxcsr) {
+	(void)fcw;
+	__asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)*mxcsr));
+}
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 /* guarded.S: the one way into the guest for an exported call, and the two ways
  * out of it for a guest that dies - from host C, or from a fault handler that
@@ -591,6 +628,24 @@ void mb_tripguard_stop_signal_install(void);
  * (it shows up much later as the guest's own malloc returning a bad pointer). */
 static inline uintptr_t mb_rdfsbase(void) { uintptr_t v; __asm__ volatile("rdfsbase %0" : "=r"(v) :: "memory"); return v; }
 static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("wrfsbase %0" :: "r"(v) : "memory"); }
+#elif defined(__aarch64__)
+/* aarch64's guest thread pointer is the word at MB_TP_SLOT, and "%fs" below
+ * means that word. EVERY aarch64 guest is a swapping guest - fs_swap is always
+ * on - and the probe always says yes. Unlike x86-64's %fs it is nobody else's:
+ * the host's own thread pointer (TPIDR_EL0 on Linux, TPIDRRO_EL0 on macOS) is
+ * never touched, so host code is safe whatever the word holds, and swapping
+ * it back around host code only keeps the bookkeeping the x86-64 path shares.
+ * It is also one word for the process, not one per thread: only the thread
+ * running the guest may write it (one machine is entered at a time, as the
+ * interop slot already assumes). */
+#define MB_HAVE_FSBASE 1
+#define MB_TP_IN_MEMORY 1
+static inline uintptr_t mb_rdfsbase(void) { return *(volatile uintptr_t *)MB_TP_SLOT; }
+static inline void mb_wrfsbase(uintptr_t v) { __asm__ volatile("" ::: "memory"); *(volatile uintptr_t *)MB_TP_SLOT = v; __asm__ volatile("" ::: "memory"); }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+#ifdef MB_HAVE_FSBASE
 bool mb_fsbase_ok(void);
 /* Plain global, not a call: the dispatcher must decide whether to swap BEFORE
  * it may safely call anything (it is entered on the guest's %fs). */
@@ -631,20 +686,31 @@ extern uintptr_t mb_early_tp;
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
 void      mb_prepare_thread(void);              /* install gs base once per host thread */
 #ifndef _WIN32
+#define MB_HIDDEN __attribute__((visibility("hidden")))
+/* the trampolines that run the guest's fault handler on the faulting thread's
+ * own stack (guarded.S, guarded_aarch64.S; tripguard.c) */
+MB_HIDDEN void mb_fault_tramp_guest(void), mb_fault_tramp_guest_end(void);
+MB_HIDDEN void mb_fault_tramp_host(void), mb_fault_tramp_host_end(void);
+#if defined(__x86_64__)
 /* this host thread's block at the gs base (context.c), and the words in it
- * that hand a fault to the trampoline that runs the guest's fault handler on
- * the faulting thread's own stack (guarded.S, tripguard.c) */
+ * that hand a fault to the trampoline */
 uintptr_t *mb_thread_block(void);
 #define MB_TIB_FAULT_FN       4   /* the function to call (guest ABI) */
 #define MB_TIB_FAULT_RIP      5   /* the interrupted rip, rdi and rsi */
 #define MB_TIB_FAULT_RDI      6
 #define MB_TIB_FAULT_RSI      7
 #define MB_TIB_FAULT_DECLINED 8   /* the address the handler did not claim */
-#define MB_HIDDEN __attribute__((visibility("hidden")))
-MB_HIDDEN void mb_fault_tramp_guest(void), mb_fault_tramp_guest_end(void);
-MB_HIDDEN void mb_fault_tramp_host(void), mb_fault_tramp_host_end(void);
 /* what the trampoline saves the vector state with (tripguard.c) */
 MB_HIDDEN extern uint64_t mb_xsave_size, mb_xsave_mask;
+#elif defined(__aarch64__)
+/* where each trampoline's udf is: the SIGILL that puts the registers back */
+MB_HIDDEN void mb_fault_tramp_guest_resume(void), mb_fault_tramp_host_resume(void);
+#define MB_FAULT_RECORD_WORDS 34   /* x0-x30, sp, pc, pstate */
+#define MB_FAULT_TRAMP_FRAME  816  /* the trampoline's own frame (guarded_aarch64.S) */
+#define MB_FAULT_TRAMP_ADDR   36   /* its word that holds the fault's address */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 #endif
 uintptr_t mb_call_guest_simple(uintptr_t entry, mb_context *c);
 uintptr_t mb_get_callback_ptr(uintptr_t slot); /* fixed extcall thunk address */
@@ -759,6 +825,23 @@ bool    mb_block_track_held_here(const mb_block *b);
 void    mb_block_note_dirty(mb_block *b, size_t pi, bool dirty);
 /* Do the packed maps say what the page array says? For tests. */
 bool    mb_block_maps_consistent(const mb_block *b);
+
+/* ---- the host's page (memblock.c) ----
+ *
+ * MB_PAGESIZE is the MACHINE's page, which the guest sees and which the spec
+ * fixes at 4 KiB on every host. The host's own page - the smallest thing the
+ * OS will protect - is asked of the OS at runtime and may be larger: 16 KiB on
+ * Apple silicon, 64 KiB on some aarch64 kernels. Then one host page holds a
+ * GROUP of machine pages that share one protection, and memblock protects by
+ * group (see group_native_prot). On a 4 KiB host a group is one page and every
+ * path is exactly what it was. mb_host_page_init runs at the first block's
+ * creation, outside any handler; afterwards these are plain reads. */
+extern unsigned mb_host_page_shift;   /* log2 of the host page, >= MB_PAGESHIFT */
+void    mb_host_page_init(void);
+static inline size_t mb_group_pages(void) { return (size_t)1 << (mb_host_page_shift - MB_PAGESHIFT); }
+/* Give the host page holding machine page pi the protection its whole group
+ * calls for. What the fault handler does after letting a write through. 0 ok. */
+int     mb_block_protect_group(mb_block *b, size_t pi);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

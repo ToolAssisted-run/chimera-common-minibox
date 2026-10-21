@@ -34,7 +34,7 @@ if build_guest_toolchain
     # kept the old test while the direct run had the new one
     depend_files: files('vktest.h', 'triangle-spv.h'),
     command: [
-      waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+      waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
       '-std=c11', '-D_GNU_SOURCE',
       '-I' + vk_bridge_source_dir, '-I' + vk_bridge_build_dir,
       '-I' + vk_headers_dir / 'include', '-I' + meson.current_source_dir(),

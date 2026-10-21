@@ -136,6 +136,21 @@ ECL_EXPORT int AnswersAreWritten(void) {
  * the host's (2026-10-18). Read before anything of the function can touch
  * them. */
 ECL_EXPORT __attribute__((naked)) uint64_t CalleeSavedOnEntry(void) {
+#if defined(__aarch64__)
+	/* x19-x28 and the frame pointer (d8-d15 are EntryXmm's) */
+	__asm__ volatile(
+		"orr x0, x19, x20\n\t"
+		"orr x0, x0, x21\n\t"
+		"orr x0, x0, x22\n\t"
+		"orr x0, x0, x23\n\t"
+		"orr x0, x0, x24\n\t"
+		"orr x0, x0, x25\n\t"
+		"orr x0, x0, x26\n\t"
+		"orr x0, x0, x27\n\t"
+		"orr x0, x0, x28\n\t"
+		"orr x0, x0, x29\n\t"
+		"ret");
+#elif defined(__x86_64__)
 	__asm__ volatile(
 		"movq %rbx, %rax\n\t"
 		"orq %rbp, %rax\n\t"
@@ -144,6 +159,9 @@ ECL_EXPORT __attribute__((naked)) uint64_t CalleeSavedOnEntry(void) {
 		"orq %r14, %rax\n\t"
 		"orq %r15, %rax\n\t"
 		"ret");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 
 /* A length that is not a whole number of pages is rounded up, as the kernel
@@ -160,11 +178,13 @@ ECL_EXPORT int UnalignedLengthsRoundUp(void) {
 	return 1;
 }
 
+#if defined(__x86_64__)   /* aarch64 has no direction flag */
 /* Returns with the direction flag set, which no correct function does: the
  * host must not run on with it (2026-10-18). */
 ECL_EXPORT __attribute__((naked)) int ReturnsBackwards(void) {
 	__asm__ volatile("std\n\tmovl $1, %eax\n\tret");
 }
+#endif
 
 /* A cancellable call keeps its fourth argument. With pthread_cancel linked,
  * musl makes such calls through __syscall_cp_asm, which put the fourth in r10,
@@ -184,11 +204,20 @@ ECL_EXPORT int CancellableCallKeepsItsArguments(void) {
 
 /* The floating-point control words are the guest's own (mb_context,
  * 2026-10-18): what it sees on entry, and that what it sets survives an
- * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr. */
+ * exported call, a syscall and a host callback. Read as (fcw << 32) | mxcsr;
+ * on aarch64 FPCR in the MXCSR place and 0 for the x87 word. */
 static uint64_t fpu_read(void) {
+#if defined(__aarch64__)
+	uint64_t v;
+	__asm__ volatile("mrs %0, fpcr" : "=r"(v));
+	return (uint32_t)v;
+#elif defined(__x86_64__)
 	uint16_t cw; uint32_t mx;
 	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(cw), "=m"(mx));
 	return ((uint64_t)cw << 32) | mx;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 ECL_EXPORT uint64_t FpuSeen(void) { return fpu_read(); }
 /* what the guest's start-up code (its constructors) ran with */
@@ -196,8 +225,15 @@ static uint64_t g_fpu_at_start;
 __attribute__((constructor)) static void fpu_at_start(void) { g_fpu_at_start = fpu_read(); }
 ECL_EXPORT uint64_t FpuAtStart(void) { return g_fpu_at_start; }
 ECL_EXPORT void FpuSet(uint32_t fcw, uint32_t mxcsr) {
+#if defined(__aarch64__)
+	(void)fcw;
+	__asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)mxcsr));
+#elif defined(__x86_64__)
 	const uint16_t cw = (uint16_t)fcw;
 	__asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mxcsr));
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 }
 ECL_EXPORT uint64_t FpuAfterSyscall(void) { (void)getpid(); return fpu_read(); }
 ECL_EXPORT uint64_t FpuAfterCallback(void) { if (g_log_cb) g_log_cb(0); return fpu_read(); }
@@ -453,7 +489,15 @@ ECL_EXPORT int Init(void) {
 	 * mmap is not supported. */
 	{
 		errno = 0;
+#if defined(__aarch64__)
+		/* on aarch64 it is how musl sets its thread pointer (the host keeps
+		 * TPIDR_EL0); a null one is refused and the live one stays */
+		if (syscall(SYS_set_thread_area, 0) != -1 || errno != EINVAL) return 0;
+#elif defined(__x86_64__)
 		if (syscall(SYS_set_thread_area, 0) != -1 || errno != ENOSYS) return 0;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 		errno = 0;
 		if (syscall(SYS_mmap, 0, 4096, PROT_READ, MAP_PRIVATE, 3, 0) != -1 || errno != EOPNOTSUPP) return 0;
 	}
@@ -511,6 +555,50 @@ ECL_EXPORT void Abort(void) {
  * scratch register carried into its savestates (run_guest checks both read 0).
  * Assembly, because a compiler owns r10 at every other point. brk(0) is the
  * syscall: it only reads, and the host always implements it. */
+#if defined(__aarch64__)
+/* aarch64: no single register carries the context. What a guest could find
+ * of the host is any scratch register that is neither an argument nor the
+ * answer, so each probe returns them all OR-ed together: x8-x18 on entry
+ * (x10 is the export's own address, a guest one, and left out), x1-x18 after
+ * a syscall and after a callback. */
+#define WBX_OR_SCRATCH(first) \
+	"\tmov x0, " first "\n" \
+	"\torr x0, x0, x9\n\torr x0, x0, x11\n\torr x0, x0, x12\n\torr x0, x0, x13\n" \
+	"\torr x0, x0, x14\n\torr x0, x0, x15\n\torr x0, x0, x16\n\torr x0, x0, x17\n\torr x0, x0, x18\n"
+__asm__(
+	".text\n"
+	".globl EntryR10\n.type EntryR10,%function\n"
+	"EntryR10:\n"
+	WBX_OR_SCRATCH("x8")
+	"\tret\n"
+	".globl SyscallR10\n.type SyscallR10,%function\n"
+	"SyscallR10:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tmov x0, #0\n"
+	"\tmov x8, #12\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\torr x8, x8, x1\n\torr x8, x8, x2\n\torr x8, x8, x3\n\torr x8, x8, x4\n"
+	"\torr x8, x8, x5\n\torr x8, x8, x6\n\torr x8, x8, x7\n\torr x8, x8, x10\n"
+	WBX_OR_SCRATCH("x8")
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n"
+	".globl ExtcallR10\n.type ExtcallR10,%function\n"
+	"ExtcallR10:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tadrp x1, g_log_cb\n"
+	"\tldr x1, [x1, #:lo12:g_log_cb]\n"
+	"\tcbz x1, 1f\n"
+	"\tmov x0, #0\n"
+	"\tblr x1\n"
+	"1:\n"
+	"\torr x8, x8, x1\n\torr x8, x8, x2\n\torr x8, x8, x3\n\torr x8, x8, x4\n"
+	"\torr x8, x8, x5\n\torr x8, x8, x6\n\torr x8, x8, x7\n\torr x8, x8, x10\n"
+	WBX_OR_SCRATCH("x8")
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n");
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl EntryR10\n.type EntryR10,@function\n"
@@ -543,6 +631,9 @@ __asm__(
 	"\tmov %r10, %rax\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 /* The same three boundaries for the vector registers: what the guest finds in
  * xmm0-15 on entering an export, after a syscall, and after a host callback.
@@ -553,6 +644,87 @@ __asm__(
  * used to leave its own values in them - a guest's varargs prologue spills
  * xmm0-7, and a JVM in the box carried host heap addresses into its states
  * that way (interop_bin.c). */
+#if defined(__aarch64__)
+/* aarch64: v0-v31, and AAPCS64 makes a callee keep d8-d15 (the low halves of
+ * v8-v15), so after a syscall and after a callback those halves are the
+ * guest's own ones and only the upper halves of v8-v15 are read; on entry all
+ * thirty-two are (run_guest fills every one before the call). The syscall and
+ * callback probes keep d8-d15 for their own caller. */
+#define WBX_FILL_V \
+	"\tmovi v0.2d, #0xffffffffffffffff\n\tmovi v1.2d, #0xffffffffffffffff\n\tmovi v2.2d, #0xffffffffffffffff\n\tmovi v3.2d, #0xffffffffffffffff\n" \
+	"\tmovi v4.2d, #0xffffffffffffffff\n\tmovi v5.2d, #0xffffffffffffffff\n\tmovi v6.2d, #0xffffffffffffffff\n\tmovi v7.2d, #0xffffffffffffffff\n" \
+	"\tmovi v8.2d, #0xffffffffffffffff\n\tmovi v9.2d, #0xffffffffffffffff\n\tmovi v10.2d, #0xffffffffffffffff\n\tmovi v11.2d, #0xffffffffffffffff\n" \
+	"\tmovi v12.2d, #0xffffffffffffffff\n\tmovi v13.2d, #0xffffffffffffffff\n\tmovi v14.2d, #0xffffffffffffffff\n\tmovi v15.2d, #0xffffffffffffffff\n" \
+	"\tmovi v16.2d, #0xffffffffffffffff\n\tmovi v17.2d, #0xffffffffffffffff\n\tmovi v18.2d, #0xffffffffffffffff\n\tmovi v19.2d, #0xffffffffffffffff\n" \
+	"\tmovi v20.2d, #0xffffffffffffffff\n\tmovi v21.2d, #0xffffffffffffffff\n\tmovi v22.2d, #0xffffffffffffffff\n\tmovi v23.2d, #0xffffffffffffffff\n" \
+	"\tmovi v24.2d, #0xffffffffffffffff\n\tmovi v25.2d, #0xffffffffffffffff\n\tmovi v26.2d, #0xffffffffffffffff\n\tmovi v27.2d, #0xffffffffffffffff\n" \
+	"\tmovi v28.2d, #0xffffffffffffffff\n\tmovi v29.2d, #0xffffffffffffffff\n\tmovi v30.2d, #0xffffffffffffffff\n\tmovi v31.2d, #0xffffffffffffffff\n"
+/* v0-v7 and v16-v31 OR'ed into v0, then both its halves into x0 */
+#define WBX_OR_V_SCRATCH_INTO_X0 \
+	"\torr v0.16b, v0.16b, v1.16b\n\torr v0.16b, v0.16b, v2.16b\n\torr v0.16b, v0.16b, v3.16b\n\torr v0.16b, v0.16b, v4.16b\n" \
+	"\torr v0.16b, v0.16b, v5.16b\n\torr v0.16b, v0.16b, v6.16b\n\torr v0.16b, v0.16b, v7.16b\n\torr v0.16b, v0.16b, v16.16b\n" \
+	"\torr v0.16b, v0.16b, v17.16b\n\torr v0.16b, v0.16b, v18.16b\n\torr v0.16b, v0.16b, v19.16b\n\torr v0.16b, v0.16b, v20.16b\n" \
+	"\torr v0.16b, v0.16b, v21.16b\n\torr v0.16b, v0.16b, v22.16b\n\torr v0.16b, v0.16b, v23.16b\n\torr v0.16b, v0.16b, v24.16b\n" \
+	"\torr v0.16b, v0.16b, v25.16b\n\torr v0.16b, v0.16b, v26.16b\n\torr v0.16b, v0.16b, v27.16b\n\torr v0.16b, v0.16b, v28.16b\n" \
+	"\torr v0.16b, v0.16b, v29.16b\n\torr v0.16b, v0.16b, v30.16b\n\torr v0.16b, v0.16b, v31.16b\n" \
+	"\tmov x0, v0.d[0]\n\tmov x1, v0.d[1]\n\torr x0, x0, x1\n"
+/* ...and the upper halves of v8-v15 */
+#define WBX_OR_V8_15_HIGH_INTO_X0 \
+	"\tmov x1, v8.d[1]\n\torr x0, x0, x1\n\tmov x1, v9.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v10.d[1]\n\torr x0, x0, x1\n\tmov x1, v11.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v12.d[1]\n\torr x0, x0, x1\n\tmov x1, v13.d[1]\n\torr x0, x0, x1\n" \
+	"\tmov x1, v14.d[1]\n\torr x0, x0, x1\n\tmov x1, v15.d[1]\n\torr x0, x0, x1\n"
+/* ...and the low halves of v8-v15 too: on entry */
+#define WBX_OR_V8_15_LOW_INTO_X0 \
+	"\tfmov x1, d8\n\torr x0, x0, x1\n\tfmov x1, d9\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d10\n\torr x0, x0, x1\n\tfmov x1, d11\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d12\n\torr x0, x0, x1\n\tfmov x1, d13\n\torr x0, x0, x1\n" \
+	"\tfmov x1, d14\n\torr x0, x0, x1\n\tfmov x1, d15\n\torr x0, x0, x1\n"
+#define WBX_SAVE_D8_15 \
+	"\tstp x29, x30, [sp, #-80]!\n" \
+	"\tstp d8, d9, [sp, #16]\n\tstp d10, d11, [sp, #32]\n\tstp d12, d13, [sp, #48]\n\tstp d14, d15, [sp, #64]\n"
+#define WBX_RESTORE_D8_15 \
+	"\tldp d8, d9, [sp, #16]\n\tldp d10, d11, [sp, #32]\n\tldp d12, d13, [sp, #48]\n\tldp d14, d15, [sp, #64]\n" \
+	"\tldp x29, x30, [sp], #80\n"
+__asm__(
+	".text\n"
+	".globl EntryXmm\n.type EntryXmm,%function\n"
+	"EntryXmm:\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_OR_V8_15_LOW_INTO_X0
+	"\tret\n"
+	".globl SyscallXmm\n.type SyscallXmm,%function\n"
+	"SyscallXmm:\n"
+	WBX_SAVE_D8_15
+	WBX_FILL_V
+	"\tmov x0, #0\n"
+	"\tmov x8, #12\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_RESTORE_D8_15
+	"\tret\n"
+	".globl ExtcallXmm\n.type ExtcallXmm,%function\n"
+	"ExtcallXmm:\n"
+	WBX_SAVE_D8_15
+	"\tadrp x1, g_log_cb\n"
+	"\tldr x1, [x1, #:lo12:g_log_cb]\n"
+	"\tcbz x1, 1f\n"
+	WBX_FILL_V
+	"\tmov x0, #0\n"
+	"\tblr x1\n"
+	WBX_OR_V_SCRATCH_INTO_X0
+	WBX_OR_V8_15_HIGH_INTO_X0
+	WBX_RESTORE_D8_15
+	"\tret\n"
+	"1:\n"
+	"\tmov x0, #1\n"
+	WBX_RESTORE_D8_15
+	"\tret\n");
+#elif defined(__x86_64__)
 #define FILL_XMM \
 	"\tpcmpeqd %xmm0, %xmm0\n\tpcmpeqd %xmm1, %xmm1\n\tpcmpeqd %xmm2, %xmm2\n\tpcmpeqd %xmm3, %xmm3\n" \
 	"\tpcmpeqd %xmm4, %xmm4\n\tpcmpeqd %xmm5, %xmm5\n\tpcmpeqd %xmm6, %xmm6\n\tpcmpeqd %xmm7, %xmm7\n" \
@@ -597,6 +769,9 @@ __asm__(
 	"\tmov $1, %eax\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 /* Faults with rsp pointing into a guard page: a heap page is protected to
  * PROT_NONE, rsp is pointed into it, and ud2 faults. The death report must
@@ -608,7 +783,13 @@ static uint8_t guard_area[8192] __attribute__((aligned(4096)));
 ECL_EXPORT void GuardFault(void) {
 	uintptr_t base = ((uintptr_t)guard_area + 0xFFF) & ~(uintptr_t)0xFFF;
 	if (mprotect((void *)base, 4096, PROT_NONE) != 0) return;
+#if defined(__aarch64__)
+	__asm__ volatile ("mov sp, %0\n\tudf #0" :: "r" (base + 2048) : "memory");
+#elif defined(__x86_64__)
 	__asm__ volatile ("mov %0, %%rsp\n\tud2" :: "r" (base + 2048) : "memory");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	__builtin_unreachable();
 }
 
@@ -645,6 +826,49 @@ ECL_EXPORT void WildWrite(void) {
 
 /* Instructions the compiler would not emit on request. Halt is exactly musl's
  * a_crash(), which its allocator runs when its own heap check fails. */
+#if defined(__aarch64__)
+/* aarch64: Halt is musl's a_crash() there (udf #0xf4), Ud2 a plain undefined
+ * instruction. There is no DivideByZero: an aarch64 integer division by zero
+ * answers 0 rather than trapping. FsProbe and ClobberAndProbe are x86-64's
+ * (a dropped %fs base); TPIDR_EL0 is never dropped. */
+__asm__(
+	".text\n"
+	".globl Halt\n.type Halt,%function\n"
+	"Halt:\n"
+	"\tudf #0xf4\n"
+	"\tret\n"
+	".globl Ud2\n.type Ud2,%function\n"
+	"Ud2:\n"
+	"\tudf #0\n"
+	"\tret\n"
+	".globl UnknownSyscall\n.type UnknownSyscall,%function\n"
+	"UnknownSyscall:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tmov x0, #1\n"
+	"\tmov x1, #2\n"
+	"\tmov x2, #3\n"
+	"\tmov x8, #4242\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n"
+	".local deadlock_word\n.comm deadlock_word,4,4\n"
+	".globl Deadlock\n.type Deadlock,%function\n"
+	"Deadlock:\n"
+	"\tstp x29, x30, [sp, #-16]!\n"
+	"\tadrp x0, deadlock_word\n"
+	"\tadd x0, x0, #:lo12:deadlock_word\n"
+	"\tmov x1, #0\n"
+	"\tmov x2, #0\n"
+	"\tmov x3, #0\n"
+	"\tmov x8, #202\n"
+	"\tmovz x16, #0x0080\n"
+	"\tmovk x16, #0x035f, lsl #32\n"
+	"\tblr x16\n"
+	"\tldp x29, x30, [sp], #16\n"
+	"\tret\n");
+#elif defined(__x86_64__)
 __asm__(
 	".text\n"
 	".globl Halt\n.type Halt,@function\n"
@@ -706,5 +930,8 @@ __asm__(
 	"\tcall *%r10\n"
 	"\tpop %rbx\n"
 	"\tret\n");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 
 int main(void) { return 0; }

@@ -111,6 +111,31 @@ bool mb_elf_check(const uint8_t *image, size_t len, char *why, size_t whylen) {
 		if (!within(ph->p_offset, ph->p_filesz, len) || ph->p_filesz > ph->p_memsz) BAD("segment %d lies outside the image", i);
 		if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr) BAD("segment %d wraps the address space", i);
 	}
+#if defined(__aarch64__)
+	/* An aarch64 guest finds its thread pointer in the machine's slot, not in
+	 * TPIDR_EL0 (MACHINE-SPEC, "aarch64"), and the guest kit rewrote every
+	 * access to the register when it linked the image, leaving a .wbx_tp
+	 * section behind. An image with neither - linked before the slot - would
+	 * read whatever the OS keeps in the register, so it is refused by name.
+	 * (One that reads no thread pointer at all has nothing to rewrite.) */
+	if (eh->e_machine == 183 /*EM_AARCH64*/) {
+		bool rewritten = false;
+		for (int i = 0; i < eh->e_shnum && !rewritten; i++)
+			rewritten = strcmp((const char *)image + names->sh_offset + sh[i].sh_name, ".wbx_tp") == 0;
+		for (int i = 0; i < eh->e_phnum && !rewritten; i++) {
+			const Elf64_Phdr *ph = (const Elf64_Phdr *)(image + eh->e_phoff + (size_t)i * eh->e_phentsize);
+			if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+			for (uint64_t k = 0; k + 4 <= ph->p_filesz; k += 4) {
+				uint32_t w;
+				memcpy(&w, image + ph->p_offset + k, 4);
+				if ((w & ~0x1fu) == 0xd53bd040u || (w & ~0x1fu) == 0xd51bd040u)
+					BAD("the core reads its thread pointer from TPIDR_EL0 (at %#llx), so it was built before "
+					    "the aarch64 machine kept it elsewhere; rebuild it with the current guest kit",
+					    (unsigned long long)(ph->p_vaddr + k));
+			}
+		}
+	}
+#endif
 #undef BAD
 	return true;
 }

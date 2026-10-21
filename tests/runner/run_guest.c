@@ -30,7 +30,14 @@
  * change it. */
 static uintptr_t host_fs_base(void) {
 	uintptr_t v = 0;
+#if defined(__aarch64__)
+	/* aarch64: TPIDR_EL0, where glibc keeps this thread's state */
+	__asm__ volatile ("mrs %0, tpidr_el0" : "=r" (v));
+#elif defined(__x86_64__)
 	syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &v);
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	return v;
 }
 #endif
@@ -85,15 +92,37 @@ static uint64_t g_last_log = 0;
 /* the floating-point control words the callback ran with (see the FPU checks) */
 static uint16_t g_cb_fcw;
 static uint32_t g_cb_mxcsr;
-static uintptr_t MB_GUEST_ABI log_cb(uintptr_t v, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6) {
-	(void)a2;(void)a3;(void)a4;(void)a5;(void)a6; g_last_log = (uint32_t)v;
-	__asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(g_cb_fcw), "=m"(g_cb_mxcsr));
-	return 0;
-}
-
+#if defined(__x86_64__)
 static void host_fpu_get(uint16_t *cw, uint32_t *mx) { __asm__ volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(*cw), "=m"(*mx)); }
 static void host_fpu_set(uint16_t cw, uint32_t mx) { __asm__ volatile("fldcw %0\n\tldmxcsr %1" : : "m"(cw), "m"(mx)); }
 #define FPU_FLAGS 0x3Fu   /* MXCSR's sticky exception flags: not compared */
+#define FPU_START_CW 0x037F   /* what every guest starts with */
+#define FPU_START_MX 0x1F80
+#define FPU_HOST_CW  0x027F   /* Windows' default: 53-bit precision */
+#define FPU_HOST_MX  0x7F80   /* round toward zero */
+#define FPU_GUEST_CW 0x077F   /* round down, both units */
+#define FPU_GUEST_MX 0x3F80
+#elif defined(__aarch64__)
+/* aarch64 has FPCR alone, in the MXCSR place; the x87 word is always 0, and
+ * FPCR keeps no sticky flags (those are FPSR's) */
+static void host_fpu_get(uint16_t *cw, uint32_t *mx) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); *cw = 0; *mx = (uint32_t)v; }
+static void host_fpu_set(uint16_t cw, uint32_t mx) { (void)cw; __asm__ volatile("msr fpcr, %0" : : "r"((uint64_t)mx)); }
+#define FPU_FLAGS 0u
+#define FPU_START_CW 0
+#define FPU_START_MX 0            /* round to nearest, no flushing */
+#define FPU_HOST_CW  0
+#define FPU_HOST_MX  0x00C00000u  /* RMode: round toward zero */
+#define FPU_GUEST_CW 0
+#define FPU_GUEST_MX 0x00800000u  /* RMode: round down */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+
+static uintptr_t MB_GUEST_ABI log_cb(uintptr_t v, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6) {
+	(void)a2;(void)a3;(void)a4;(void)a5;(void)a6; g_last_log = (uint32_t)v;
+	host_fpu_get(&g_cb_fcw, &g_cb_mxcsr);
+	return 0;
+}
 
 /* The guest is sysv64 whatever the host is; MB_GUEST_ABI (minibox.h) makes that
  * explicit, which matters on a win64 host and expands to nothing on Linux. */
@@ -120,15 +149,16 @@ static mb_host *make_host(const char *path, uint32_t seed) {
 	mb_return r;
 	/* made from a host at Windows' default control words (see the FPU
 	 * checks in main): the guest's start-up code still runs with
-	 * 0x37F/0x1F80, and the host has its own back afterwards */
+	 * 0x37F/0x1F80 (aarch64: FPCR 0), and the host has its own back
+	 * afterwards */
 	uint16_t create_cw; uint32_t create_mx;
 	host_fpu_get(&create_cw, &create_mx);
-	host_fpu_set(0x027F, 0x7F80);
+	host_fpu_set(FPU_HOST_CW, FPU_HOST_MX);
 	wbx_create_host(&layout, "guest.wbx", file_read, (uintptr_t)&fr, &r);
 	uint16_t created_cw; uint32_t created_mx;
 	host_fpu_get(&created_cw, &created_mx);
 	host_fpu_set(create_cw, create_mx);
-	CHECK(created_cw == 0x027F && (created_mx & ~FPU_FLAGS) == 0x7F80);
+	CHECK(created_cw == FPU_HOST_CW && (created_mx & ~FPU_FLAGS) == FPU_HOST_MX);
 	fclose(f);
 	if (r.error_message[0]) { fprintf(stderr, "create_host: %s\n", r.error_message); exit(1); }
 	mb_host *h = (mb_host *)r.data;
@@ -569,7 +599,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 }
 #endif
 
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(__x86_64__)   /* %fs repair: x86-64 only (aarch64 never loses TPIDR_EL0) */
 /* Can this machine run a real guest-side drop (guest WRFSBASE(0))? Some
  * kernels (WSL2) kill it despite the CPU flag - and the base is already 0
  * when the fault arrives, so nothing libc may run until %fs is put back.
@@ -796,7 +826,9 @@ static void guest_deaths_are_survived(const char *path) {
 		{ "Abort", "aborted" },
 		{ "Halt", "stopped itself" },
 		{ "Ud2", "illegal instruction" },
+#if defined(__x86_64__)   /* aarch64 integer division by zero does not trap: it answers 0 */
 		{ "DivideByZero", "divided by zero" },
+#endif
 		{ "WildWrite", "crashed" },
 		{ "ExitNow", "exited (status 7)" },
 		{ "UnknownSyscall", "system call 4242" },
@@ -873,7 +905,9 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--stop") == 0) return stop_flow(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
+#if defined(__x86_64__)
 	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);
+#endif
 #else
 	if (argc > 2 && strcmp(argv[1], "--handler-recursion-child") == 0) return handler_recursion_child(argv[2]);
 #endif
@@ -943,18 +977,33 @@ int main(int argc, char **argv) {
 	}
 	/* nor in its xmm0-15. Before the entry case this side fills xmm0-5 (scratch
 	 * in both host ABIs) with ones, so the check does not rest on whatever the
-	 * host's own code happened to leave there. */
+	 * host's own code happened to leave there. On aarch64 it fills v0-v31,
+	 * d8-d15 included (the compiler keeps this function's own around the
+	 * asm): the blob must clear those on entry too. */
 	{
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		const u64_fn entry = (u64_fn)proc(h, "EntryXmm");
+#if defined(__aarch64__)
+		__asm__ volatile(".irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n\t"
+		                 "movi v\\n\\().2d, #0xffffffffffffffff\n\t"
+		                 ".endr"
+		                 ::: "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+		                     "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22",
+		                     "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+		const char *vregs = "v0-v31";
+#elif defined(__x86_64__)
 		__asm__ volatile("pcmpeqd %%xmm0, %%xmm0\n\tpcmpeqd %%xmm1, %%xmm1\n\tpcmpeqd %%xmm2, %%xmm2\n\t"
 		                 "pcmpeqd %%xmm3, %%xmm3\n\tpcmpeqd %%xmm4, %%xmm4\n\tpcmpeqd %%xmm5, %%xmm5"
 		                 ::: "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5");
+		const char *vregs = "xmm0-15";
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 		uint64_t at_entry = entry();
 		uint64_t after_syscall = ((u64_fn)proc(h, "SyscallXmm"))();
 		uint64_t after_extcall = ((u64_fn)proc(h, "ExtcallXmm"))();
-		printf("run_guest: xmm0-15 seen by the guest on entry=%llx, after a syscall=%llx, "
-		       "after a callback=%llx\n", (unsigned long long)at_entry,
+		printf("run_guest: %s seen by the guest on entry=%llx, after a syscall=%llx, "
+		       "after a callback=%llx\n", vregs, (unsigned long long)at_entry,
 		       (unsigned long long)after_syscall, (unsigned long long)after_extcall);
 		CHECK(at_entry == 0);
 		CHECK(after_syscall == 0);
@@ -965,25 +1014,27 @@ int main(int argc, char **argv) {
 	 * with round-toward-zero SSE rounding, and the guest still starts from
 	 * 0x37F/0x1F80; what the guest sets (round down, both units) stays with
 	 * it across calls, a syscall and a callback; the host gets its own back
-	 * after every call, and has them inside the callback. */
+	 * after every call, and has them inside the callback. On aarch64 the same
+	 * with FPCR: the host rounds toward zero, the guest starts at 0 (to
+	 * nearest) and sets round down. */
 	{
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		typedef void (MB_GUEST_ABI *fpuset_fn)(uint32_t, uint32_t);
 		uint16_t keep_cw, cw; uint32_t keep_mx, mx;
 		host_fpu_get(&keep_cw, &keep_mx);
-		const uint16_t host_cw = 0x027F; const uint32_t host_mx = 0x7F80;
-		const uint16_t guest_cw = 0x077F; const uint32_t guest_mx = 0x3F80;   /* round down */
+		const uint16_t host_cw = FPU_HOST_CW; const uint32_t host_mx = FPU_HOST_MX;
+		const uint16_t guest_cw = FPU_GUEST_CW; const uint32_t guest_mx = FPU_GUEST_MX;   /* round down */
 		host_fpu_set(host_cw, host_mx);
 		uint64_t seen = ((u64_fn)proc(h, "FpuSeen"))();
 		host_fpu_get(&cw, &mx);
 		printf("run_guest: control words the guest starts with %llx/%llx (host %x/%x)\n",
 		       (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen, (unsigned)host_cw, (unsigned)host_mx);
-		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		CHECK((seen >> 32) == FPU_START_CW && ((uint32_t)seen & ~FPU_FLAGS) == FPU_START_MX);
 		CHECK(cw == host_cw && (mx & ~FPU_FLAGS) == host_mx);
 		seen = ((u64_fn)proc(h, "FpuAtStart"))();
 		printf("run_guest: the guest's start-up code ran with %llx/%llx\n",
 		       (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen);
-		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		CHECK((seen >> 32) == FPU_START_CW && ((uint32_t)seen & ~FPU_FLAGS) == FPU_START_MX);
 		((fpuset_fn)proc(h, "FpuSet"))(guest_cw, guest_mx);
 		host_fpu_get(&cw, &mx);
 		CHECK(cw == host_cw && (mx & ~FPU_FLAGS) == host_mx);      /* the guest's stay in */
@@ -997,7 +1048,7 @@ int main(int argc, char **argv) {
 		       (unsigned)g_cb_fcw, (unsigned)g_cb_mxcsr, (unsigned long long)(seen >> 32), (unsigned long long)(uint32_t)seen);
 		CHECK(g_cb_fcw == host_cw && (g_cb_mxcsr & ~FPU_FLAGS) == host_mx);
 		CHECK((seen >> 32) == guest_cw && ((uint32_t)seen & ~FPU_FLAGS) == guest_mx);
-		((fpuset_fn)proc(h, "FpuSet"))(0x037F, 0x1F80);
+		((fpuset_fn)proc(h, "FpuSet"))(FPU_START_CW, FPU_START_MX);
 		host_fpu_set(keep_cw, keep_mx);
 	}
 	/* calls that used to stop the machine (spec v2.2): each must answer
@@ -1009,13 +1060,15 @@ int main(int argc, char **argv) {
 		CHECK(((int_fn)proc(h, "CancellableCallKeepsItsArguments"))() == 1);
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		CHECK(((u64_fn)proc(h, "CalleeSavedOnEntry"))() == 0);
-		CHECK(((int_fn)proc(h, "ReturnsBackwards"))() == 1);
 		CHECK(((int_fn)proc(h, "UnalignedLengthsRoundUp"))() == 1);
+#if defined(__x86_64__)   /* aarch64 has no direction flag */
+		CHECK(((int_fn)proc(h, "ReturnsBackwards"))() == 1);
 		{
 			uint64_t flags;
 			__asm__ volatile("pushfq\n\tpopq %0" : "=r"(flags));
 			CHECK((flags & 0x400) == 0);   /* DF */
 		}
+#endif
 		CHECK(((int_fn)proc(h, "PipeRefused"))() == 1);
 		CHECK(((int_fn)proc(h, "GetrusageZeroed"))() == 1);
 		CHECK(((int_fn)proc(h, "NullCloneRefused"))() == 1);
@@ -1086,21 +1139,21 @@ int main(int argc, char **argv) {
 	{
 		typedef uint64_t (MB_GUEST_ABI *u64_fn)(void);
 		typedef void (MB_GUEST_ABI *fpuset_fn)(uint32_t, uint32_t);
-		((fpuset_fn)proc(h, "FpuSet"))(0x077F, 0x3F80);
+		((fpuset_fn)proc(h, "FpuSet"))(FPU_GUEST_CW, FPU_GUEST_MX);
 		membuf fs = {0};
 		wbx_deactivate_host(h, &r);
 		wbx_save_state(h, mem_write, (uintptr_t)&fs, &r);
 		CHECK(!r.error_message[0]);
 		CHECK(state_contains(&fs, "GuestFpuState1"));
 		wbx_activate_host(h, &r);
-		((fpuset_fn)proc(h, "FpuSet"))(0x037F, 0x1F80);
+		((fpuset_fn)proc(h, "FpuSet"))(FPU_START_CW, FPU_START_MX);
 		fs.pos = 0;
 		wbx_deactivate_host(h, &r);
 		wbx_load_state(h, mem_read, (uintptr_t)&fs, &r);
 		CHECK(!r.error_message[0]);
 		wbx_activate_host(h, &r);
 		uint64_t seen = ((u64_fn)proc(h, "FpuSeen"))();
-		CHECK((seen >> 32) == 0x077F && ((uint32_t)seen & ~FPU_FLAGS) == 0x3F80);
+		CHECK((seen >> 32) == FPU_GUEST_CW && ((uint32_t)seen & ~FPU_FLAGS) == FPU_GUEST_MX);
 		/* the same state with the record cut out, as an older build wrote it */
 		size_t at = 0;
 		while (at + 14 <= fs.len && memcmp(fs.buf + at, "GuestFpuState1", 14) != 0) at++;
@@ -1113,7 +1166,7 @@ int main(int argc, char **argv) {
 		CHECK(!r.error_message[0]);
 		wbx_activate_host(h, &r);
 		seen = ((u64_fn)proc(h, "FpuSeen"))();
-		CHECK((seen >> 32) == 0x037F && ((uint32_t)seen & ~FPU_FLAGS) == 0x1F80);
+		CHECK((seen >> 32) == FPU_START_CW && ((uint32_t)seen & ~FPU_FLAGS) == FPU_START_MX);
 		free(fs.buf);
 	}
 

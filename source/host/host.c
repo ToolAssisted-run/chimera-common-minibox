@@ -381,8 +381,11 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
                           uintptr_t a5, uintptr_t a6, uintptr_t nr, void *hp) {
 	/* Host C counts on the direction flag being clear (memcpy, memset), and
 	 * a guest that called in with it set handed that over (analysis of
-	 * 2026-10-18). Before anything else, so nothing runs backwards. */
+	 * 2026-10-18). Before anything else, so nothing runs backwards.
+	 * (aarch64 has no direction flag.) */
+#if defined(__x86_64__)
 	__asm__ volatile("cld" ::: "memory");
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* The guest trapped in here with %fs = its own thread pointer (a Rust guest
 	 * uses %fs-direct TLS), but everything below is host C and glibc - malloc
@@ -852,7 +855,20 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 		}
 		case NR_exit_group:
 			mb_host_guest_death(&h->context, "the core exited (status %lld)", (long long)(intptr_t)a1);
+#if defined(__aarch64__)
+		/* An aarch64 guest's thread pointer is TPIDR_EL0, swapped in by the host
+		 * around guest code (MB_HAVE_FSBASE), so musl tells the host instead of
+		 * writing it (arch/waterbox_aarch64 __set_thread_area); dispatch puts it
+		 * in the register on the way back. */
+		case NR_set_thread_area:
+			if (a1 == 0) return serr(EINVAL);   /* no thread pointer is null */
+			h->context.thread_area = a1;
+			return sok(0);
+#elif defined(__x86_64__)
 		case NR_set_thread_area: return serr(ENOSYS);   /* musl handles in userspace */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 		/* The address is written (with 0) when the thread exits; one the host
 		 * may not write is not kept, as Linux ignores a write there that fails. */
 		case NR_set_tid_address: return sok(mb_threads_set_tid_address(h->threads, guest_can(h, a1, 4, true) ? a1 : 0));
@@ -899,13 +915,22 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			return mb_threads_yield(h->threads, &h->context);
 		}
 		case NR_wbx_clone: {
-			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*):
-			 * the musl pthread struct is read (14 words), the child's first frame
-			 * and the parent's tid written */
+			/* args: (tls/thread_area, child_rsp, child_rip, child_tid, parent_tid*,
+			 * pthread): the musl pthread struct is read (14 words), the child's
+			 * first frame and the parent's tid written. On x86-64 the struct IS
+			 * the thread pointer; an aarch64 thread pointer is past it (TLS above
+			 * TP), so the guest passes the struct as well. */
+#if defined(__aarch64__)
+			const uintptr_t pthread = a6;
+#elif defined(__x86_64__)
+			const uintptr_t pthread = a1;
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 			if (a1 == 0) return serr(EINVAL);   /* a foreign convention: mb_threads_spawn says why */
-			if (!guest_can(h, a1, 14 * 8, false)) return serr(EFAULT);
+			if (!guest_can(h, pthread, 14 * 8, false)) return serr(EFAULT);
 			if (!guest_can(h, a2 - 16, 16, true) || !guest_can(h, a5, 4, true)) return serr(EFAULT);
-			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5);
+			mb_sword r = mb_threads_spawn(h->threads, h->block, a1, a2, a3, a4, (uint32_t *)a5, pthread);
 			return r < 0 ? serr((int)-r) : sok(r);
 		}
 		case NR_sched_setaffinity:
@@ -1068,6 +1093,28 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	h->thunks = mb_thunks_new();
 	h->threads = mb_threads_new();
 
+	/* A guest is machine code for one CPU, and this host runs it directly: an
+	 * x86-64 core.wbx on an aarch64 host (or the reverse) would die on its
+	 * first instruction, so it is refused here, by name. e_machine is at 18. */
+	{
+#if defined(__aarch64__)
+		const uint16_t want = 183; const char *cpu = "aarch64";   /* EM_AARCH64 */
+#elif defined(__x86_64__)
+		const uint16_t want = 62; const char *cpu = "x86-64";     /* EM_X86_64 */
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+		uint16_t machine = 0;
+		if (image_len >= 20) memcpy(&machine, image + 18, 2);
+		if (image_len >= 20 && memcmp(image, "\x7f""ELF", 4) == 0 && machine != want) {
+			snprintf(errbuf, errlen, "%s is built for %s (ELF machine %u), and this host runs %s guests",
+			         module_name ? module_name : "the guest",
+			         machine == 62 ? "x86-64" : machine == 183 ? "aarch64" : "another CPU",
+			         (unsigned)machine, cpu);
+			return host_new_unwind(h);
+		}
+	}
+
 	/* build the layout: elf span (page-expanded), then the fixed + sized areas */
 	mb_range elf = mb_range_align_expand(mb_elf_span(image, image_len));
 	mb_layout *L = &h->layout;
@@ -1115,10 +1162,19 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	 * for a guest with no PT_TLS - leaving the gates at their zero value
 	 * while the instructions would have worked. */
 	{ const bool fs_ok = mb_fsbase_ok();
+#if defined(__aarch64__)
+	  /* every aarch64 guest: its musl reaches pthread_self through TPIDR_EL0
+	   * (arch/waterbox_aarch64), with or without thread locals of its own */
+	  h->context.fs_swap = fs_ok; }
+#elif defined(__x86_64__)
 	  h->context.fs_swap = mb_elf_has_tls(h->elf) && fs_ok && !getenv("MB_NO_FS_SWAP"); }
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
+#if defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
 	if (mb_elf_has_tls(h->elf)) {
 		fprintf(stderr, "miniBox: guest declares TLS; %%fs swap %s%s\n",
 		        h->context.fs_swap ? "ON" : "OFF",
@@ -1127,6 +1183,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		                                       : " (the OS does not offer fsbase to user mode)"));
 		fflush(stderr);
 	}
+#endif
 #endif
 
 	/* Machine-spec version, decided before the guest runs a single
@@ -1154,6 +1211,20 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	  mb_threads_set_kit_revision(h->threads, h->kit_revision);
 	  mb_fs_set_linux_answers(h->fs, h->kit_revision >= 2);
 	  if (spec == 3) { fprintf(stderr, "miniBox: guest declares machine spec v3 (virtual time)\n"); fflush(stderr); } }
+
+	/* A guest that exports GuestFaultHandler protects its own pages and relies
+	 * on the next access to one of them to fault. On a host whose page is
+	 * larger than the machine's that cannot be kept: the machine pages sharing
+	 * one host page share its protection, and read and write are open on the
+	 * whole host page while a neighbour is readable or writable (memblock.c,
+	 * group_native_prot) - the access goes through, and the handler never
+	 * hears of it. The machine would run differently from a 4 KiB host's, and
+	 * silently, so it is refused, by name, before it runs. */
+	if (mb_group_pages() > 1 && mb_elf_proc_addr(h->elf, "GuestFaultHandler")) {
+		snprintf(errbuf, errlen, "%s exports GuestFaultHandler, which needs a host with 4 KiB pages; this host's pages are %u KiB",
+		         module_name ? module_name : "the guest", (1u << mb_host_page_shift) >> 10);
+		return host_new_unwind(h);
+	}
 
 	/* every callback slot answers, registered or not */
 	{ const uintptr_t none = mb_thunks_get_extcall(h->thunks, (uintptr_t)&unregistered_callback, &h->context);

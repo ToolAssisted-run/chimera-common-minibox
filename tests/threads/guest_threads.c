@@ -67,7 +67,13 @@ ECL_EXPORT uint64_t RunCondvar(uint64_t value) {
 	return (uint64_t)(uintptr_t)r;   /* must equal value*2+1 */
 }
 
-ECL_EXPORT int Init(void) { return 1; }
+/* Ballast: a .bss larger than any page rounding, so that the image's thread-
+ * pointer trampolines (wbx-tp-rewrite.py, aarch64) must go after the .bss and
+ * not merely after the file's bytes - placed over the .bss they would be
+ * zeroed by it, which only an image with a real .bss shows. */
+static volatile uint8_t g_ballast[8u << 20];
+
+ECL_EXPORT int Init(void) { g_ballast[sizeof g_ballast - 1] = 1; return 1; }
 int main(void) { return 0; }
 
 /* Thread-local storage, on a new thread and on the main one: a zeroed local
@@ -111,6 +117,7 @@ ECL_EXPORT uint64_t RunTls(void) {
 	return on_main | (uint64_t)(uintptr_t)on_new << 8;
 }
 
+#ifndef NO_GUEST_FAULT_HANDLER
 /* The guest's own fault handler (GuestFaultHandler), which an emulator's
  * write tracking uses: called on the faulting thread, it must run as guest
  * code does - its thread locals its own, its system calls accepted. Until it
@@ -128,7 +135,9 @@ static volatile uintptr_t g_yield_page, g_other_page, g_clobber_page;
 static volatile int g_other_done;
 static int fault_yield(void);
 static void clobber_registers(void);
+#if defined(__x86_64__)
 static int have_avx(void);
+#endif
 
 ECL_EXPORT int GuestFaultHandler(uint64_t addr, uint64_t is_write) {
 	(void)is_write;
@@ -275,6 +284,114 @@ ECL_EXPORT uint64_t RunFaultYield(void) {
 	return bad;
 }
 
+#if defined(__aarch64__)
+/* What a function may change, changed, so that the code a fault interrupted
+ * must get its registers back from whatever ran the handler. */
+static void clobber_registers(void) {
+	__asm__ volatile(
+		".irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17\n\t"
+		"mov x\\n, #-1\n\t"
+		".endr\n\t"
+		"movi v0.2d, #0xffffffffffffffff\n\t"
+		"movi v8.2d, #0xffffffffffffffff\n\t"
+		"movi v31.2d, #0xffffffffffffffff\n\t"
+		"msr nzcv, xzr\n\t"
+		"msr fpsr, xzr"
+		::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+		    "x12", "x13", "x14", "x15", "x16", "x17", "v0", "v8", "v31", "cc", "memory");
+}
+
+/* 0 when right: every register the faulting code held, the carry flag and
+ * FPSR's cumulative flags are what they were before the fault, although the
+ * handler changed them. x18 is nobody's (-ffixed-x18), x29/x30 the
+ * compiler's; x27 points at the results and x28 at the page. */
+ECL_EXPORT uint64_t RunFaultRegisters(void) {
+	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) return 0xff;
+	page[0] = 1;
+	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	/* x0-x17 then x19-x26, each byte the register's number + 1 */
+	static const uint64_t want[26] = {
+		0x0101010101010101ull, 0x0202020202020202ull, 0x0303030303030303ull, 0x0404040404040404ull,
+		0x0505050505050505ull, 0x0606060606060606ull, 0x0707070707070707ull, 0x0808080808080808ull,
+		0x0909090909090909ull, 0x0a0a0a0a0a0a0a0aull, 0x0b0b0b0b0b0b0b0bull, 0x0c0c0c0c0c0c0c0cull,
+		0x0d0d0d0d0d0d0d0dull, 0x0e0e0e0e0e0e0e0eull, 0x0f0f0f0f0f0f0f0full, 0x1010101010101010ull,
+		0x1111111111111111ull, 0x1212121212121212ull,
+		0x1414141414141414ull, 0x1515151515151515ull, 0x1616161616161616ull, 0x1717171717171717ull,
+		0x1818181818181818ull, 0x1919191919191919ull, 0x1a1a1a1a1a1a1a1aull, 0x1b1b1b1b1b1b1b1bull,
+	};
+	uint64_t out[40] = { (uint64_t)(uintptr_t)page };
+	uint64_t *outp = out;
+	const uint64_t *wantp = want;
+	g_clobber_page = (uintptr_t)page;
+	__asm__ volatile(
+		"ldr x27, %[outp]\n\t"
+		"ldr x28, [x27]\n\t"           /* the page */
+		"ldr x26, %[wantp]\n\t"
+		"mov x0, #0x20000000\n\t"      /* C */
+		"msr nzcv, x0\n\t"
+		"mov x0, #0x1f\n\t"            /* IOC DZC OFC UFC IXC: as if they had happened */
+		"msr fpsr, x0\n\t"
+		"ldp x0, x1, [x26, #0]\n\t"
+		"ldp x2, x3, [x26, #16]\n\t"
+		"ldp x4, x5, [x26, #32]\n\t"
+		"ldp x6, x7, [x26, #48]\n\t"
+		"ldp x8, x9, [x26, #64]\n\t"
+		"ldp x10, x11, [x26, #80]\n\t"
+		"ldp x12, x13, [x26, #96]\n\t"
+		"ldp x14, x15, [x26, #112]\n\t"
+		"ldp x16, x17, [x26, #128]\n\t"
+		"fmov d0, x0\n\t"
+		"mov v0.d[1], x1\n\t"
+		"fmov d8, x2\n\t"
+		"mov v8.d[1], x3\n\t"          /* the upper half too, which AAPCS64 does not keep */
+		"fmov d31, x4\n\t"
+		"mov v31.d[1], x5\n\t"
+		"ldp x19, x20, [x26, #144]\n\t"
+		"ldp x21, x22, [x26, #160]\n\t"
+		"ldp x23, x24, [x26, #176]\n\t"
+		"ldr x25, [x26, #192]\n\t"
+		"ldr x26, [x26, #200]\n\t"
+		"strb w0, [x28, #1]\n\t"       /* faults; the handler changes everything it may */
+		"stp x0, x1, [x27, #16]\n\t"
+		"stp x2, x3, [x27, #32]\n\t"
+		"stp x4, x5, [x27, #48]\n\t"
+		"stp x6, x7, [x27, #64]\n\t"
+		"stp x8, x9, [x27, #80]\n\t"
+		"stp x10, x11, [x27, #96]\n\t"
+		"stp x12, x13, [x27, #112]\n\t"
+		"stp x14, x15, [x27, #128]\n\t"
+		"stp x16, x17, [x27, #144]\n\t"
+		"stp x19, x20, [x27, #160]\n\t"
+		"stp x21, x22, [x27, #176]\n\t"
+		"stp x23, x24, [x27, #192]\n\t"
+		"stp x25, x26, [x27, #208]\n\t"
+		"str x28, [x27, #224]\n\t"
+		"stp q0, q8, [x27, #240]\n\t"
+		"str q31, [x27, #272]\n\t"
+		"mrs x0, nzcv\n\t"
+		"str x0, [x27, #8]\n\t"
+		"mrs x0, fpsr\n\t"
+		"str x0, [x27, #232]\n\t"
+		: : [outp] "m"(outp), [wantp] "m"(wantp)
+		: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
+		  "x13", "x14", "x15", "x16", "x17", "x19", "x20", "x21", "x22", "x23", "x24", "x25",
+		  "x26", "x27", "x28", "v0", "v8", "v31", "cc", "memory");
+	g_clobber_page = 0;
+	uint64_t bad = 0;
+	if (page[1] != (uint8_t)want[0]) bad |= 1;
+	if (!(out[1] & 0x20000000u)) bad |= 2;                           /* carry */
+	for (int i = 0; i < 26; i++) if (out[2 + i] != want[i]) bad |= 1ull << (8 + i);
+	if (out[28] != (uint64_t)(uintptr_t)page) bad |= 1ull << 40;     /* x28 */
+	if ((out[29] & 0x1f) != 0x1f) bad |= 1ull << 41;                 /* FPSR */
+	if (out[30] != want[0] || out[31] != want[1]) bad |= 1ull << 42; /* v0 */
+	if (out[32] != want[2] || out[33] != want[3]) bad |= 1ull << 43; /* v8, its upper half too */
+	if (out[34] != want[4] || out[35] != want[5]) bad |= 1ull << 44; /* v31 */
+	munmap((void *)page, 4096);
+	return bad;
+}
+
+#elif defined(__x86_64__)
 /* What a function may change, changed, so that the code a fault interrupted
  * must get its registers back from whatever ran the handler. */
 static void clobber_registers(void) {
@@ -386,6 +503,10 @@ ECL_EXPORT uint64_t RunFaultRegisters(void) {
 	return bad;
 }
 
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+
 /* Never returns: a protected page the handler does not claim (it answers 0),
  * which is an unhandled fault and the machine's death, as without a handler. */
 ECL_EXPORT uint64_t RunGuestFaultDeclined(void) {
@@ -395,6 +516,7 @@ ECL_EXPORT uint64_t RunGuestFaultDeclined(void) {
 	page[1] = 0x5a;
 	return 0xfd;
 }
+#endif
 
 /* Never returns: a call through a null pointer from a guest that owns %fs.
  * The fault is outside the guest's memory and arrives with the guest's thread

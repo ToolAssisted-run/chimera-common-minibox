@@ -24,6 +24,15 @@ typedef uint64_t (MB_GUEST_ABI *run1_fn)(uint64_t);
 static uintptr_t proc(mb_host *h, const char *n){mb_return r;wbx_get_proc_addr(h,n,&r);if(r.error_message[0]){fprintf(stderr,"proc %s:%s\n",n,r.error_message);exit(2);}return r.data;}
 
 int main(int argc, char **argv) {
+	/* --refused: run where the host page groups machine pages (MB_HOST_PAGE),
+	 * and the guest, which exports GuestFaultHandler, must be refused there */
+	const bool refused = argc > 1 && strcmp(argv[1], "--refused") == 0;
+	if (refused) { argc--; argv++; }
+	/* --no-fault-handler: the guest built without GuestFaultHandler, which a
+	 * host with pages over 4 KiB refuses - the threads and their thread
+	 * locals are tested there too, the guest's handler is not */
+	const bool no_handler = argc > 1 && strcmp(argv[1], "--no-fault-handler") == 0;
+	if (no_handler) { argc--; argv++; }
 	const char *path = argc > 1 ? argv[1] : "guest_threads.wbx";
 	FILE *f = fopen(path, "rb");
 	if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
@@ -32,6 +41,21 @@ int main(int argc, char **argv) {
 	mb_return r;
 	wbx_create_host(&layout, "guest_threads.wbx", file_read, (uintptr_t)&fr, &r);
 	fclose(f);
+	if (refused) {
+		const char *said = (const char *)r.error_message;
+		printf("create -> %s\n", said[0] ? said : "(a host, not refused)");
+		CHECK(strstr(said, "GuestFaultHandler") != NULL);
+		CHECK(strstr(said, "4 KiB pages") != NULL);
+		if (!said[0]) wbx_destroy_host((mb_host *)r.data, &r);
+		if (fails == 0) printf("run_threads --refused: all checks passed\n");
+		return fails ? 1 : 0;
+	}
+	if (r.error_message[0] && strstr((const char *)r.error_message, "4 KiB pages") != NULL) {
+		/* a host with larger pages (macOS, Asahi) refuses this guest by design;
+		 * threads-no-fault-handler runs the rest of it there */
+		printf("run_threads: skipped, %s\n", r.error_message);
+		return 77;
+	}
 	if (r.error_message[0]) { fprintf(stderr, "create: %s\n", r.error_message); return 1; }
 	mb_host *h = (mb_host *)r.data;
 
@@ -40,12 +64,12 @@ int main(int argc, char **argv) {
 	run_fn RunThreads = (run_fn)proc(h, "RunThreads");
 	run1_fn RunCondvar = (run1_fn)proc(h, "RunCondvar");
 	run_fn RunTls = (run_fn)proc(h, "RunTls");
-	run_fn RunGuestFault = (run_fn)proc(h, "RunGuestFault");
-	run_fn RunGuestFaultDeath = (run_fn)proc(h, "RunGuestFaultDeath");
-	run_fn RunHostWriteFault = (run_fn)proc(h, "RunHostWriteFault");
-	run_fn RunFaultYield = (run_fn)proc(h, "RunFaultYield");
-	run_fn RunFaultRegisters = (run_fn)proc(h, "RunFaultRegisters");
-	run_fn RunGuestFaultDeclined = (run_fn)proc(h, "RunGuestFaultDeclined");
+	run_fn RunGuestFault = no_handler ? NULL : (run_fn)proc(h, "RunGuestFault");
+	run_fn RunGuestFaultDeath = no_handler ? NULL : (run_fn)proc(h, "RunGuestFaultDeath");
+	run_fn RunHostWriteFault = no_handler ? NULL : (run_fn)proc(h, "RunHostWriteFault");
+	run_fn RunFaultYield = no_handler ? NULL : (run_fn)proc(h, "RunFaultYield");
+	run_fn RunFaultRegisters = no_handler ? NULL : (run_fn)proc(h, "RunFaultRegisters");
+	run_fn RunGuestFaultDeclined = no_handler ? NULL : (run_fn)proc(h, "RunGuestFaultDeclined");
 	run_fn CallNullWithOwnFs = (run_fn)proc(h, "CallNullWithOwnFs");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
@@ -64,6 +88,8 @@ int main(int argc, char **argv) {
 		const uint64_t tls = RunTls();
 		printf("RunTls -> %#llx (expect 0: thread locals zeroed, initialised, apart from the stack)\n", (unsigned long long)tls);
 		CHECK(tls == 0);
+	}
+	if (!no_handler) {
 		const uint64_t gf = RunGuestFault();
 		printf("RunGuestFault -> %#llx (expect 0: the guest's fault handler runs as guest code, and may fault)\n", (unsigned long long)gf);
 		CHECK(gf == 0);
@@ -135,7 +161,7 @@ int main(int argc, char **argv) {
 	 * host lives on, with this thread out of every handler frame - its signal
 	 * mask what it was, and the next fault on it not taken for one nested in a
 	 * handler that is gone. */
-	{
+	if (!no_handler) {
 #ifndef _WIN32
 		sigset_t mask_before, mask_after;
 		pthread_sigmask(SIG_BLOCK, NULL, &mask_before);
@@ -171,7 +197,7 @@ int main(int argc, char **argv) {
 	}
 	/* A protected page the handler does not claim: the machine's death, as
 	 * with no handler at all, and the host lives on. */
-	{
+	if (!no_handler) {
 		RunGuestFaultDeclined();
 		char why[512];
 		wbx_get_death(h, why, sizeof why, &r);

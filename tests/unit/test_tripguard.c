@@ -65,6 +65,10 @@ static double now_ns(void) {
 static inline void cpu_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
 	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ volatile("yield");
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
 #endif
 }
 
