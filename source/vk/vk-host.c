@@ -625,6 +625,39 @@ static uint64_t vkb_special_vkEnumerateDeviceLayerProperties(uint64_t op, struct
 	return VK_SUCCESS;
 }
 
+#ifdef __APPLE__
+static int has_instance_extension(const char *name)
+{
+	PFN_vkEnumerateInstanceExtensionProperties list =
+		(PFN_vkEnumerateInstanceExtensionProperties)s_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+	uint32_t n = 0;
+	if (!list || list(NULL, &n, NULL) < 0 || n == 0)
+		return 0;
+	VkExtensionProperties *have = calloc(n, sizeof *have);
+	int found = 0;
+	if (have && list(NULL, &n, have) >= 0)
+		for (uint32_t i = 0; i < n && !found; i++)
+			found = strcmp(have[i].extensionName, name) == 0;
+	free(have);
+	return found;
+}
+
+static int has_device_extension(VkPhysicalDevice phys, const char *name)
+{
+	uint32_t n = 0;
+	if (!vkb_fn.vkEnumerateDeviceExtensionProperties
+	    || vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) < 0 || n == 0)
+		return 0;
+	VkExtensionProperties *have = calloc(n, sizeof *have);
+	int found = 0;
+	if (have && vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, have) >= 0)
+		for (uint32_t i = 0; i < n && !found; i++)
+			found = strcmp(have[i].extensionName, name) == 0;
+	free(have);
+	return found;
+}
+#endif
+
 /* Which of the machine's devices. One is offered: a renderer that chose
  * between several would choose differently on the next machine. */
 static VkPhysicalDevice choose_device(void)
@@ -646,11 +679,17 @@ static VkPhysicalDevice choose_device(void)
 	for (uint32_t i = 0; i < n; i++) {
 		VkPhysicalDeviceProperties p;
 		props(all[i], &p);
-		int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 :
-		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 :
-		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 1 : 0;
+		int rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 6 :
+		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 4 :
+		           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? 2 : 0;
+#ifdef __APPLE__
+		/* the same GPU can answer twice, through MoltenVK (a subset of
+		 * Vulkan) and through Mesa's KosmicKrisp (all of it): the whole wins */
+		if (!has_device_extension(all[i], "VK_KHR_portability_subset"))
+			rank++;
+#endif
 		if (want && *want)
-			rank = strstr(p.deviceName, want) ? 4 : -1;
+			rank = strstr(p.deviceName, want) ? 8 : -1;
 		if (rank > best_rank) {
 			best = (int)i;
 			best_rank = rank;
@@ -694,38 +733,6 @@ static void create_instance_there(void *p)
 	}
 }
 
-#ifdef __APPLE__
-static int has_instance_extension(const char *name)
-{
-	PFN_vkEnumerateInstanceExtensionProperties list =
-		(PFN_vkEnumerateInstanceExtensionProperties)s_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
-	uint32_t n = 0;
-	if (!list || list(NULL, &n, NULL) < 0 || n == 0)
-		return 0;
-	VkExtensionProperties *have = calloc(n, sizeof *have);
-	int found = 0;
-	if (have && list(NULL, &n, have) >= 0)
-		for (uint32_t i = 0; i < n && !found; i++)
-			found = strcmp(have[i].extensionName, name) == 0;
-	free(have);
-	return found;
-}
-
-static int has_device_extension(VkPhysicalDevice phys, const char *name)
-{
-	uint32_t n = 0;
-	if (!vkb_fn.vkEnumerateDeviceExtensionProperties
-	    || vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) < 0 || n == 0)
-		return 0;
-	VkExtensionProperties *have = calloc(n, sizeof *have);
-	int found = 0;
-	if (have && vkb_fn.vkEnumerateDeviceExtensionProperties(phys, NULL, &n, have) >= 0)
-		for (uint32_t i = 0; i < n && !found; i++)
-			found = strcmp(have[i].extensionName, name) == 0;
-	free(have);
-	return found;
-}
-#endif
 
 static uint64_t vkb_special_vkCreateInstance(uint64_t op, struct vkb_vkCreateInstance_args *a)
 {
