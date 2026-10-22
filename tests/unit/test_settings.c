@@ -18,6 +18,18 @@ int main(void)
 	assert(wbx_setting_long("scale", 0) == 3);
 	assert(wbx_setting_bool("fast", 0) == 1);
 	assert(wbx_setting_str("naomi", out, sizeof out) == -1);   /* a value is not a key */
+
+	/* wide whole numbers, as Chimera writes them (chimera#358): a ulong past
+	 * a long, and the ends of a long, uint and datetime */
+	const char *wide = "{\"seed\":18446744073709551615,\"low\":-9223372036854775808,\"uint\":4294967295,\"clock\":253402300799}";
+	wbx_settings_use_buffer(wide, (int)strlen(wide));
+	assert(wbx_setting_ulong("seed", 0) == 18446744073709551615ULL);
+	assert(wbx_setting_ulong("absent", 7) == 7);
+	if (sizeof(long) == 8) {   /* a guest's long; a 32-bit host long cannot hold these */
+		assert(wbx_setting_long("low", 0) == (-9223372036854775807L - 1));
+		assert(wbx_setting_long("uint", 0) == 4294967295L);
+		assert(wbx_setting_long("clock", 0) == 253402300799L);
+	}
 	wbx_settings_use_file();
 	puts("test_settings: ok");
 	return 0;

@@ -101,10 +101,20 @@ static inline const char *wbx__setting_raw(const char *key, char *out, int outsz
 	return 0;
 }
 
+/* A whole number: Chimera's "int", "uint", "long" and "datetime" settings (a
+ * datetime is its seconds since 1970, in UTC). A guest's long is 64 bits. */
 static inline long wbx_setting_long(const char *key, long dflt)
 {
 	char v[64];
 	return wbx__setting_raw(key, v, (int)sizeof v) ? strtol(v, 0, 0) : dflt;
+}
+
+/* A whole number of up to 64 bits with no sign: Chimera's "ulong" setting,
+ * which may be past what a long holds (chimera#358). */
+static inline unsigned long long wbx_setting_ulong(const char *key, unsigned long long dflt)
+{
+	char v[64];
+	return wbx__setting_raw(key, v, (int)sizeof v) ? strtoull(v, 0, 10) : dflt;
 }
 
 static inline double wbx_setting_double(const char *key, double dflt)
