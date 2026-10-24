@@ -73,3 +73,28 @@ case now answers 0, as a call the driver refused, and calls
 nothing unless the host defined it before including the file: Chimera's
 bridge says which function, once; a core repository's own test runner needs
 nothing new. The hand-written cases in Chimera's `gl_bridge.cpp` do the same.
+
+## The names a state holds (2026-10-24)
+
+Every GL object a renderer keeps is a number the driver gave it, and those
+numbers are in guest memory, so a state holds them. After a load the host
+gives the guest a fresh context, and it takes every number the guest still
+holds again, empty, before the guest runs, so that no new object can get a
+number an old call could still reach. The host knew those numbers only by
+watching the guest make them, in its own process. A state taken by another
+process, such as a project opened again with its greenzone read back from
+disk, held numbers the new process had never seen. Dolphin's rebuild then
+deleted a vertex array by its old number, which was the array another vertex
+format had just been given, and drew black (chimera#367).
+
+So the generated wrappers of the calls that hand out names (`NAME_MAKERS` in
+the generator: `glGen*`, `glCreate*`, `glCreateProgram`, `glCreateShader`,
+`glCreateShaderProgramv`) raise a table of the highest number of each kind
+the guest has been given (`struct ChimeraGlNameMarks`, in the guest's own
+memory), and `chimera_gl_install` tells the host where it is
+(`GL_OP_NAME_MARKS`). The table is in every state, and after a load the host
+keeps every number up to its marks from new objects. The kinds are the
+host's, in its order. A host too old for the opcode says it has no case for
+it, once, and nothing else changes.
+
+A core picks this up when it is built again against this generator.

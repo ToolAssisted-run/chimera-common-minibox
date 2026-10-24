@@ -123,6 +123,35 @@ def read_names(path):
     return out
 
 
+# The entry points that hand the guest names, and the kind each is (the host
+# keeps the same list in chimera's gl_bridge.cpp, noteNames). Their wrappers
+# raise the guest's marks (GL_OP_NAME_MARKS in gl-bridge.h): (count, list) for
+# the ones that fill a list, None for the ones that return one name.
+NAME_MAKERS = {
+    "glGenTextures": ("CHIMERA_GL_NAME_TEXTURE", "n", "textures"),
+    "glCreateTextures": ("CHIMERA_GL_NAME_TEXTURE", "n", "textures"),
+    "glGenBuffers": ("CHIMERA_GL_NAME_BUFFER", "n", "buffers"),
+    "glCreateBuffers": ("CHIMERA_GL_NAME_BUFFER", "n", "buffers"),
+    "glGenFramebuffers": ("CHIMERA_GL_NAME_FRAMEBUFFER", "n", "framebuffers"),
+    "glCreateFramebuffers": ("CHIMERA_GL_NAME_FRAMEBUFFER", "n", "framebuffers"),
+    "glGenRenderbuffers": ("CHIMERA_GL_NAME_RENDERBUFFER", "n", "renderbuffers"),
+    "glCreateRenderbuffers": ("CHIMERA_GL_NAME_RENDERBUFFER", "n", "renderbuffers"),
+    "glGenSamplers": ("CHIMERA_GL_NAME_SAMPLER", "count", "samplers"),
+    "glCreateSamplers": ("CHIMERA_GL_NAME_SAMPLER", "n", "samplers"),
+    "glGenQueries": ("CHIMERA_GL_NAME_QUERY", "n", "ids"),
+    "glCreateQueries": ("CHIMERA_GL_NAME_QUERY", "n", "ids"),
+    "glGenVertexArrays": ("CHIMERA_GL_NAME_VERTEX_ARRAY", "n", "arrays"),
+    "glCreateVertexArrays": ("CHIMERA_GL_NAME_VERTEX_ARRAY", "n", "arrays"),
+    "glGenProgramPipelines": ("CHIMERA_GL_NAME_PIPELINE", "n", "pipelines"),
+    "glCreateProgramPipelines": ("CHIMERA_GL_NAME_PIPELINE", "n", "pipelines"),
+    "glGenTransformFeedbacks": ("CHIMERA_GL_NAME_TRANSFORM_FEEDBACK", "n", "ids"),
+    "glCreateTransformFeedbacks": ("CHIMERA_GL_NAME_TRANSFORM_FEEDBACK", "n", "ids"),
+    "glCreateProgram": ("CHIMERA_GL_NAME_PROGRAM", None, None),
+    "glCreateShader": ("CHIMERA_GL_NAME_PROGRAM", None, None),
+    "glCreateShaderProgramv": ("CHIMERA_GL_NAME_PROGRAM", None, None),
+}
+
+
 def main():
     if len(sys.argv) not in (4, 6):
         sys.exit(__doc__)
@@ -275,6 +304,40 @@ def main():
             continue
 
         body_fill = "".join(f"\tchimera_a.{arg} = {arg};\n" for _, arg in args)
+        if name in NAME_MAKERS:
+            kind, count, names = NAME_MAKERS[name]
+            arg_names = [arg for _, arg in args]
+            if count is not None and (ret != "void" or count not in arg_names or names not in arg_names):
+                sys.exit(f"{name}: not the (count, names) shape NAME_MAKERS expects")
+            if count is None and ret == "void":
+                sys.exit(f"{name}: NAME_MAKERS expects it to return the name")
+            call = (f"g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a, 0, 0, 0, 0)" if args
+                    else f"g_bridge(CHIMERA_GL_OP_{name}, 0, 0, 0, 0, 0)")
+            fill = body_fill if args else ""
+            decl = f"\tstruct {struct} chimera_a;\n" if args else ""
+            if count is not None:
+                guest.append(f"""static void GLAD_API_PTR w_{name}({signature})
+{{
+{decl}{fill}	{call};
+	chimera_gl_mark({kind}, {names}, {count});
+}}
+""")
+            else:
+                guest.append(f"""static {ret} GLAD_API_PTR w_{name}({signature})
+{{
+{decl}{fill}	const GLuint chimera_r = (GLuint){call};
+	chimera_gl_mark({kind}, &chimera_r, 1);
+	return ({ret})chimera_r;
+}}
+""")
+            host.append(f"""		case CHIMERA_GL_OP_{name}:
+		{{
+			{f'struct {struct} *chimera_p = (struct {struct} *)a;' if args else '(void)a;'}
+			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
+			{'' if ret == 'void' else 'return (uintptr_t)'}{name}({call_args});
+			{'return 0;' if ret == 'void' else ''}
+		}}""")
+            continue
         if ret == "void":
             guest.append(f"""static void GLAD_API_PTR w_{name}({signature})
 {{
@@ -396,6 +459,17 @@ static void *chimera_gl_shadow_new(uint64_t size)
 	*(uint64_t *)base = need;
 	return (char *)base + 64;
 }}
+/* The highest name of each kind the driver has handed this guest
+ * (GL_OP_NAME_MARKS): guest memory, so every state holds it, and the host
+ * reads it after a load to keep those numbers from new objects. */
+static struct ChimeraGlNameMarks g_name_marks = {{ CHIMERA_GL_NAME_MARKS_MAGIC, CHIMERA_GL_NAME_KINDS, {{ 0 }} }};
+static void chimera_gl_mark(unsigned kind, const GLuint *names, GLsizei n)
+{{
+	if (names == nullptr || kind >= CHIMERA_GL_NAME_KINDS) return;
+	for (GLsizei i = 0; i < n; i++)
+		if (names[i] > g_name_marks.high[kind]) g_name_marks.high[kind] = names[i];
+}}
+
 static void chimera_gl_shadow_free(void *p)
 {{
 	if (p == nullptr) return;
@@ -428,6 +502,9 @@ bool chimera_gl_install(chimera_gl_bridge_fn bridge)
 	}}
 
 	g_bridge = bridge;
+	/* where the marks are; a host that does not ask about them says it has no
+	 * case for the opcode, once, and nothing changes */
+	bridge(GL_OP_NAME_MARKS, (uint64_t)(uintptr_t)&g_name_marks, sizeof g_name_marks, 0, 0, 0);
 """ + "".join(f"\tglad_{n} = w_{n};\n" for n, _, _ in entries) + """	return true;
 }
 

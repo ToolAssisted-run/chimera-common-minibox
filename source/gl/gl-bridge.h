@@ -62,7 +62,39 @@ enum {
 	 * The unmap wrappers pass in b where the host writes the shadow it gives
 	 * back, for the guest to free. A persistent map not flushed explicitly
 	 * keeps the driver's pointer (see SHADOWED_MAPS in gen-gl-bridge.py). */
-	GL_OP_BUFFER_SIZE = 5
+	GL_OP_BUFFER_SIZE = 5,
+
+	/* Where the guest keeps the highest name of each kind the driver has
+	 * given it: a = a struct ChimeraGlNameMarks in guest memory, b = its
+	 * size. The table is the guest's own memory, so every state carries it.
+	 * After a load the host takes every name up to these marks again, empty,
+	 * in the fresh context it gives the guest, so no new object can get a
+	 * number the restored machine still holds - whichever process the state
+	 * was taken in. The host's own list of the names it saw made covers a
+	 * load in the process that took the state; a state taken by another
+	 * process (a project opened again) holds names this one never saw, and
+	 * a renderer deleting one by its old number deleted an object it had
+	 * just made (chimera#367). A host too old to know the question says it
+	 * has no case for it, and the guest goes on as before. */
+	GL_OP_NAME_MARKS = 6
+};
+
+/* The kinds of GL name, one namespace each, in the host's order. Programs and
+ * shaders share one. */
+enum {
+	CHIMERA_GL_NAME_TEXTURE, CHIMERA_GL_NAME_BUFFER, CHIMERA_GL_NAME_FRAMEBUFFER,
+	CHIMERA_GL_NAME_RENDERBUFFER, CHIMERA_GL_NAME_SAMPLER, CHIMERA_GL_NAME_QUERY,
+	CHIMERA_GL_NAME_VERTEX_ARRAY, CHIMERA_GL_NAME_PIPELINE, CHIMERA_GL_NAME_TRANSFORM_FEEDBACK,
+	CHIMERA_GL_NAME_PROGRAM,
+	CHIMERA_GL_NAME_KINDS
+};
+
+#define CHIMERA_GL_NAME_MARKS_MAGIC 0x4B52414Du /* "MARK" */
+
+struct ChimeraGlNameMarks {
+	uint32_t magic;      /* CHIMERA_GL_NAME_MARKS_MAGIC */
+	uint32_t kinds;      /* how many of high[] the guest keeps */
+	uint32_t high[16];   /* the highest name of each kind ever handed to it */
 };
 
 struct GlVersionArgs {
