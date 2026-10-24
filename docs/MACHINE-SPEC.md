@@ -542,10 +542,17 @@ Nothing changes for a guest that is never stopped.
   death: an error, and the machine ends. Where the guest is decides when:
   - in its own code: at once. On Linux the signal sends the thread out of the
     call; on Windows the thread is suspended, sent out and resumed.
+  - in its own fault handler (GuestFaultHandler, for a fault its code took):
+    at once, as in its own code. On Windows that handler runs inside the
+    host's fault handler, so the thread is sent to a trap, and the trap
+    leaves every handler frame from inside it (2026-10-24, chimera#363:
+    RPCS3's texture cache waits in there, and a wait that never ended could
+    not be stopped on Windows).
   - in a system call or a host callback: when it next makes a system call
     (every system call checks for a stop first).
   - in host code that never returns to the guest (a GPU call that waits for
-    ever, a fault being handled): not stopped. The frontend asks again.
+    ever, the host's own work on a fault): not stopped. The frontend asks
+    again.
   - asked on the thread running the call (from inside a host callback):
     at the guest's next system call.
 
@@ -574,7 +581,9 @@ blocked, so the check at a system call is what ends it); a stop asked for
 before a call and cancelled ends nothing; the count moves for getppid and
 not for yields; and a stop asked from inside a host callback ends the guest
 at its next yield, unless the frontend counted work after the ask, when the
-call ends by itself.
+call ends by itself. `threads` (`run_threads`), on Linux and on Windows: a
+guest looping inside its own fault handler is stopped from a second thread,
+twice, and the machine runs again after a state load.
 
 On Linux the stop's signal handler puts the host's `%fs` back before it runs
 any host code, as the fault handler does, when the signal came in while a

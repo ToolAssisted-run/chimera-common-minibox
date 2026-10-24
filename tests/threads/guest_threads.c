@@ -117,7 +117,8 @@ ECL_EXPORT uint64_t RunTls(void) {
  * ran under the guest's %fs it read the host's thread locals and its
  * mprotect arrived with a base the dispatcher refuses. */
 static _Thread_local volatile uint32_t t_faults;   /* changed by the handler, under the compiler's feet */
-static volatile uintptr_t g_watched, g_fatal;
+static volatile uintptr_t g_watched, g_fatal, g_spin_page;
+static volatile uint64_t g_handler_spins;
 /* A page of its own that nothing but the handler writes, so that after sealing
  * it is a tracked clean page: the handler's write to it faults INSIDE the
  * handler, and that fault has to be served as any other. */
@@ -146,6 +147,8 @@ ECL_EXPORT int GuestFaultHandler(uint64_t addr, uint64_t is_write) {
 		*(volatile uint32_t *)(uintptr_t)8 = 1;   /* dies in here: a fault no one handles */
 		return 0;
 	}
+	if (g_spin_page && addr >= g_spin_page && addr < g_spin_page + 4096)
+		for (;;) g_handler_spins++;   /* never comes back: SpinInFaultHandler */
 	if (!g_watched || addr < g_watched || addr >= g_watched + 4096) return 0;
 	t_faults++;
 	g_handler_page[0]++;
@@ -392,6 +395,20 @@ ECL_EXPORT uint64_t RunGuestFaultDeclined(void) {
 	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (page == MAP_FAILED) return 0xff;
 	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	page[1] = 0x5a;
+	return 0xfd;
+}
+
+/* Never returns: the handler loops for ever on this fault, making no system
+ * call, for the stop the host asks for from another thread (wbx_stop_guest).
+ * RPCS3's texture cache waits inside its fault handler for its renderer, and
+ * a wait there that never ended could not be stopped on Windows, where the
+ * handler runs inside the host's own (chimera#363). */
+ECL_EXPORT uint64_t SpinInFaultHandler(void) {
+	volatile uint8_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) return 0xff;
+	if (mprotect((void *)page, 4096, PROT_READ) != 0) return 0xfe;
+	g_spin_page = (uintptr_t)page;
 	page[1] = 0x5a;
 	return 0xfd;
 }

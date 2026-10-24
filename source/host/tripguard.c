@@ -365,6 +365,8 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 	/* guest code runs from here: a fault it takes on a held page is served */
 	const int phase = fault_phase();
 	fault_phase_set(MB_PHASE_GUEST);
+	mb_context *const in = mb_guest_ctx;
+	if (in) InterlockedIncrement(&in->guest_handlers);
 #ifdef MB_HAVE_FSBASE
 	/* ...and with the guest's own thread pointer, when it owns %fs. The
 	 * handler put the host's back on entry, and guest code under it reads
@@ -382,6 +384,7 @@ static bool ask_guest(uintptr_t addr, bool write, bool from_host_code) {
 #ifdef MB_HAVE_FSBASE
 	if (swap) mb_wrfsbase(host_fs);
 #endif
+	if (in) InterlockedDecrement(&in->guest_handlers);
 	fault_phase_set(phase);
 	return handled;
 }
@@ -1321,11 +1324,25 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep);
 /* The per-thread state above is read through TlsGetValue, which writes the
  * thread's last-error value on the way, and the code that faulted may be about
  * to read that value: it is put back. */
+/* A stop sent to a thread that is inside the host's fault handler: it is
+ * pointed here, and the trap it takes ends the call from inside that handler
+ * (veh_inner), the way a crash in the guest's own fault handler ends it. */
+extern char mb_stop_trap[];
+__asm__(".text\n\t.p2align 4\nmb_stop_trap:\n\tud2\n");
+
 /* A stop asked for from another thread (host.c's wbx_stop_guest): the thread
- * that calls the guest is suspended, and when it is running guest code with
- * no fault of this machine being handled, it is sent to the escape - the same
- * way a crash in guest code is (veh_fs below). Anywhere else it is let go, and
- * left for the next system call (host.c) or the next ask. 1 when it was sent. */
+ * that calls the guest is suspended, and when it is running guest code it is
+ * sent to the escape - the same way a crash in guest code is (veh_fs below).
+ * With no fault of this machine being handled it goes there at once. When the
+ * only faults being handled are ones whose guest fault handler is running, it
+ * is in that handler's code, called from inside the host's own handler - and
+ * a guest that loops in there was never stopped on Windows (chimera#363:
+ * RPCS3 waiting in its texture cache for a renderer that waited for it). Then
+ * it is sent to a trap, and leaves every handler frame from inside the
+ * handler, which also puts this thread's fault depth back to none (veh). Not
+ * while the host's own handler code runs, or a fault on another thread is
+ * being handled: it is let go, and left for the next system call (host.c) or
+ * the next ask. 1 when it was sent. */
 int mb_tripguard_stop_thread(void *thread) {
 	HANDLE t = (HANDLE)thread;
 	if (SuspendThread(t) == (DWORD)-1) return 0;
@@ -1334,13 +1351,22 @@ int mb_tripguard_stop_thread(void *thread) {
 	c.ContextFlags = CONTEXT_FULL;
 	int sent = 0;
 	if (GetThreadContext(t, &c) && mb_guest_ctx != NULL && mb_guest_ctx->stop_pending
-	    && mb_guest_ctx->handling == 0 && code_in_guest((uintptr_t)c.Rip) && mb_stop_due(mb_guest_ctx)) {
-		mb_guest_ctx->stop_pending = 0;
-		mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
-		c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-		c.Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
-		c.ContextFlags = CONTEXT_CONTROL;
-		sent = SetThreadContext(t, &c) != 0;
+	    && code_in_guest((uintptr_t)c.Rip)) {
+		const long handling = mb_guest_ctx->handling, in_handler = mb_guest_ctx->guest_handlers;
+		const bool idle = handling == 0;
+		const bool in_own_handler = in_handler > 0 && handling == in_handler;
+		if ((idle || in_own_handler) && mb_stop_due(mb_guest_ctx)) {
+			mb_guest_ctx->stop_pending = 0;
+			mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
+			if (idle) {
+				c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+				c.Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+			} else {
+				c.Rip = (DWORD64)(uintptr_t)mb_stop_trap;
+			}
+			c.ContextFlags = CONTEXT_CONTROL;
+			sent = SetThreadContext(t, &c) != 0;
+		}
 	}
 	ResumeThread(t);
 	return sent;
@@ -1353,8 +1379,16 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	if (handled) InterlockedIncrement(&handled->handling);
 	const LONG r = veh_fs(ep);
 	if (handled) InterlockedDecrement(&handled->handling);
-	/* a death: out of every handler frame at once (see the phase notes) */
+	/* a death: out of every handler frame at once (see the phase notes). The
+	 * frames left behind are this thread's faults still being handled, each
+	 * counted in its depth, and the guest fault handlers they called: none of
+	 * them comes back to take itself off the count, or a later stop would
+	 * wait for them for ever. */
 	if (r == EXCEPTION_CONTINUE_EXECUTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)&mb_guarded_escape) {
+		if (handled) {
+			InterlockedExchangeAdd(&handled->handling, -(long)fault_depth());
+			InterlockedExchange(&handled->guest_handlers, 0);
+		}
 		fault_depth_set(0);
 		fault_phase_set(MB_PHASE_NONE);
 	}
@@ -1404,6 +1438,14 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
 
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
+	/* a stop sent from inside the guest's own fault handler (mb_tripguard_stop_thread):
+	 * the death is already recorded */
+	if (code == STATUS_ILLEGAL_INSTRUCTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)mb_stop_trap
+	    && mb_guest_ctx != NULL && mb_guest_ctx->esc_rsp != 0) {
+		ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
+		ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
 	if (code == STATUS_GUARD_PAGE_VIOLATION) {
 		/* No page of a block is a guard page - see mb_page_native_prot - so
 		 * this is the host's own stack growing, and the kernel has already done

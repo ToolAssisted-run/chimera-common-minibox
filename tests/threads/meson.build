@@ -10,9 +10,7 @@ guest_threads_wbx = custom_target('guest_threads.wbx',
   ],
 )
 
-run_threads = executable('run_threads', 'run_threads.c',
-  dependencies: minibox_host_dep,
-)
+# run_threads comes from ../runner (built for every target, cross included)
 test('threads', run_threads,
   args: [guest_threads_wbx],
   suite: 'system',

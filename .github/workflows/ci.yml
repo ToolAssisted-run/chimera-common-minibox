@@ -79,6 +79,15 @@ jobs:
           name: guest-wbx
           path: build/ci/tests/conformance/guest.wbx
 
+      # The threads guest, whose fault handler runs inside the host's own on
+      # Windows (run_threads: a stop that lands in there, chimera#363)
+      - name: Upload the threads guest for the Windows jobs
+        if: matrix.name == 'c-guests'
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-threads-wbx
+          path: build/ci/tests/threads/guest_threads.wbx
+
   windows-cross:
     name: windows build (mingw-w64 cross)
     runs-on: ubuntu-latest
@@ -145,6 +154,7 @@ jobs:
           # was added no guest had ever run on Windows - the win64<->sysv64
           # boundary was only ever exercised on Linux
           cp build/ci-win/tests/runner/run_guest.exe artifacts/
+          cp build/ci-win/tests/runner/run_threads.exe artifacts/
           # the unit tests link the host statically, but mingw still needs its
           # own runtime beside them
           cp /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libgcc_s_seh-1.dll artifacts/ 2>/dev/null || true
@@ -176,12 +186,18 @@ jobs:
           name: guest-wbx
           path: artifacts
 
+      - name: Fetch the Linux-built threads guest
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-threads-wbx
+          path: artifacts
+
       - name: Run unit tests
         shell: pwsh
         working-directory: artifacts
         run: |
           $failed = 0
-          Get-ChildItem -Filter *.exe | Where-Object { $_.Name -ne "run_guest.exe" } | ForEach-Object {
+          Get-ChildItem -Filter *.exe | Where-Object { $_.Name -ne "run_guest.exe" -and $_.Name -ne "run_threads.exe" } | ForEach-Object {
             Write-Host "== $($_.Name)"
             & ".\$($_.Name)"
             if ($LASTEXITCODE -ne 0) { Write-Host "   FAILED ($LASTEXITCODE)"; $failed = 1 }
@@ -198,3 +214,13 @@ jobs:
         run: |
           & ".\run_guest.exe" ".\guest.wbx"
           if ($LASTEXITCODE -ne 0) { throw "guest run failed ($LASTEXITCODE)" }
+
+      # Green threads, and the guest's own fault handler, which on Windows runs
+      # inside the host's: it may fault again, give way to another thread, die
+      # in there, or loop in there until a stop from another thread ends it.
+      - name: Run the threads guest
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          & ".\run_threads.exe" ".\guest_threads.wbx"
+          if ($LASTEXITCODE -ne 0) { throw "threads guest run failed ($LASTEXITCODE)" }

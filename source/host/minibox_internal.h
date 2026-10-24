@@ -497,8 +497,15 @@ typedef struct {
 	 * code (tripguard.c). 0 when none is asked for. */
 	volatile int stop_pending;
 	/* Faults being handled for this machine right now (Windows): a stop from
-	 * another thread waits until there are none. */
+	 * another thread waits until there are none, or until every one of them is
+	 * the guest's own fault handler running guest code (guest_handlers). */
 	volatile long handling;
+	/* Calls into the guest's own fault handler in progress for a fault its
+	 * code took (Windows, where that handler runs inside the host's). A guest
+	 * can loop forever in there - RPCS3's texture cache waits in it for its
+	 * renderer (chimera#363) - and is stopped there like anywhere in its own
+	 * code. */
+	volatile long guest_handlers;
 	/* The guest's working system calls (all but yields, sleeps, clock reads,
 	 * futexes and thread ids), and a count of the frontend's own work for it
 	 * (wbx_count_work_from: a GPU driver call, a compile cache) added on top:

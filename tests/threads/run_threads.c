@@ -5,8 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <signal.h>
+#include <pthread.h>
+#include <time.h>
 #endif
 
 typedef struct { FILE *f; } fr_t;
@@ -22,6 +26,40 @@ typedef int (MB_GUEST_ABI *init_fn)(void);
 typedef uint64_t (MB_GUEST_ABI *run_fn)(void);
 typedef uint64_t (MB_GUEST_ABI *run1_fn)(uint64_t);
 static uintptr_t proc(mb_host *h, const char *n){mb_return r;wbx_get_proc_addr(h,n,&r);if(r.error_message[0]){fprintf(stderr,"proc %s:%s\n",n,r.error_message);exit(2);}return r.data;}
+
+/* Asks for a stop from another thread, as a frontend's watchdog does: after
+ * 200 ms, and again every 50 ms until the call comes back. A stop that never
+ * lands would hang the test, so after 10 seconds of asking it fails it. */
+struct stopper { mb_host *h; volatile int done; int asked; };
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+	Sleep((DWORD)ms);
+#else
+	struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+	nanosleep(&ts, NULL);
+#endif
+}
+#ifdef _WIN32
+static DWORD WINAPI stopper_fn(LPVOID arg)
+#else
+static void *stopper_fn(void *arg)
+#endif
+{
+	struct stopper *s = (struct stopper *)arg;
+	sleep_ms(200);
+	while (!s->done) {
+		mb_return r;
+		wbx_stop_guest(s->h, "stopped by the test after 200 ms", &r);
+		if (++s->asked == 200) {
+			fprintf(stderr, "  FAIL: a guest looping in its own fault handler was not stopped after %d asks\n", s->asked);
+			fflush(stdout);
+			fflush(stderr);
+			_Exit(1);
+		}
+		sleep_ms(50);
+	}
+	return 0;
+}
 
 int main(int argc, char **argv) {
 	const char *path = argc > 1 ? argv[1] : "guest_threads.wbx";
@@ -47,6 +85,7 @@ int main(int argc, char **argv) {
 	run_fn RunFaultRegisters = (run_fn)proc(h, "RunFaultRegisters");
 	run_fn RunGuestFaultDeclined = (run_fn)proc(h, "RunGuestFaultDeclined");
 	run_fn CallNullWithOwnFs = (run_fn)proc(h, "CallNullWithOwnFs");
+	run_fn SpinInFaultHandler = (run_fn)proc(h, "SpinInFaultHandler");
 	wbx_deactivate_host(h, &r); wbx_seal(h, &r);
 	if (r.error_message[0]) { fprintf(stderr, "seal: %s\n", r.error_message); return 1; }
 	wbx_activate_host(h, &r);
@@ -182,6 +221,40 @@ int main(int argc, char **argv) {
 		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
 		CHECK(!r.error_message[0]);
 		CHECK(RunThreads() == after_save);
+	}
+
+	/* A guest that loops for ever inside its own fault handler is stopped from
+	 * another thread - twice, so the first stop is seen to leave nothing
+	 * behind that keeps the next one from landing. On Windows, where the
+	 * handler runs inside the host's, it was never stopped (chimera#363). */
+	for (int k = 0; k < 2; k++) {
+		wbx_stop_from_here(h, &r);
+		struct stopper s = { h, 0, 0 };
+#ifdef _WIN32
+		HANDLE t = CreateThread(NULL, 0, stopper_fn, &s, 0, NULL);
+#else
+		pthread_t t;
+		pthread_create(&t, NULL, stopper_fn, &s);
+#endif
+		const uint64_t got = SpinInFaultHandler();
+		s.done = 1;
+#ifdef _WIN32
+		WaitForSingleObject(t, INFINITE);
+		CloseHandle(t);
+#else
+		pthread_join(t, NULL);
+#endif
+		char why[512];
+		wbx_get_death(h, why, sizeof why, &r);
+		printf("SpinInFaultHandler -> %#llx, dead=%llu, after %d asks: %s\n", (unsigned long long)got,
+		       (unsigned long long)r.data, s.asked, why);
+		CHECK(got == 0 && r.data == 1 && strstr(why, "stopped by the test after 200 ms") != NULL);
+		wbx_stop_cancel(h, &r);
+		st.pos = 0;
+		wbx_deactivate_host(h, &r); wbx_load_state(h, mem_read, (uintptr_t)&st, &r); wbx_activate_host(h, &r);
+		CHECK(!r.error_message[0]);
+		CHECK(RunThreads() == after_save);
+		CHECK(RunGuestFault() == 0);   /* the handler runs again, as at first */
 	}
 
 	wbx_deactivate_host(h, &r); wbx_destroy_host(h, &r);
