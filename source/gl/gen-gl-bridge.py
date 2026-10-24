@@ -330,16 +330,12 @@ def main():
 	return ({ret})chimera_r;
 }}
 """)
-            host.append(f"""		case CHIMERA_GL_OP_{name}:
-		{{
-			{f'struct {struct} *chimera_p = (struct {struct} *)a;' if args else '(void)a;'}
-			if (glad_{name} == NULL) {{ CHIMERA_GL_UNSUPPLIED(CHIMERA_GL_OP_{name}, "{name}"); return 0; }}
-			{'' if ret == 'void' else 'return (uintptr_t)'}{name}({call_args});
-			{'return 0;' if ret == 'void' else ''}
-		}}""")
-            continue
+            marked = True
+        else:
+            marked = False
         if ret == "void":
-            guest.append(f"""static void GLAD_API_PTR w_{name}({signature})
+            if not marked:
+                guest.append(f"""static void GLAD_API_PTR w_{name}({signature})
 {{
 	struct {struct} chimera_a;
 {body_fill}	g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a, 0, 0, 0, 0);
@@ -357,7 +353,8 @@ def main():
 			return 0;
 		}}""")
         else:
-            guest.append(f"""static {ret} GLAD_API_PTR w_{name}({signature})
+            if not marked:
+                guest.append(f"""static {ret} GLAD_API_PTR w_{name}({signature})
 {{
 	struct {struct} chimera_a;
 {body_fill}	return ({ret})g_bridge(CHIMERA_GL_OP_{name}, (uint64_t)(uintptr_t)&chimera_a, 0, 0, 0, 0);
