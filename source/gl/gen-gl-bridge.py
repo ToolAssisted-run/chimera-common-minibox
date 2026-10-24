@@ -524,8 +524,19 @@ uint64_t chimera_gl_context_id(void)
     unsupplied = ("#ifndef CHIMERA_GL_UNSUPPLIED\n"
                   "#define CHIMERA_GL_UNSUPPLIED(op, name) ((void)0)\n"
                   "#endif\n")
+    # The guest says where its name marks are (GL_OP_NAME_MARKS) as it
+    # installs. A host that never gives a guest a fresh context - a core
+    # repository's test runner - has no use for them and answers nothing; one
+    # that does (Chimera's) defines CHIMERA_GL_HOST_NAME_MARKS and answers it
+    # itself. Without this case such a runner says it has no case for the
+    # opcode, which its gate counts as a fault.
+    marks_case = ("#ifndef CHIMERA_GL_HOST_NAME_MARKS\n"
+                  "\t\tcase GL_OP_NAME_MARKS:\n"
+                  "\t\t\t(void)a;\n"
+                  "\t\t\treturn 0;\n"
+                  "#endif\n")
     with open(f"{outdir}/gl-bridge-host.inc", "w") as f:
-        f.write(banner + unsupplied + "\n".join(host) + "\n")
+        f.write(banner + unsupplied + marks_case + "\n".join(host) + "\n")
 
     print(f"{len(entries)} entry points generated"
           + (f"; {len(missing)} not found in glad: {' '.join(missing)}" if missing else ""))
