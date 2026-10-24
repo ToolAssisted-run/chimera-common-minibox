@@ -19,6 +19,7 @@ uintptr_t mb_host_proc_addr_raw(mb_host *h, const char *name);
 uintptr_t mb_host_callin_addr(mb_host *h, uintptr_t ptr);
 int       mb_host_callback_addr(mb_host *h, mb_external_callback cb, uintptr_t slot, uintptr_t *out);
 int       mb_host_seal(mb_host *h, char *errbuf, size_t errlen);
+int       mb_host_set_clock_start(mb_host *h, uint64_t unix_seconds, char *errbuf, size_t errlen);
 int       mb_host_mount(mb_host *h, const char *name, const uint8_t *data, size_t len, bool writable);
 int       mb_host_mount_path(mb_host *h, const char *name, const char *path);
 int       mb_host_unmount(mb_host *h, const char *name, uint8_t **out, size_t *outlen);
@@ -114,6 +115,12 @@ void wbx_get_callback_addr(mb_host *obj, mb_external_callback cb, uintptr_t slot
 	uintptr_t out;
 	if (mb_host_callback_addr(obj, cb, slot, &out) != 0) { err(ret, "slot must be < 64"); return; }
 	ok(ret, out);
+}
+
+void wbx_set_clock_start(mb_host *obj, uint64_t unix_seconds, mb_return *ret) {
+	char e[256]; e[0] = 0;
+	if (mb_host_set_clock_start(obj, unix_seconds, e, sizeof(e)) != 0) { err(ret, e); return; }
+	ok(ret, 0);
 }
 
 void wbx_seal(mb_host *obj, mb_return *ret) {

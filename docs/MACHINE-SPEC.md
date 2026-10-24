@@ -321,8 +321,12 @@ Implemented syscalls and their EXACT semantics:
 - **sched_setaffinity(203)** returns 0; **sched_getaffinity(204)** writes a
   zero mask (up to 4096 bytes) and returns 8; a size under 8 or a null mask
   is EINVAL.
-- **clock_gettime(228)**: writes tv_sec=1495889068, tv_nsec=0 regardless of the
-  clock id; returns 0. (This constant is part of the spec.)
+- **clock_gettime(228)**: writes the clock's start, tv_sec=1495889068,
+  tv_nsec=0 unless the host was told another (below), regardless of the clock
+  id; returns 0. (This start is part of the spec.) A host may be told another
+  start before the guest first runs (`wbx_set_clock_start`, 2026-10-24,
+  chimera#366): a whole second from 1970 to 2200-01-01, the same for every run
+  of a machine, so a movie still replays.
 - **sysinfo(99)**: zero-fills the 112-byte struct, then totalram = 1 GiB and
   freeram = 512 MiB; returns 0. mem_unit is 1, at offset 104 - for a core
   built with guest kit revision 1 or later. A core with no revision gets the
@@ -624,9 +628,11 @@ wants frame-paced time calls `clock_nanosleep(frame_ns)` once per frame; the
 policy stays inside the core, and the advance is part of the guest's own
 instruction stream.
 
-- **Clock**: starts at the v2 constant (tv_sec=1495889068, tv_nsec=0,
-  whatever the clock id). Every `clock_gettime` advances it by the tick,
-  1000 ns, then yields (below). The tick is a constant written here, not a
+- **Clock**: starts at the clock's start (tv_sec=1495889068, tv_nsec=0
+  unless the host was told another, whatever the clock id). Absolute times
+  given to clock_nanosleep and futex are on the same scale, past that start.
+  Every `clock_gettime` advances it by the tick, 1000 ns, then yields
+  (below). The tick is a constant written here, not a
   knob: two runs of the same movie advance identically.
 - **Thread switches**: a clock read yields after ticking, and a futex wake
   yields after waking. Reason: a thread spinning on the clock (or a waker

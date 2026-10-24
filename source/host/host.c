@@ -50,6 +50,7 @@ struct mb_host {
 	mb_thunks *thunks;
 	mb_threads *threads;
 	uint64_t getrandom_state; /* deterministic entropy stream, per host */
+	uint64_t clock_start_ns;  /* the second the machine's clock starts at, in ns (wbx_set_clock_start) */
 	uint32_t kit_revision;    /* the guest kit the core was built with (__wbx_kit_revision; 0 before) */
 	/* what the machine's small non-memory state was when the epoch began, so a
 	 * REVERSE delta can put it back. The memory half lives in the block. */
@@ -761,11 +762,11 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			 * chance to run; single-threaded the yield is a no-op) */
 			if (mb_threads_spec(h->threads) == 3) {
 				mb_threads_advance(h->threads, MB_V3_TICK_NS);
-				uint64_t now = MB_V3_BASE_NS + mb_threads_clock_ns(h->threads);
+				uint64_t now = h->clock_start_ns + mb_threads_clock_ns(h->threads);
 				ts[0] = (int64_t)(now / 1000000000ull); ts[1] = (int64_t)(now % 1000000000ull);
 				return mb_threads_yield_value(h->threads, &h->context, sok(0));
 			}
-			ts[0] = 1495889068; ts[1] = 0; return sok(0);
+			ts[0] = (int64_t)(h->clock_start_ns / 1000000000ull); ts[1] = (int64_t)(h->clock_start_ns % 1000000000ull); return sok(0);
 		}
 		case NR_getrandom: {
 			/* Determinism is the whole contract, so randomness cannot be real:
@@ -888,7 +889,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 			uint64_t target = mb_threads_ns_of(h->threads, req[0], req[1]);
 			if ((a2 & 1) != 0) {
 				/* absolute, on the clock's own scale: convert past the base */
-				uint64_t rel = (target > MB_V3_BASE_NS) ? target - MB_V3_BASE_NS : 0;
+				uint64_t rel = (target > h->clock_start_ns) ? target - h->clock_start_ns : 0;
 				uint64_t now = mb_threads_clock_ns(h->threads);
 				if (rel > now) mb_threads_advance(h->threads, rel - now);
 			} else mb_threads_advance(h->threads, target);
@@ -960,7 +961,7 @@ static uintptr_t MB_SYSV dispatch_inner(uintptr_t a1, uintptr_t a2, uintptr_t a3
 				uint64_t t = mb_threads_ns_of(h->threads, to[0], to[1]);
 				uint64_t dl;
 				if (op == FUTEX_WAIT) dl = mb_threads_ns_add(h->threads, mb_threads_clock_ns(h->threads), t);
-				else dl = (t > MB_V3_BASE_NS) ? t - MB_V3_BASE_NS : 0;   /* absolute, past the base; at-or-before the base is already due */
+				else dl = (t > h->clock_start_ns) ? t - h->clock_start_ns : 0;   /* absolute, past the start; at-or-before the start is already due */
 				return mb_threads_futex_wait_timeout(h->threads, &h->context, a1, (uint32_t)a3, true, dl);
 			}
 			switch (op) {
@@ -1147,6 +1148,7 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	  /* the guest kit's revision, read the same way (emulibc.c); none is 0 */
 	  uintptr_t kit_addr = mb_elf_proc_addr(h->elf, "__wbx_kit_revision");
 	  h->kit_revision = 0;
+	  h->clock_start_ns = MB_V3_BASE_NS;
 	  if (kit_addr) {
 		if (!guest_owns(h, kit_addr, 4)) { snprintf(errbuf, errlen, "guest's __wbx_kit_revision points outside its memory"); return host_new_unwind(h); }
 		memcpy(&h->kit_revision, (const void *)kit_addr, 4);
@@ -1314,6 +1316,18 @@ int mb_host_callback_addr(mb_host *h, mb_external_callback cb, uintptr_t slot, u
 	if (wrapped == 0) return -1;
 	h->context.extcall_slots[slot] = (mb_external_callback)wrapped;
 	*out = mb_get_callback_ptr(slot);
+	return 0;
+}
+
+/* The second the machine's clock starts at (owner, 2026-10-24, chimera#366):
+ * May 27, 2017 unless told otherwise, the same for every run, so a movie
+ * replays; a project may choose another to give a game other luck. Told
+ * before the core first runs, and never after the machine is sealed: a state
+ * does not carry it, so a machine taken back to a state must already have it. */
+int mb_host_set_clock_start(mb_host *h, uint64_t unix_seconds, char *errbuf, size_t errlen) {
+	if (h->sealed) { snprintf(errbuf, errlen, "the clock's start is set before the machine is sealed"); return -1; }
+	if (unix_seconds > MB_CLOCK_START_MAX_SEC) { snprintf(errbuf, errlen, "the clock cannot start later than 2200-01-01"); return -1; }
+	h->clock_start_ns = unix_seconds * 1000000000ull;
 	return 0;
 }
 

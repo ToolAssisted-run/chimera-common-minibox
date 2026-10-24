@@ -54,6 +54,10 @@ void wbx_get_proc_addr_raw(mb_host *obj, const char *name, mb_return *ret);
  * from sysv64 code, and a win64 callee would corrupt the caller's stack with its
  * shadow-space spill. */
 void wbx_get_callback_addr(mb_host *obj, mb_external_callback callback, uintptr_t slot, mb_return *ret);
+/* The second (since 1970, UTC) the machine's clock starts at; 1495889068
+ * (May 27, 2017) when never told. Before the core first runs; refused once
+ * the machine is sealed, and for a start later than 2200-01-01. */
+void wbx_set_clock_start(mb_host *obj, uint64_t unix_seconds, mb_return *ret);
 void wbx_seal(mb_host *obj, mb_return *ret);
 void wbx_mount_file(mb_host *obj, const char *name, mb_read_callback cb, uintptr_t userdata, bool writable, mb_return *ret);
 /* Mounts a file on the host's disk, read-only, WITHOUT reading it: the guest's

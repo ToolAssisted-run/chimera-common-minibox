@@ -29,6 +29,18 @@ ECL_EXPORT int Init(void) { return 1; }
 static long raw_clock(struct timespec *ts) { return syscall(SYS_clock_gettime, 0, ts); }
 static uint64_t vnow(void) { struct timespec ts; raw_clock(&ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 
+/* The second the clock reads, whatever start the host gave it (chimera#366). */
+ECL_EXPORT uint64_t V3ClockSeconds(void) { struct timespec ts; raw_clock(&ts); return (uint64_t)ts.tv_sec; }
+
+/* An absolute sleep to 1 ms past now, on whatever start the clock has: it
+ * wakes 1 ms later (and the reads' ticks), not a lifetime later. */
+ECL_EXPORT uint64_t V3AbsoluteSleepOneMs(void) {
+	const uint64_t now = vnow(), target = now + 1000000ull;
+	struct timespec t = { (time_t)(target / 1000000000ull), (long)(target % 1000000000ull) };
+	syscall(SYS_clock_nanosleep, 0, 1 /*TIMER_ABSTIME*/, &t, NULL);
+	return vnow() - now;
+}
+
 /* successive reads tick exactly 1 us (no absolute base asserted: Init may
  * have ticked before the first export runs) */
 ECL_EXPORT int V3ClockTicks(void) {

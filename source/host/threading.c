@@ -154,7 +154,7 @@ uint32_t mb_threads_kit_revision(const mb_threads *t) { return t->kit_revision; 
  * so the sum must fit. Linux saturates a huge timeout the same way
  * (KTIME_MAX); before revision 2 it wrapped, and a sleep of the largest time
  * there is ran the clock backwards (analysis of 2026-10-18). */
-#define MB_V3_CLOCK_MAX (UINT64_MAX - MB_V3_BASE_NS)
+#define MB_V3_CLOCK_MAX (UINT64_MAX - MB_CLOCK_START_MAX_SEC * 1000000000ull)
 
 uint64_t mb_threads_ns_of(const mb_threads *t, int64_t sec, int64_t nsec)
 {

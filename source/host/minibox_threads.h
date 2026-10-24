@@ -41,6 +41,10 @@ bool          mb_threads_take_held_unmap(mb_threads *t, mb_range *out);
 #define MB_V3_TICK_NS 1000ull
 #define MB_V3_BASE_SEC 1495889068ull
 #define MB_V3_BASE_NS (MB_V3_BASE_SEC * 1000000000ull)
+/* The latest second a machine may be told to start at (wbx_set_clock_start):
+ * 2200-01-01, so that the start plus the longest clock fits in 64 bits of
+ * nanoseconds whatever start was chosen. */
+#define MB_CLOCK_START_MAX_SEC 7258118400ull
 
 uintptr_t mb_threads_futex_wait(mb_threads *t, mb_context *c, uintptr_t addr, uint32_t compare);
 mb_sword      mb_threads_futex_wake(mb_threads *t, uintptr_t addr, uint32_t count);

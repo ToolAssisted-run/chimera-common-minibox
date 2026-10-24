@@ -284,6 +284,25 @@ static int v3_flow(const char *guest, bool kit0) {
 	free(state.buf);
 	wbx_deactivate_host(h, &r);
 	wbx_destroy_host(h, &r);
+
+	/* A host told another start for the clock (chimera#366): before the
+	 * guest first runs, never past 2200, never once sealed. */
+	STAGE("v3 a host told another start for the clock");
+	mb_host *h2 = make_v3_host(guest);
+	wbx_set_clock_start(h2, 7258118401ull, &r);
+	CHECK(r.error_message[0] != 0);
+	wbx_set_clock_start(h2, 1893553445ull, &r);
+	CHECK(!r.error_message[0]);
+	wbx_activate_host(h2, &r);
+	CHECK(((init_fn)proc(h2, "Init"))() == 1);
+	seal_and_activate(h2);
+	CHECK(((u64_fn)proc(h2, "V3ClockSeconds"))() == 1893553445ull);
+	const uint64_t slept = ((u64_fn)proc(h2, "V3AbsoluteSleepOneMs"))();
+	CHECK(slept >= 1000000ull && slept < 1100000ull);
+	wbx_deactivate_host(h2, &r);
+	wbx_set_clock_start(h2, 1495889068ull, &r);
+	CHECK(r.error_message[0] != 0);
+	wbx_destroy_host(h2, &r);
 	return fails != 0;
 }
 
