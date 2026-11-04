@@ -49,12 +49,12 @@ static void test_epoch_tracks_what_changed(void) {
 	gp(b, 0x3000)[0] = 7;                    /* page 3 */
 	gp(b, 0x3800)[0] = 8;                    /* page 3 again - still one page */
 	gp(b, 0x9000)[0] = 9;                    /* page 9 */
-	CHECK_EQ(mb_block_epoch_page_count(b), 2);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(3, 9));
 
 	/* a page already dirty against the baseline is still tracked by the epoch:
 	 * the two questions are independent, which is the whole point */
 	gp(b, 0x1000)[0] = 2;
-	CHECK_EQ(mb_block_epoch_page_count(b), 3);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(3, 9, 1));
 
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
@@ -148,7 +148,7 @@ static void test_delta_apply_leaves_its_pages_watched(void) {
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
 	gp(b, 0x4000)[1] = 0xBB;
 	gp(b, 0x5000)[0] = 0xCC;
-	CHECK_EQ(mb_block_epoch_page_count(b), 2);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(4, 5));
 	membuf next = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&next), 0);
 
@@ -184,7 +184,9 @@ static void test_hot_page_still_reports_every_change(void) {
 		CHECK(mb_block_maps_consistent(b));
 	}
 	CHECK(b->pages[4].hot);
-	CHECK(!b->pages[9].hot);
+	/* cold - unless it shares the hot page's host page, whose every write
+	 * releases it too (memblock.c, group_native_prot) */
+	CHECK(!b->pages[9].hot || same_group(9, 4));
 	uint8_t *end = snapshot(b, SIZE);
 	/* back to the anchor and forward through every delta: the machine the run
 	 * ended on, and the page was in every delta after the hold came off */
@@ -237,7 +239,7 @@ static void test_hot_page_cools_and_is_exact(void) {
 	gp(b, 0x4000)[1] = 0x99;
 	membuf e = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&e), 0);
-	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(4));
 	membuf_free(&e);
 	CHECK(mb_block_maps_consistent(b));
 	mb_block_free(b);
@@ -370,7 +372,7 @@ static void test_stack_page_after_an_anchor(void) {
 	gp(b, 0x6000)[0] = 7;
 	membuf d3 = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d3), 0);
-	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(6));
 
 	/* and anchor + delta is frame 3 */
 	anchor.pos = 0;
@@ -411,7 +413,7 @@ static void test_a_truncated_delta_leaves_pages_watched(void) {
 	gp(b, 0x3000)[1] = 0xAA;
 	gp(b, 0x4000)[1] = 0xBB;
 	gp(b, 0x5000)[1] = 0xCC;
-	CHECK_EQ(mb_block_epoch_page_count(b), 3);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(3, 4, 5));
 	CHECK(mb_block_maps_consistent(b));
 
 	membuf_free(&fwd); membuf_free(&cut);
@@ -491,9 +493,8 @@ static void test_a_truncated_state_leaves_pages_watched(void) {
 
 	/* and the same again through an epoch, which is the ordinary path */
 	CHECK_EQ(mb_block_epoch_begin(b), 0);
-	size_t wrote = 0;
-	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) { gp(b, i)[3] = 0x78; wrote++; }
-	CHECK_EQ(mb_block_epoch_page_count(b), wrote);
+	for (uintptr_t i = 0; i < 0x8000; i += 0x1000) gp(b, i)[3] = 0x78;
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(0, 1, 2, 3, 4, 5, 6, 7));
 
 	membuf_free(&whole); membuf_free(&cut);
 	mb_block_free(b);
@@ -1037,7 +1038,7 @@ static void test_a_hold_outlives_its_epoch(void) {
 	/* and the OS agrees: its first write in epoch 2 faults, and is counted once */
 	CHECK_EQ(mb_block_epoch_page_count(b), 0);
 	gp(b, 0x5000)[0] = 2;
-	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(5));
 	/* written: the hold is lifted by the write, and by nothing else */
 	CHECK(!b->pages[5].held);
 	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_RW);
@@ -1047,7 +1048,7 @@ static void test_a_hold_outlives_its_epoch(void) {
 	CHECK(b->pages[5].held);
 	CHECK_EQ(mb_page_native_prot(&b->pages[5]), MB_PROT_R);
 	gp(b, 0x5000)[0] = 3;
-	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(5));
 	CHECK(!b->pages[5].held);
 	/* an epoch given up with no successor leaves an unwritten page as it is:
 	 * read-only, and said to be */
@@ -1090,7 +1091,7 @@ static void test_a_hold_survives_a_planned_state(void) {
 
 	/* the frame writes it after the anchor: the fault must still come */
 	gp(b, 0x5000)[0] = 2;
-	CHECK_EQ(mb_block_epoch_page_count(b), 1);
+	CHECK_EQ(mb_block_epoch_page_count(b), WRITTEN(5));
 	membuf d = { 0 };
 	CHECK_EQ(mb_block_delta_save(b, true, membuf_write, (uintptr_t)&d), 0);
 

@@ -4,7 +4,7 @@
 #   minibox = subproject('miniBox')
 #   minibox_host_dep = minibox.get_variable('minibox_host_dep')
 #
-# Phase 1: Linux x86-64, single guest thread, C guests.
+# Phase 1: Linux x86-64 (and aarch64), single guest thread, C guests.
 
 minibox_host_inc = include_directories('.')
 
@@ -13,16 +13,24 @@ minibox_host_sources = files(
   'memblock.c',
   'diag.c',
   'tripguard.c',
-  'interop_bin.c',
   'context.c',
-  'guarded.S',
   'elf.c',
   'fs.c',
   'host.c',
   'threading.c',
   'cinterface.c',
-  'calling_convention_adapters.c',
 )
+
+# The machine's own code - the interop area and the guarded call - is written
+# for the CPU it runs on: x86-64 (the spec's) or aarch64.
+if host_machine.cpu_family() == 'aarch64'
+  minibox_host_sources += files('interop_aarch64.S', 'guarded_aarch64.S')
+elif host_machine.cpu_family() == 'x86_64'
+  # (the win64<->sysv64 adapters are x86-64's: aarch64 has one ABI)
+  minibox_host_sources += files('interop_bin.c', 'guarded.S', 'calling_convention_adapters.c')
+else
+  error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
+endif
 
 # The PAL is platform-specific (each file self-guards with #ifdef, so listing
 # both is also fine, but select the right one for clarity).
@@ -44,11 +52,14 @@ if minibox_git_commit == ''
   minibox_git_commit = 'unknown'
 endif
 minibox_build_os = run_command(
-  'sh', '-c', '. /etc/os-release 2>/dev/null && printf "%s %s" "$ID" "$VERSION_ID" || uname -s',
+  'sh', '-c', '[ -r /etc/os-release ] && . /etc/os-release && printf "%s %s" "$ID" "$VERSION_ID" || uname -s',
   check: false).stdout().strip()
 
 minibox_host_c_args = [
   '-fno-strict-aliasing',
+  # MB_HOST_PAGE (memblock.c) is read only by this build, for the tests; a
+  # frontend that compiles the host itself leaves it out
+  '-DMB_HOST_PAGE_TESTING=1',
   '-DMB_BUILD_COMMIT="' + minibox_git_commit + '"',
   '-DMB_BUILD_COMPILER="' + meson.get_compiler('c').get_id() + ' ' + meson.get_compiler('c').version() + '"',
   '-DMB_BUILD_OS="' + minibox_build_os + '"',

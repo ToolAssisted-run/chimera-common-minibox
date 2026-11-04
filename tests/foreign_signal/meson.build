@@ -7,7 +7,7 @@ guest_spin_wbx = custom_target('guest_spin.wbx',
   input: 'guest_spin.c',
   output: 'guest_spin.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )

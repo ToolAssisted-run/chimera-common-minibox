@@ -6,7 +6,7 @@ guest_cpp_wbx = custom_target('guest_cpp.wbx',
   input: 'guest_cpp.cpp',
   output: 'guest_cpp.wbx',
   command: [
-    waterbox_musl_gxx, waterbox_guest_cxxflags, waterbox_guest_cxx_ldflags,
+    waterbox_guest_link + [waterbox_musl_gxx], waterbox_guest_cxxflags, waterbox_guest_cxx_ldflags,
     '-std=c++17', '-o', '@OUTPUT@', '@INPUT@',
     waterbox_cxxglue_obj, waterbox_emulibc_obj, waterbox_guest_cxx_libs,
   ],

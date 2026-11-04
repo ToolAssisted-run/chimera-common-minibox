@@ -13,6 +13,11 @@
 #                '-o', '@OUTPUT@', '@INPUT@',
 #                minibox.get_variable('waterbox_emulibc_obj'), '-lgcc' ])
 #
+# On aarch64 a linked guest is finished by wbx-tp-rewrite.py, which points its
+# thread-pointer reads at the machine's slot (MACHINE-SPEC, "aarch64"); put
+# minibox.get_variable('waterbox_guest_link') in front of the link command to
+# have it done (it links, then rewrites the -o; on x86-64 it only links).
+#
 # A generated cross-file (waterbox-guest.ini) is also emitted for consumers that
 # prefer building the guest as a separate cross-compiled meson project.
 #
@@ -30,23 +35,33 @@ waterbox_jsmn_dir     = meson.project_source_root() / 'extern' / 'jsmn'
 waterbox_linkscript  = meson.current_source_dir() / 'linkscript.T'
 
 # The frozen guest flags (BizHawk waterbox COMMONFLAGS; C, no C++/LTO).
+# (waterbox_cpu_flags and waterbox_common_flags: the top-level meson.build,
+# per guest CPU; on x86-64 they are exactly the list this used to spell out)
 waterbox_guest_cflags = [
   '-fvisibility=hidden', '-I' + waterbox_emulibc_dir,
   '-I' + waterbox_guestkit_inc, '-I' + waterbox_jsmn_dir,
-  '-Wall', '-mcmodel=large', '-mno-red-zone',
-  '-mstack-protector-guard=global', '-fno-stack-protector', '-fno-pic', '-fno-pie', '-fcf-protection=none',
+  '-Wall'] + waterbox_cpu_flags + waterbox_common_flags + [
   '-O2', '-DNDEBUG',
 ]
 waterbox_guest_ldflags = [
   '-static', '-no-pie', '-Wl,--eh-frame-hdr,-O2', '-T', waterbox_linkscript,
 ]
+# Every guest link goes through this: the link, then wbx-tp-rewrite.py on its
+# output (an aarch64 guest reads its thread pointer from the machine's slot,
+# not TPIDR_EL0; x86-64 has nothing to rewrite).
+waterbox_tp_rewrite = files('wbx-tp-rewrite.py')
+waterbox_guest_link = [find_program('python3'), waterbox_tp_rewrite, '--']
 
 # emulibc.o is a meson build artifact, compiled with the just-built musl-gcc.
 # Passing the musl-gcc custom_target as command[0] makes ninja build musl first.
+# Built by default, and musl with it: cores outside this tree link the kit, and
+# a plain build has to leave it ready for them. Meson 1.3 built it anyway,
+# because the guest tests use it; Meson 1.10 and later do not.
 waterbox_emulibc_ct = custom_target('emulibc.c.o',
   input: waterbox_emulibc_dir / 'emulibc.c',
   output: 'emulibc.c.o',
   command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default: true,
 )
 waterbox_emulibc_obj = waterbox_emulibc_ct
 
@@ -67,7 +82,7 @@ if waterbox_cpp_guest
   waterbox_guest_cxxflags = waterbox_guest_cflags + [
     '-specs', waterbox_sysroot / 'lib' / 'musl-gcc.specs',
     '-I' + waterbox_gxx_include,
-    '-I' + waterbox_gxx_include / 'x86_64-linux-musl',
+    '-I' + waterbox_gxx_include / waterbox_guest_triplet,
     '-fno-exceptions', '-fno-rtti',
   ]
   waterbox_guest_cxx_ldflags = [
@@ -85,10 +100,16 @@ if waterbox_cpp_guest
     output: 'cxxglue.c.o',
     command: [waterbox_musl_gcc, '-c', waterbox_guest_cflags, '-std=c11', '-o', '@OUTPUT@', '@INPUT@'],
     depends: waterbox_libstdcxx,
+    build_by_default: true,   # and libstdc++ with it, as emulibc above
   )
 endif
 
 # Emit a cross-file for consumers who want to build the guest as a cross project.
+waterbox_machine_args_quoted = []
+foreach f : waterbox_cpu_flags + waterbox_common_flags
+  waterbox_machine_args_quoted += '\'' + f + '\''
+endforeach
+waterbox_machine_args_ini = ', '.join(waterbox_machine_args_quoted)
 configure_file(
   input: 'waterbox-guest.ini.in',
   output: 'waterbox-guest.ini',
@@ -99,5 +120,8 @@ configure_file(
     'JSMN_INC': waterbox_jsmn_dir,
     'EMULIBC_OBJ': waterbox_emulibc_ct.full_path(),
     'LINKSCRIPT': waterbox_linkscript,
+    'MACHINE_ARGS': waterbox_machine_args_ini,
+    'CPU_FAMILY': host_machine.cpu_family(),
+    'TP_REWRITE': meson.current_source_dir() / 'wbx-tp-rewrite.py',
   },
 )

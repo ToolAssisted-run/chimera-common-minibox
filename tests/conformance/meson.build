@@ -6,7 +6,7 @@ guest_wbx = custom_target('guest.wbx',
   input: 'guest.c',
   output: 'guest.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )
@@ -37,7 +37,7 @@ guest_kit0_wbx = custom_target('guest-kit0.wbx',
   input: 'guest.c',
   output: 'guest-kit0.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', emulibc_kit0, '-lgcc',
   ],
 )
@@ -47,6 +47,9 @@ test('conformance-kit0', run_guest,
   timeout: 120,
 )
 
+# x86-64 only: the %fs a host may drop, and FSGSBASE that may be missing.
+# aarch64's thread pointer is always the user's and is never lost.
+if host_machine.cpu_family() == 'x86_64'
 # Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
 test('conformance-fs-repair', run_guest,
   args: ['--fs-repair-child', guest_wbx],
@@ -61,6 +64,7 @@ test('conformance-probe-off', run_guest,
   suite: 'system',
   timeout: 180,
 )
+endif
 
 # Guests that die while starting and while being sealed: the host refuses the
 # machine with the reason and lives on.
@@ -86,7 +90,7 @@ guest_v3_wbx = custom_target('guest-v3.wbx',
   input: 'guest-v3.c',
   output: 'guest-v3.wbx',
   command: [
-    waterbox_musl_gcc, waterbox_guest_cflags, waterbox_guest_ldflags,
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
     '-std=c11', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
   ],
 )

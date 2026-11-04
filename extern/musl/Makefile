@@ -177,7 +177,7 @@ lib/%.o: obj/crt/%.o
 	cp $< $@
 
 lib/musl-gcc.specs: $(srcdir)/tools/musl-gcc.specs.sh config.mak
-	sh $< "$(includedir)" "$(libdir)" "$(LDSO_PATHNAME)" > $@
+	sh $< "$(includedir)" "$(libdir)" "$(LDSO_PATHNAME)" "$(ARCH)" > $@
 
 obj/musl-gcc: config.mak
 	printf '#!/bin/sh\nexec "$${REALGCC:-$(WRAPCC_GCC)}" "$$@" -specs "%s/musl-gcc.specs"\n' "$(libdir)" > $@

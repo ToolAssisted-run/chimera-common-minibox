@@ -358,7 +358,7 @@ static void test_host_file(void) {
 	 * UTF-8 it arrives as, on every host (Windows' fopen would read the bytes
 	 * in the ANSI code page and find nothing) */
 	char accented[600];
-	snprintf(accented, sizeof accented, "%s-Br\xc3\xb8derbund.dsk", path);
+	snprintf(accented, sizeof accented, "%s-Br\xc3\xb8" "derbund.dsk", path);
 	{
 #if defined(_WIN32)
 		wchar_t wide[600];

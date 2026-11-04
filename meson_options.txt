@@ -5,3 +5,7 @@
 # (GPL-3 WITH GCC Runtime Library Exception).
 option('guest_cpp', type: 'boolean', value: false,
        description: 'build the C++ guest toolchain (libstdc++ for the guest)')
+# The compiler guests are built with: a gcc whose objects are ELF for the
+# machine's CPU. Empty: the host's gcc.
+option('guest_cc', type: 'string', value: '',
+       description: 'the gcc that builds guests (default: gcc)')

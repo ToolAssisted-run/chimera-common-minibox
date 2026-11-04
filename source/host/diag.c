@@ -71,15 +71,24 @@ void mb_diag_banner(const char *what) {
 #define MB_BUILD_OS "unknown"
 #endif
 
+#if defined(_WIN32)
+#define MB_TARGET_OS "windows"
+#else
+#define MB_TARGET_OS "linux"
+#endif
+#if defined(__aarch64__)
+#define MB_TARGET_CPU "aarch64"
+#elif defined(__x86_64__)
+#define MB_TARGET_CPU "x86_64"
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+
 const char *mb_build_info(void) {
 	return "{\"component\":\"miniBox host\""
 	       ",\"commit\":\"" MB_BUILD_COMMIT "\""
 	       ",\"compiler\":\"" MB_BUILD_COMPILER "\""
 	       ",\"builtOn\":\"" MB_BUILD_OS "\""
-#if defined(_WIN32)
-	       ",\"target\":\"windows-x86_64\""
-#else
-	       ",\"target\":\"linux-x86_64\""
-#endif
+	       ",\"target\":\"" MB_TARGET_OS "-" MB_TARGET_CPU "\""
 	       "}";
 }
