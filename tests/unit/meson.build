@@ -5,7 +5,9 @@ unit_tests = ['test_memblock', 'test_sha256', 'test_fs', 'test_errno', 'test_sav
 
 foreach t : unit_tests
   exe = executable(t, t + '.c', dependencies: minibox_host_static_dep)
-  test(t, exe, suite: 'unit', timeout: 60)
+  # a fault costs several times more on macOS (Mach's exception, then the
+  # signal), and test_tripguard takes 768,000 of them
+  test(t, exe, suite: 'unit', timeout: t == 'test_tripguard' and host_machine.system() == 'darwin' ? 300 : 60)
 endforeach
 
 # waterbox_slots.h is guest-kit C that compiles on the host too, which is how

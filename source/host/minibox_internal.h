@@ -763,11 +763,6 @@ static inline uintptr_t mb_gs_host_now(void) {
 	__asm__ volatile("movq %%gs:%c1, %0" : "=r"(v) : "i"(MB_TIB_HOST_GS * 8));
 	return v;
 }
-static inline uintptr_t mb_gs_context_now(void) {
-	uintptr_t v;
-	__asm__ volatile("movq %%gs:0x18, %0" : "=r"(v));
-	return v;
-}
 /* guarded.S: swap this thread to its guest block / back to the OS's; each
  * keeps every register and is a no-op when already there (the second) */
 void mb_gs_to_guest(void);

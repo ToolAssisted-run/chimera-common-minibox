@@ -322,17 +322,21 @@ static void test_an_unmap_during_a_plan(void) {
 
 /* A page the guest takes every right from while a state still owes it stays
  * without them: the hold takes away writing, not what the guest asked for. It
- * was readable until the copier got to it. */
+ * was readable until the copier got to it. A whole host page of them: on a
+ * host whose page is larger than the machine's (16 KiB on Apple silicon), one
+ * machine page shares its protection with the rest of its host page, and
+ * stays readable while they are. */
 static void test_a_hold_keeps_the_guests_protection(void) {
 	mb_block *b = running(0x80000);
+	const uintptr_t host_page = (uintptr_t)mb_group_pages() * MB_PAGESIZE;
 	const size_t size = mb_block_state_size(b);
 	uint8_t *dest = (uint8_t *)calloc(1, size);
 	CHECK(dest != NULL);
 	CHECK(mb_block_state_plan(b, dest) != 0);
-	mb_range none = { b->addr.start + 0x20000, MB_PAGESIZE };
+	mb_range none = { b->addr.start + 0x20000, host_page };
 	CHECK_EQ(mb_block_mprotect(b, none, MB_PROT_NONE), 0);
 	CHECK(!mb_page_readable(none.start));
-	mb_range ro = { b->addr.start + 0x21000, MB_PAGESIZE };
+	mb_range ro = { b->addr.start + 0x20000 + host_page, host_page };
 	CHECK_EQ(mb_block_mprotect(b, ro, MB_PROT_R), 0);
 	CHECK(mb_page_readable(ro.start));
 	CHECK(mb_block_maps_consistent(b));

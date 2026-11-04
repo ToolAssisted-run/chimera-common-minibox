@@ -62,9 +62,13 @@ static uintptr_t gs_context_slot(void) {
 	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
 #else
 #ifdef __APPLE__
-	/* the thread's gs is the guest's block only while it runs a guest, and
-	 * says so itself (mb_gs_in_guest); the OS's own is not ours to read */
-	return mb_gs_in_guest() ? mb_gs_context_now() : 0;
+	/* this thread's block, read as memory rather than through gs: the signal
+	 * handlers put the OS's gs back before anything asks (MB_GS_WRAP), so gs
+	 * no longer says whether the thread was in a guest call; the block's
+	 * slot does, whichever base is loaded. A thread that never ran a guest
+	 * has no block yet (no magic), and is not read. */
+	const uintptr_t *block = mb_thread_block();
+	return block[0] == MB_GS_MAGIC ? block[3] : 0;
 #else
 	uintptr_t base = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /* ARCH_GET_GS */, &base) != 0 || base == 0) return 0;
@@ -646,23 +650,6 @@ bool mb_page_readable(uintptr_t p) {
 	}
 	close(fd);
 	return found && readable;
-}
-#elif defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-/* The kernel's own answer, one Mach trap, no allocation: the region at or
- * after the address, and the address counts when the region starts at or
- * before it and may be read. */
-bool mb_page_readable(uintptr_t p) {
-	mach_vm_address_t addr = p;
-	mach_vm_size_t size = 0;
-	vm_region_basic_info_data_64_t info;
-	mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-	mach_port_t object = MACH_PORT_NULL;
-	if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
-	                   (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
-		return false;
-	return addr <= p && (info.protection & VM_PROT_READ) != 0;
 }
 #else
 bool mb_page_readable(uintptr_t p) { (void)p; return true; }
