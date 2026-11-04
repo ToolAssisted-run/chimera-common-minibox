@@ -1014,6 +1014,16 @@ int main(int argc, char **argv) {
 		CHECK(at_entry == 0);
 		CHECK(after_syscall == 0);
 		CHECK(after_extcall == 0);
+#if defined(__aarch64__)
+		/* x18, the platform register: zeroed for the guest on Linux and macOS;
+		 * on Windows the thread's TEB, which must stay there */
+		const uint64_t x18 = ((u64_fn)proc(h, "EntryX18"))();
+#ifdef _WIN32
+		CHECK(x18 == (uint64_t)(uintptr_t)NtCurrentTeb());
+#else
+		CHECK(x18 == 0);
+#endif
+#endif
 	}
 	/* nor in its xmm0-15. Before the entry case this side fills xmm0-5 (scratch
 	 * in both host ABIs) with ones, so the check does not rest on whatever the

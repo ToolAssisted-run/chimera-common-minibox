@@ -1891,12 +1891,19 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			int phase_before;
 			if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
-			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
+#if defined(__aarch64__)
+			/* musl's a_crash() on aarch64 is udf #0xf4: an illegal instruction to
+			 * Windows, a halt to the guest (as on Linux, handler_other) */
+			const bool halted = code == STATUS_ILLEGAL_INSTRUCTION && *(const uint32_t *)rip == 0x000000f4u;
+#else
+			const bool halted = code == STATUS_PRIVILEGED_INSTRUCTION;
+#endif
+			mb_diag_banner(halted ? "the guest halted itself" : "the guest hit an illegal instruction");
 			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
 			        code == STATUS_PRIVILEGED_INSTRUCTION ? "privileged instruction" : "illegal instruction", (void *)rip);
 			say_ctx_regs(c);
 			if (guest_can_die_here(rip)
-			    && mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_PRIVILEGED_INSTRUCTION
+			    && mb_host_guest_death_in_handler(mb_guest_ctx, halted
 			           ? "the core stopped itself after finding its own memory corrupt (a halt at %p)"
 			           : "the core ran an illegal instruction at %p", (void *)rip)) {
 				WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
@@ -1908,6 +1915,29 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+#if defined(__aarch64__)
+	if (code == STATUS_DATATYPE_MISALIGNMENT || code == 0xC00000AA /* STATUS_INSTRUCTION_MISALIGNMENT */) {
+		/* aarch64's bus error: a call to an address that is not a multiple of
+		 * 4 (a wild call), or a misaligned exclusive access. In guest code it
+		 * is the guest's death, as SIGBUS is on Linux (handler_other). */
+		const uintptr_t rip = (uintptr_t)WC_PC(ep->ContextRecord);
+		if (guest_can_die_here(rip)) {
+			int phase_before;
+			if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
+			mb_diag_banner("a bus error in guest code");
+			say_ctx_regs(ep->ContextRecord);
+			if (mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: a bus error at address %p (at %p)",
+			        (void *)(uintptr_t)ep->ExceptionRecord->ExceptionInformation[1], (void *)rip)) {
+				WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
+				WC_PC(ep->ContextRecord) = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				report_end(phase_before);
+				return EXCEPTION_CONTINUE_EXECUTION;
+			}
+			report_end(phase_before);
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+#endif
 	if (code == STATUS_INTEGER_DIVIDE_BY_ZERO || code == STATUS_INTEGER_OVERFLOW) {
 		const uintptr_t rip = (uintptr_t)WC_PC(ep->ContextRecord);
 		if (guest_can_die_here(rip)) {

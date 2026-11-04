@@ -560,18 +560,25 @@ ECL_EXPORT void Abort(void) {
 #if defined(__aarch64__)
 /* aarch64: no single register carries the context. What a guest could find
  * of the host is any scratch register that is neither an argument nor the
- * answer, so each probe returns them all OR-ed together: x8-x18 on entry
- * (x10 is the export's own address, a guest one, and left out), x1-x18 after
- * a syscall and after a callback. */
+ * answer, so each probe returns them all OR-ed together: x8-x17 on entry
+ * (x10 is the export's own address, a guest one, and left out), x1-x17 after
+ * a syscall and after a callback. x18, the platform register, is probed on
+ * its own (EntryX18): guests never use it (-ffixed-x18), the host zeroes it
+ * on Linux and macOS, and on Windows it is the thread's TEB, which Windows
+ * needs there at every instruction. */
 #define WBX_OR_SCRATCH(first) \
 	"\tmov x0, " first "\n" \
 	"\torr x0, x0, x9\n\torr x0, x0, x11\n\torr x0, x0, x12\n\torr x0, x0, x13\n" \
-	"\torr x0, x0, x14\n\torr x0, x0, x15\n\torr x0, x0, x16\n\torr x0, x0, x17\n\torr x0, x0, x18\n"
+	"\torr x0, x0, x14\n\torr x0, x0, x15\n\torr x0, x0, x16\n\torr x0, x0, x17\n"
 __asm__(
 	".text\n"
 	".globl EntryR10\n.type EntryR10,%function\n"
 	"EntryR10:\n"
 	WBX_OR_SCRATCH("x8")
+	"\tret\n"
+	".globl EntryX18\n.type EntryX18,%function\n"
+	"EntryX18:\n"
+	"\tmov x0, x18\n"
 	"\tret\n"
 	".globl SyscallR10\n.type SyscallR10,%function\n"
 	"SyscallR10:\n"
