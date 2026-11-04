@@ -139,30 +139,6 @@ jobs:
           name: meson-logs-macos-${{ matrix.arch }}
           path: build/ci/meson-logs/
 
-      - name: Why macOS killed a test (on failure)
-        if: failure()
-        run: |
-          # a test macOS ends with SIGKILL says nothing itself: run test_delta
-          # again, watching its memory, and ask the system log who killed it
-          set +e
-          t=build/ci/tests/unit/test_delta
-          "$t" > td.out 2>&1 & pid=$!
-          for i in $(seq 1 90); do
-            kill -0 $pid 2>/dev/null || break
-            echo "$i s: $(ps -o rss=,vsz= -p $pid) (rss, vsz in KiB)"
-            sleep 1
-          done
-          kill -9 $pid 2>/dev/null
-          wait $pid; echo "exit $?"
-          tail -5 td.out
-          # the kernel names the process it kills, and why (code signing,
-          # a guard, memory)
-          log show --last 3m --style compact --predicate 'eventMessage CONTAINS[c] "test_delta" OR process == "kernel" AND (eventMessage CONTAINS[c] "kill" OR eventMessage CONTAINS[c] "signing" OR eventMessage CONTAINS[c] "guard")' | tail -60
-          ls -t ~/Library/Logs/DiagnosticReports 2>/dev/null | head -5
-          f=$(ls -t ~/Library/Logs/DiagnosticReports/test_delta* 2>/dev/null | head -1)
-          [ -n "$f" ] && head -c 6000 "$f"
-          exit 1
-
   windows-cross:
     name: windows build (mingw-w64 cross)
     runs-on: ubuntu-latest
