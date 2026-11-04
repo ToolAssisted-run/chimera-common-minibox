@@ -46,6 +46,14 @@
  * on the guest stack across a syscall, which is also the frame a new guest
  * thread starts from (threading.c: {x29 = 0, x30 = entry}).
  *
+ * On Windows the thread's stack bounds in its TEB (StackBase at x18 + 8,
+ * StackLimit at x18 + 16) span the whole address space while a guest call
+ * runs, as the x86-64 blob makes them span it at gs:0x8 and gs:0x10: Windows
+ * checks the stack pointer against them when it delivers an exception (a
+ * fault the handler serves, on the guest's stack), and ends the process when
+ * they do not hold it. The host's go back when the call returns, and when a
+ * guest that died is escaped from (guarded_aarch64.S).
+ *
  * Context offsets: see mb_context and the asserts in context.c.
  */
 
@@ -183,6 +191,9 @@ call_guest_impl:
 	stp d10, d11, [sp, #-16]!
 	stp d12, d13, [sp, #-16]!
 	stp d14, d15, [sp, #-16]!
+#ifdef _WIN32
+	bl teb_bounds_wide
+#endif
 	interop_slot_addr x11
 	str x9, [x11]
 	mov x11, sp
@@ -224,6 +235,9 @@ call_guest_impl:
 	str x17, [x16, #CTX_GUEST_RSP]
 	str x15, [x16, #CTX_GUEST_RSP_ALT]
 2:
+#ifdef _WIN32
+	bl teb_bounds_back
+#endif
 	ldp d14, d15, [sp], #16
 	ldp d12, d13, [sp], #16
 	ldp d10, d11, [sp], #16
@@ -288,6 +302,25 @@ zero_vectors:
 	movi v\n\().2d, #0
 	.endr
 	ret
+
+#ifdef _WIN32
+/* call_guest_impl's, out of line for the same reason: the TEB's stack bounds
+ * pushed on the host stack (StackLimit, then StackBase above it) and made the
+ * whole address space; and taken back. x11 and x12 only. */
+teb_bounds_wide:
+	ldr x11, [x18, #8]
+	ldr x12, [x18, #16]
+	stp x12, x11, [sp, #-16]!
+	mov x11, #-1
+	str x11, [x18, #8]
+	str xzr, [x18, #16]
+	ret
+teb_bounds_back:
+	ldp x12, x11, [sp], #16
+	str x11, [x18, #8]
+	str x12, [x18, #16]
+	ret
+#endif
 mb_interop_end:
 
 	.balign 4

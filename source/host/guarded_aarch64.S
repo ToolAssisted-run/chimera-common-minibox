@@ -55,7 +55,9 @@
 #define FRAME_D8            144  /* d8..d15 */
 #define FRAME_PREV_FPCR     208  /* the context's host FPCR before this call */
 #define FRAME_PREV_FPSR     212  /* and its host FPSR flags (16 bits) */
-#define FRAME_SIZE          224
+#define FRAME_TEB_BASE      216  /* Windows: the TEB's StackBase and StackLimit */
+#define FRAME_TEB_LIMIT     224  /* as this call found them */
+#define FRAME_SIZE          240
 
 	.text
 	.globl MB_SYM(mb_guarded_call)
@@ -99,6 +101,14 @@ MB_SYM(mb_guarded_call):
 	str x11, [sp, #FRAME_HOST_RSP_ALT]
 	ldr x11, [x9, #CTX_GUEST_RSP_ALT]
 	str x11, [sp, #FRAME_GUEST_RSP_ALT]
+#ifdef _WIN32
+	/* the thread's stack bounds, which the blob makes the whole address
+	 * space for the guest (interop_aarch64.S): an escape puts them back */
+	ldr x11, [x18, #8]
+	str x11, [sp, #FRAME_TEB_BASE]
+	ldr x11, [x18, #16]
+	str x11, [sp, #FRAME_TEB_LIMIT]
+#endif
 	mov x11, sp
 	str x11, [x9, #CTX_ESC_RSP]
 	ldr x11, [x9, #CTX_CALLS]
@@ -225,12 +235,19 @@ MB_SYM(mb_guarded_escape):
 	/* the thread is in no guest call: the blob's context word, as gs:0x18 */
 	interop_slot_addr x10
 	str xzr, [x10]
+#ifdef _WIN32
+	/* and its stack bounds are the host's again */
+	ldr x10, [sp, #FRAME_TEB_BASE]
+	str x10, [x18, #8]
+	ldr x10, [sp, #FRAME_TEB_LIMIT]
+	str x10, [x18, #16]
+#endif
 	mov x0, #0
 	b .Llanding
 	MB_SIZE(MB_SYM(mb_guarded_escape))
 
-#if defined(__linux__)
-/* Linux: the guest's fault handler, run on the faulting thread's own stack
+#if !defined(_WIN32)
+/* Linux and macOS: the guest's fault handler, run on the faulting thread's own stack
  * (guarded.S says why). The signal handler (tripguard.c, send_to_guest) points
  * the interrupted thread here with sp 128 bytes below its own, rounded down to
  * 16, x0 and x1 the handler's arguments, x2 the handler and x3 this thread's
