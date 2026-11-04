@@ -147,10 +147,25 @@ static void test_concurrent_faults_are_all_counted(void) {
 	const int rounds = rounds_wanted();
 	int short_rounds = 0, first_short = -1;
 	size_t least_count = NPAGES, least_bits = NPAGES;
+	const double start = now_ns();
 	for (int r = 0; r < rounds; r++) {
 		CHECK_EQ(mb_block_epoch_begin(b), 0);   /* re-holds every page written last round */
 		__atomic_add_fetch(&round, 1, __ATOMIC_ACQ_REL);
-		while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < NTHREADS * (r + 1)) cpu_relax();
+		/* A round that never ends is a fault never served: said, with where
+		 * each writer is, rather than left to the test's time limit */
+		const double round_start = now_ns();
+		for (unsigned spins = 0; __atomic_load_n(&done, __ATOMIC_ACQUIRE) < NTHREADS * (r + 1); spins++) {
+			cpu_relax();
+			if ((spins & 0xFFFFF) == 0 && now_ns() - round_start > 60e9) {
+				printf("test_tripguard: round %d has not ended after 60 s: %d of %d writers done; rounds seen:",
+				       r, __atomic_load_n(&done, __ATOMIC_ACQUIRE) - NTHREADS * r, NTHREADS);
+				for (int i = 0; i < NTHREADS; i++) printf(" %d", ws[i].rounds_seen);
+				printf("\n");
+				exit(1);
+			}
+		}
+		if (r % 250 == 249)
+			printf("test_tripguard: %d of %d rounds after %.1f s\n", r + 1, rounds, (now_ns() - start) / 1e9);
 
 		const size_t counted = mb_block_epoch_page_count(b);
 		const size_t bits = popcount_words(b->epoch_bits, b->nwords);
