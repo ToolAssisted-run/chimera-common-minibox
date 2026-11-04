@@ -83,7 +83,11 @@
 	mov x15, xzr
 	mov x16, xzr
 	mov x17, xzr
+#ifndef _WIN32
+	/* (on Windows x18 is the thread's TEB, which the OS and every host
+	 * function rely on: it is left as it is, and guests never use it) */
 	mov x18, xzr
+#endif
 .endm
 
 /* every vector register a callee may leave changed: all but d8-d15 */
@@ -196,7 +200,9 @@ call_guest_impl:
 	mov x15, xzr
 	mov x16, xzr
 	mov x17, xzr
+#ifndef _WIN32
 	mov x18, xzr
+#endif
 	mov x29, xzr
 	bl zero_vectors
 	blr x10

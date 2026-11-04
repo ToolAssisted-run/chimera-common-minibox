@@ -86,9 +86,11 @@ static void init_interop_area(void) {
 	/* aarch64 does not keep its instruction cache coherent with stores: code
 	 * written as data has to be published before it is run (x86-64: nothing) */
 	__builtin___clear_cache((char *)MB_ORG, (char *)(MB_ORG + mb_interop_bin_len));
-#ifdef _WIN32
+#if defined(_WIN32) && defined(__x86_64__)
 	/* register the hand-written unwind info so host SEH can unwind across the
-	 * guest stack-switch (the table lives at RUNTIME_TABLE_ADDR in interop.bin) */
+	 * guest stack-switch (the table lives at RUNTIME_TABLE_ADDR in interop.bin;
+	 * x86-64's: the aarch64 blob has none yet, so on Windows on arm64 an
+	 * exception cannot be unwound through a guest call) */
 	if (!RtlAddFunctionTable((PRUNTIME_FUNCTION)RUNTIME_TABLE_ADDR, 2, MB_ORG)) {
 		fprintf(stderr, "miniBox: RtlAddFunctionTable failed\n");
 		abort();
@@ -222,7 +224,14 @@ mb_context *mb_guest_ctx = NULL;
  * documents: Linux advertises it in AT_HWCAP2, Windows answers
  * IsProcessorFeaturePresent. A fault probe would be at the mercy of whatever
  * debugger happens to intercept the signal first. */
-#ifdef _WIN32
+#if defined(__aarch64__)
+/* The thread pointer is a word of memory (MB_TP_SLOT): always there, on
+ * every OS. */
+bool mb_fsbase_ok(void) {
+	mb_fs_swap = true;
+	return true;
+}
+#elif defined(_WIN32)
 #ifndef PF_RDWRFSGSBASE_AVAILABLE
 #define PF_RDWRFSGSBASE_AVAILABLE 22
 #endif
@@ -234,12 +243,6 @@ bool mb_fsbase_ok(void) {
 	if (getenv("MB_NO_FSGSBASE")) cached = 0;   /* testing only: probe off */
 	mb_fs_swap = cached != 0;
 	return cached != 0;
-}
-#elif defined(__aarch64__)
-/* The thread pointer is a word of memory (MB_TP_SLOT): always there. */
-bool mb_fsbase_ok(void) {
-	mb_fs_swap = true;
-	return true;
 }
 #elif defined(__x86_64__)
 #ifndef HWCAP2_FSGSBASE

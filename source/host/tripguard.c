@@ -53,12 +53,13 @@ static bool code_in_guest(uintptr_t rip) {
  * included). A Linux thread that never ran a guest has no gs base, and is not
  * read. Safe in a signal handler: one system call and one load. */
 static uintptr_t gs_context_slot(void) {
-#ifdef _WIN32
-	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
-#elif defined(__aarch64__)
+#if defined(__aarch64__)
 	/* no gs: the aarch64 blob's one word, set and cleared the same way
-	 * (interop_aarch64.S), mapped by the time a machine exists */
+	 * (interop_aarch64.S), mapped by the time a machine exists - on Windows
+	 * as on Linux and macOS */
 	return *(volatile const uintptr_t *)MB_INTEROP_SLOT;
+#elif defined(_WIN32)
+	return (uintptr_t)__readgsqword(0x18);   /* the TEB's SubSystemTib */
 #else
 #ifdef __APPLE__
 	/* the thread's gs is the guest's block only while it runs a guest, and
@@ -765,6 +766,12 @@ static struct sigaction *old_fault_action(int sig) { return sig == SIGBUS ? &g_o
 #if defined(__aarch64__) && defined(__APPLE__)
 #define UC_PC(uc) ((uc)->uc_mcontext->__ss.__pc)
 #define UC_SP(uc) ((uc)->uc_mcontext->__ss.__sp)
+#define UC_PSTATE(uc) ((uc)->uc_mcontext->__ss.__cpsr)
+/* register i of x0-x30: x29 and x30 have names of their own on a Mac */
+static inline uint64_t *uc_x(ucontext_t *uc, int i) {
+	return i < 29 ? (uint64_t *)&uc->uc_mcontext->__ss.__x[i]
+	     : i == 29 ? (uint64_t *)&uc->uc_mcontext->__ss.__fp : (uint64_t *)&uc->uc_mcontext->__ss.__lr;
+}
 /* Darwin hands the handler the fault's syndrome as it is: a data abort's WnR
  * bit (6) says write. */
 static bool uc_write(const ucontext_t *uc) {
@@ -780,6 +787,8 @@ static bool uc_exec(const ucontext_t *uc) {
 #elif defined(__aarch64__)
 #define UC_PC(uc) ((uc)->uc_mcontext.pc)
 #define UC_SP(uc) ((uc)->uc_mcontext.sp)
+#define UC_PSTATE(uc) ((uc)->uc_mcontext.pstate)
+static inline uint64_t *uc_x(ucontext_t *uc, int i) { return (uint64_t *)&uc->uc_mcontext.regs[i]; }
 /* The kernel puts the fault's syndrome (ESR_EL1) in a record of its own in the
  * signal frame's reserved area; a data abort's WnR bit (6) says write. Spelled
  * out here because the kernel's header for it fights glibc's. */
@@ -818,7 +827,8 @@ static void say_uc_regs(const ucontext_t *uc) {
 	x[29] = uc->uc_mcontext->__ss.__fp;
 	x[30] = uc->uc_mcontext->__ss.__lr;
 #else
-	const unsigned long long *x = (const unsigned long long *)uc->uc_mcontext.regs;
+	unsigned long long x[31];
+	for (int i = 0; i < 31; i++) x[i] = *uc_x((ucontext_t *)uc, i);
 #endif
 	mb_diag(" pc=%p sp=%p\n", (void *)(uintptr_t)UC_PC(uc), (void *)(uintptr_t)UC_SP(uc));
 	for (int i = 0; i < 31; i++) mb_diag(" x%d=%p%s", i, (void *)(uintptr_t)x[i], (i % 6 == 5 || i == 30) ? "\n" : "");
@@ -1130,16 +1140,16 @@ static bool send_to_guest(ucontext_t *uc, uintptr_t addr, bool write, bool from_
 		for (uintptr_t a = (top - frame) & ~(uintptr_t)MB_PAGEMASK; a < top; a += MB_PAGESIZE)
 			if (!guest_writable(a)) return false;
 	}
-	for (int i = 0; i < 31; i++) g_fault_record[i] = (uintptr_t)uc->uc_mcontext.regs[i];
+	for (int i = 0; i < 31; i++) g_fault_record[i] = (uintptr_t)*uc_x(uc, i);
 	g_fault_record[31] = sp;
-	g_fault_record[32] = (uintptr_t)uc->uc_mcontext.pc;
-	g_fault_record[33] = (uintptr_t)uc->uc_mcontext.pstate;
+	g_fault_record[32] = (uintptr_t)UC_PC(uc);
+	g_fault_record[33] = (uintptr_t)UC_PSTATE(uc);
 	UC_SP(uc) = top;
 	UC_PC(uc) = (uintptr_t)(from_host_code ? &mb_fault_tramp_host : &mb_fault_tramp_guest);
-	uc->uc_mcontext.regs[0] = addr;
-	uc->uc_mcontext.regs[1] = write ? 1 : 0;
-	uc->uc_mcontext.regs[2] = (uintptr_t)fn;
-	uc->uc_mcontext.regs[3] = (uintptr_t)g_fault_record;
+	*uc_x(uc, 0) = addr;
+	*uc_x(uc, 1) = write ? 1 : 0;
+	*uc_x(uc, 2) = (uintptr_t)fn;
+	*uc_x(uc, 3) = (uintptr_t)g_fault_record;
 	return true;
 #elif defined(__x86_64__)
 	uintptr_t *tib = mb_thread_block();
@@ -1333,11 +1343,11 @@ static bool fault_tramp_resume(ucontext_t *uc) {
 	if (pc != (uintptr_t)&mb_fault_tramp_guest_resume && pc != (uintptr_t)&mb_fault_tramp_host_resume)
 		return false;
 	const uintptr_t *rec = (const uintptr_t *)(uintptr_t)UC_SP(uc);
-	if ((uint32_t)uc->uc_mcontext.regs[0] == 0) g_fault_declined = rec[MB_FAULT_TRAMP_ADDR];
-	for (int i = 0; i < 31; i++) uc->uc_mcontext.regs[i] = rec[i];
-	uc->uc_mcontext.sp = rec[31];
-	uc->uc_mcontext.pc = rec[32];
-	uc->uc_mcontext.pstate = rec[33];
+	if ((uint32_t)*uc_x(uc, 0) == 0) g_fault_declined = rec[MB_FAULT_TRAMP_ADDR];
+	for (int i = 0; i < 31; i++) *uc_x(uc, i) = rec[i];
+	UC_SP(uc) = rec[31];
+	UC_PC(uc) = rec[32];
+	UC_PSTATE(uc) = rec[33];
 	return true;
 }
 #endif
@@ -1462,6 +1472,40 @@ void mb_tripguard_stop_signal_install(void) {
 	sigaction(MB_STOP_SIGNAL, &sa, &g_old_stop);
 }
 
+/* ---- the handlers' gs (macOS) -------------------------------------------
+ *
+ * A signal can arrive at any instruction, on a thread whose gs base is the
+ * guest's block (minibox_internal.h). The body of every handler is host C -
+ * libc, errno, thread locals - so it must run on the OS's gs; the wrapper
+ * puts it there first and, when the handler returns, decides which gs the
+ * interrupted code resumes with from where the handler pointed it:
+ *   - to the escape (a guest that died): the OS's, the escape swaps itself;
+ *   - to a fault trampoline: the guest block, which the trampoline reads its
+ *     arguments from (the host one swaps back to the OS's after);
+ *   - anywhere else: what it was when the signal arrived.
+ * No stack protector and no calls before the swap: this is the first
+ * instruction that may run on the wrong gs. */
+#if defined(__APPLE__) && defined(__x86_64__)
+#define MB_GS_WRAP(name) \
+__attribute__((no_stack_protector)) \
+static void name(int sig, siginfo_t *info, void *ucontext) { \
+	uintptr_t block = 0; \
+	if (mb_gs_in_guest()) { block = mb_gs_block_now(); mb_gs_set(mb_gs_host_now()); } \
+	name##_body(sig, info, ucontext); \
+	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP; \
+	if (rip == (uintptr_t)&mb_guarded_escape) return; \
+	if (rip == (uintptr_t)&mb_fault_tramp_guest || rip == (uintptr_t)&mb_fault_tramp_host) \
+		block = (uintptr_t)mb_thread_block(); \
+	if (block) mb_gs_set(block); \
+}
+#else
+#define MB_GS_WRAP(name) \
+static void name(int sig, siginfo_t *info, void *ucontext) { name##_body(sig, info, ucontext); }
+#endif
+MB_GS_WRAP(handler)
+MB_GS_WRAP(handler_other)
+MB_GS_WRAP(handler_stop)
+
 #if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 /* Every OTHER handler in the process, run under the host's thread pointer.
  * (x86-64 only: aarch64's guest thread pointer is a word of memory no host
@@ -1518,39 +1562,6 @@ static void handler_foreign_body(int sig, siginfo_t *info, void *ucontext) {
 }
 
 
-/* ---- the handlers' gs (macOS) -------------------------------------------
- *
- * A signal can arrive at any instruction, on a thread whose gs base is the
- * guest's block (minibox_internal.h). The body of every handler is host C -
- * libc, errno, thread locals - so it must run on the OS's gs; the wrapper
- * puts it there first and, when the handler returns, decides which gs the
- * interrupted code resumes with from where the handler pointed it:
- *   - to the escape (a guest that died): the OS's, the escape swaps itself;
- *   - to a fault trampoline: the guest block, which the trampoline reads its
- *     arguments from (the host one swaps back to the OS's after);
- *   - anywhere else: what it was when the signal arrived.
- * No stack protector and no calls before the swap: this is the first
- * instruction that may run on the wrong gs. */
-#ifdef __APPLE__
-#define MB_GS_WRAP(name) \
-__attribute__((no_stack_protector)) \
-static void name(int sig, siginfo_t *info, void *ucontext) { \
-	uintptr_t block = 0; \
-	if (mb_gs_in_guest()) { block = mb_gs_block_now(); mb_gs_set(mb_gs_host_now()); } \
-	name##_body(sig, info, ucontext); \
-	const uintptr_t rip = (uintptr_t)((ucontext_t *)ucontext)->uc_mcontext MB_GREG_RIP; \
-	if (rip == (uintptr_t)&mb_guarded_escape) return; \
-	if (rip == (uintptr_t)&mb_fault_tramp_guest || rip == (uintptr_t)&mb_fault_tramp_host) \
-		block = (uintptr_t)mb_thread_block(); \
-	if (block) mb_gs_set(block); \
-}
-#else
-#define MB_GS_WRAP(name) \
-static void name(int sig, siginfo_t *info, void *ucontext) { name##_body(sig, info, ucontext); }
-#endif
-MB_GS_WRAP(handler)
-MB_GS_WRAP(handler_other)
-MB_GS_WRAP(handler_stop)
 MB_GS_WRAP(handler_foreign)
 
 static void wrap_foreign_handlers(void) {
@@ -1632,6 +1643,31 @@ static void initialize(void) {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+/* The interrupted thread's registers, per CPU: Windows' CONTEXT is the CPU's */
+#if defined(__aarch64__)
+#define WC_PC(c) ((c)->Pc)
+#define WC_SP(c) ((c)->Sp)
+#elif defined(__x86_64__)
+#define WC_PC(c) ((c)->Rip)
+#define WC_SP(c) ((c)->Rsp)
+#else
+#error "miniBox runs on x86-64 and aarch64 only"
+#endif
+
+static void say_ctx_regs(const CONTEXT *c) {
+#if defined(__aarch64__)
+	mb_diag(" pc=%p sp=%p fp=%p lr=%p\n", (void *)(uintptr_t)c->Pc, (void *)(uintptr_t)c->Sp,
+	        (void *)(uintptr_t)c->Fp, (void *)(uintptr_t)c->Lr);
+	for (int i = 0; i < 29; i++) mb_diag(" x%d=%p%s", i, (void *)(uintptr_t)c->X[i], (i % 6 == 5 || i == 28) ? "\n" : "");
+#else
+	say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
+	                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
+	                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
+	                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
+	                  (uintptr_t)c->R14, (uintptr_t)c->R15);
+#endif
+}
+
 static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep);
 static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t fault);
 
@@ -1661,7 +1697,7 @@ static bool report_begin(EXCEPTION_POINTERS *ep, int *phase_before) {
 	if (InterlockedCompareExchange(&g_reporting, 1, 0) != 0) {
 		say_handler_fault_once(MB_PHASE_REPORT, fault_depth(),
 		                       (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1],
-		                       (uintptr_t)ep->ContextRecord->Rip);
+		                       (uintptr_t)WC_PC(ep->ContextRecord));
 		return false;
 	}
 	*phase_before = fault_phase();
@@ -1711,7 +1747,11 @@ static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep);
  * pointed here, and the trap it takes ends the call from inside that handler
  * (veh_inner), the way a crash in the guest's own fault handler ends it. */
 extern char mb_stop_trap[];
+#if defined(__aarch64__)
+__asm__(".text\n\t.p2align 4\nmb_stop_trap:\n\tudf #0\n");
+#else
 __asm__(".text\n\t.p2align 4\nmb_stop_trap:\n\tud2\n");
+#endif
 
 /* A stop asked for from another thread (host.c's wbx_stop_guest): the thread
  * that calls the guest is suspended, and when it is running guest code it is
@@ -1734,7 +1774,7 @@ int mb_tripguard_stop_thread(void *thread) {
 	c.ContextFlags = CONTEXT_FULL;
 	int sent = 0;
 	if (GetThreadContext(t, &c) && mb_guest_ctx != NULL && mb_guest_ctx->stop_pending
-	    && code_in_guest((uintptr_t)c.Rip)) {
+	    && code_in_guest((uintptr_t)WC_PC(&c))) {
 		const long handling = mb_guest_ctx->handling, in_handler = mb_guest_ctx->guest_handlers;
 		const bool idle = handling == 0;
 		const bool in_own_handler = in_handler > 0 && handling == in_handler;
@@ -1742,10 +1782,10 @@ int mb_tripguard_stop_thread(void *thread) {
 			mb_guest_ctx->stop_pending = 0;
 			mb_host_guest_death_in_handler(mb_guest_ctx, "%s", mb_host_stop_reason(mb_guest_ctx));
 			if (idle) {
-				c.Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-				c.Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				WC_SP(&c) = (DWORD64)mb_guest_ctx->esc_rsp;
+				WC_PC(&c) = (DWORD64)(uintptr_t)&mb_guarded_escape;
 			} else {
-				c.Rip = (DWORD64)(uintptr_t)mb_stop_trap;
+				WC_PC(&c) = (DWORD64)(uintptr_t)mb_stop_trap;
 			}
 			c.ContextFlags = CONTEXT_CONTROL;
 			sent = SetThreadContext(t, &c) != 0;
@@ -1767,7 +1807,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 	 * counted in its depth, and the guest fault handlers they called: none of
 	 * them comes back to take itself off the count, or a later stop would
 	 * wait for them for ever. */
-	if (r == EXCEPTION_CONTINUE_EXECUTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)&mb_guarded_escape) {
+	if (r == EXCEPTION_CONTINUE_EXECUTION && WC_PC(ep->ContextRecord) == (DWORD64)(uintptr_t)&mb_guarded_escape) {
 		if (handled) {
 			InterlockedExchangeAdd(&handled->handling, -(long)fault_depth());
 			InterlockedExchange(&handled->guest_handlers, 0);
@@ -1781,12 +1821,12 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep) {
 
 __attribute__((no_stack_protector))
 static LONG CALLBACK veh_fs(EXCEPTION_POINTERS *ep) {
-#ifdef MB_HAVE_FSBASE
+#if defined(MB_HAVE_FSBASE) && !defined(MB_TP_IN_MEMORY)
 	const bool guest_rip = mb_fs_swap && mb_guest_ctx
-	                       && rip_in_guest((uintptr_t)ep->ContextRecord->Rip);
+	                       && rip_in_guest((uintptr_t)WC_PC(ep->ContextRecord));
 	const uintptr_t fs_at_fault = guest_rip ? mb_rdfsbase() : 0;
 	const uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
-	const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+	const uintptr_t rip = (uintptr_t)WC_PC(ep->ContextRecord);
 	/* The real register, not drop_fs_for_test's pretend one: that hook forces
 	 * the answer unconditionally, and a forced answer here would re-fault into
 	 * the same retry for ever. The cost is that this path is exercised on
@@ -1823,10 +1863,10 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
 	/* a stop sent from inside the guest's own fault handler (mb_tripguard_stop_thread):
 	 * the death is already recorded */
-	if (code == STATUS_ILLEGAL_INSTRUCTION && ep->ContextRecord->Rip == (DWORD64)(uintptr_t)mb_stop_trap
+	if (code == STATUS_ILLEGAL_INSTRUCTION && WC_PC(ep->ContextRecord) == (DWORD64)(uintptr_t)mb_stop_trap
 	    && mb_guest_ctx != NULL && mb_guest_ctx->esc_rsp != 0) {
-		ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-		ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+		WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
+		WC_PC(ep->ContextRecord) = (DWORD64)(uintptr_t)&mb_guarded_escape;
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	if (code == STATUS_GUARD_PAGE_VIOLATION) {
@@ -1843,7 +1883,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		 * with no access violation, so the report below never saw it and the
 		 * log stayed silent about exactly the crash it was built for. Nothing is
 		 * handled here - the process still dies - it is only said first. */
-		uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+		uintptr_t rip = (uintptr_t)WC_PC(ep->ContextRecord);
 		bool in_guest = false;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, rip)) { in_guest = true; break; }
@@ -1854,17 +1894,13 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 			mb_diag_banner(code == STATUS_PRIVILEGED_INSTRUCTION ? "the guest halted itself" : "the guest hit an illegal instruction");
 			mb_diag("[veh] %s at rip=%p - a hlt here is musl's a_crash(): the guest found its own state corrupt\n",
 			        code == STATUS_PRIVILEGED_INSTRUCTION ? "privileged instruction" : "illegal instruction", (void *)rip);
-			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
-			                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
-			                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
-			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
-			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
+			say_ctx_regs(c);
 			if (guest_can_die_here(rip)
 			    && mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_PRIVILEGED_INSTRUCTION
 			           ? "the core stopped itself after finding its own memory corrupt (a halt at %p)"
 			           : "the core ran an illegal instruction at %p", (void *)rip)) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
+				WC_PC(ep->ContextRecord) = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
@@ -1873,21 +1909,17 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	if (code == STATUS_INTEGER_DIVIDE_BY_ZERO || code == STATUS_INTEGER_OVERFLOW) {
-		const uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+		const uintptr_t rip = (uintptr_t)WC_PC(ep->ContextRecord);
 		if (guest_can_die_here(rip)) {
 			int phase_before;
 			if (!report_begin(ep, &phase_before)) return EXCEPTION_CONTINUE_SEARCH;
 			const CONTEXT *c = ep->ContextRecord;
 			mb_diag_banner("the guest divided by zero");
-			say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
-			                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
-			                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
-			                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
-			                  (uintptr_t)c->R14, (uintptr_t)c->R15);
+			say_ctx_regs(c);
 			if (mb_host_guest_death_in_handler(mb_guest_ctx, code == STATUS_INTEGER_DIVIDE_BY_ZERO
 			        ? "the core divided by zero at %p" : "the core overflowed a division at %p", (void *)rip)) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
+				WC_PC(ep->ContextRecord) = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
@@ -1907,7 +1939,7 @@ static LONG CALLBACK veh_inner(EXCEPTION_POINTERS *ep) {
 	{
 		const int phase = fault_phase(), depth = fault_depth();
 		if (phase == MB_PHASE_TRACK || phase == MB_PHASE_REPORT || depth >= MB_FAULT_DEPTH_MOST) {
-			say_handler_fault_once(phase, depth, fault, (uintptr_t)ep->ContextRecord->Rip);
+			say_handler_fault_once(phase, depth, fault, (uintptr_t)WC_PC(ep->ContextRecord));
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 		fault_depth_set(depth + 1);
@@ -1937,7 +1969,7 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 	 * dirty tracking would protect it and trap on the refusal - so it is
 	 * reported, as the host being out of memory */
 	if (!oom && write && trip(fault)) return EXCEPTION_CONTINUE_EXECUTION;
-	if (!oom && ask_guest(fault, write, !rip_in_guest((uintptr_t)ep->ContextRecord->Rip))) return EXCEPTION_CONTINUE_EXECUTION;
+	if (!oom && ask_guest(fault, write, !rip_in_guest((uintptr_t)WC_PC(ep->ContextRecord)))) return EXCEPTION_CONTINUE_EXECUTION;
 
 	/* Not miniBox's to handle. Say what was asked for and whether any block owns
 	 * the address - the difference between "the guest touched something it
@@ -1956,7 +1988,7 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		mb_block *owner = NULL;
 		for (int i = 0; i < g_nblocks; i++)
 			if (mb_range_contains(g_blocks[i]->addr, fault)) { owner = g_blocks[i]; break; }
-		const bool guest_code = code_in_guest((uintptr_t)ep->ContextRecord->Rip);
+		const bool guest_code = code_in_guest((uintptr_t)WC_PC(ep->ContextRecord));
 		const char *access = ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "read"
 		        : ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write" : "execute";
 		mb_diag_banner(guest_code ? "unhandled fault" : "a fault in host code");
@@ -1965,12 +1997,12 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 			        (void *)fault, (unsigned long)GetLastError());
 		if (guest_code)
 			mb_diag("[veh] unhandled fault: addr=%p access=%s rip=%p, %s",
-			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
+			        (void *)fault, access, (void *)WC_PC(ep->ContextRecord),
 			        owner ? "inside a registered block" : "OUTSIDE every registered block");
 		else
 			mb_diag("[veh] fault in host code, passed on to the process's exception handlers (it may well be handled):"
 			        " addr=%p access=%s rip=%p, %s",
-			        (void *)fault, access, (void *)ep->ContextRecord->Rip,
+			        (void *)fault, access, (void *)WC_PC(ep->ContextRecord),
 			        owner ? "inside a registered block" : "outside every registered block");
 		if (owner) {
 			size_t pi = (fault - owner->addr.start) >> MB_PAGESHIFT;
@@ -1995,13 +2027,9 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 				mb_diag(" [vq] VirtualQuery(%p) failed\n", (void *)fault);
 		}
 		const CONTEXT *c = ep->ContextRecord;
-		say_code_and_regs((const unsigned char *)c->Rip, (uintptr_t)c->Rsp, (uintptr_t)c->Rbp,
-		                  (uintptr_t)c->Rax, (uintptr_t)c->Rbx, (uintptr_t)c->Rcx, (uintptr_t)c->Rdx,
-		                  (uintptr_t)c->Rsi, (uintptr_t)c->Rdi, (uintptr_t)c->R8, (uintptr_t)c->R9,
-		                  (uintptr_t)c->R10, (uintptr_t)c->R11, (uintptr_t)c->R12, (uintptr_t)c->R13,
-		                  (uintptr_t)c->R14, (uintptr_t)c->R15);
-		if (guest_code) say_guest_stack((uintptr_t)c->Rsp);
-		const uintptr_t rip = (uintptr_t)c->Rip;
+		say_ctx_regs(c);
+		if (guest_code) say_guest_stack((uintptr_t)WC_SP(c));
+		const uintptr_t rip = (uintptr_t)WC_PC(c);
 		if (guest_can_die_here(rip)) {
 			const bool died = oom
 				? mb_host_guest_death_in_handler(mb_guest_ctx, "the computer is out of memory: Windows would not give the core "
@@ -2010,8 +2038,8 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 				: mb_host_guest_death_in_handler(mb_guest_ctx, "the core crashed: it %s address %p (at %p)",
 				      write ? "wrote to" : "read or ran", (void *)fault, (void *)rip);
 			if (died) {
-				ep->ContextRecord->Rsp = (DWORD64)mb_guest_ctx->esc_rsp;
-				ep->ContextRecord->Rip = (DWORD64)(uintptr_t)&mb_guarded_escape;
+				WC_SP(ep->ContextRecord) = (DWORD64)mb_guest_ctx->esc_rsp;
+				WC_PC(ep->ContextRecord) = (DWORD64)(uintptr_t)&mb_guarded_escape;
 				report_end(phase_before);
 				return EXCEPTION_CONTINUE_EXECUTION;
 			}
