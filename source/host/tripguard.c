@@ -1654,7 +1654,44 @@ static void initialize(void) {
 #error "miniBox runs on x86-64 and aarch64 only"
 #endif
 
+/* The module an address is in, as "name+offset": a fault in host code at a
+ * bare address in some system DLL is a riddle, a name is a lead. */
+static void say_where(const char *what, uintptr_t a) {
+	HMODULE m = NULL;
+	char path[MAX_PATH];
+	if (a != 0 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                                 (LPCSTR)a, &m) && m != NULL && GetModuleFileNameA(m, path, sizeof path) > 0) {
+		const char *name = path;
+		for (const char *q = path; *q; q++) if (*q == '\\' || *q == '/') name = q + 1;
+		mb_diag(" %s %p = %s+0x%llx\n", what, (void *)a, name, (unsigned long long)(a - (uintptr_t)m));
+	} else {
+		mb_diag(" %s %p (in no module)\n", what, (void *)a);
+	}
+}
+
+/* The interrupted thread's host stack, walked with Windows' own unwind data
+ * (what a debugger does): each caller, by module. Host frames only - a guest
+ * frame has no unwind data, and the walk stops there. */
+static void say_host_stack(const CONTEXT *interrupted) {
+	CONTEXT c = *interrupted;
+	mb_diag(" host stack:\n");
+	for (int i = 0; i < 24; i++) {
+		const DWORD64 pc = (DWORD64)WC_PC(&c);
+		if (pc == 0) break;
+		DWORD64 base = 0;
+		PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(pc, &base, NULL);
+		char label[16];
+		snprintf(label, sizeof label, "#%d", i);
+		say_where(label, (uintptr_t)pc);
+		if (f == NULL) break;   /* a leaf or code with no unwind data: no further */
+		PVOID handler_data = NULL;
+		DWORD64 frame = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, pc, f, &c, &handler_data, &frame, NULL);
+	}
+}
+
 static void say_ctx_regs(const CONTEXT *c) {
+	say_where("code at", (uintptr_t)WC_PC(c));
 #if defined(__aarch64__)
 	mb_diag(" pc=%p sp=%p fp=%p lr=%p\n", (void *)(uintptr_t)c->Pc, (void *)(uintptr_t)c->Sp,
 	        (void *)(uintptr_t)c->Fp, (void *)(uintptr_t)c->Lr);
@@ -2059,6 +2096,7 @@ static LONG veh_access_violation(EXCEPTION_POINTERS *ep, bool write, uintptr_t f
 		const CONTEXT *c = ep->ContextRecord;
 		say_ctx_regs(c);
 		if (guest_code) say_guest_stack((uintptr_t)WC_SP(c));
+		else say_host_stack(c);
 		const uintptr_t rip = (uintptr_t)WC_PC(c);
 		if (guest_can_die_here(rip)) {
 			const bool died = oom
