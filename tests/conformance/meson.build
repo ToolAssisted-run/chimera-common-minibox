@@ -51,11 +51,14 @@ test('conformance-kit0', run_guest,
 # aarch64's thread pointer is always the user's and is never lost.
 if host_machine.cpu_family() == 'x86_64'
 # Dropped-%fs repair: guest toolchain only (Linux), like the guest itself.
+# Not on a Mac, which has no rdfsbase or wrfsbase at all.
+if host_machine.system() != 'darwin'
 test('conformance-fs-repair', run_guest,
   args: ['--fs-repair-child', guest_wbx],
   suite: 'system',
   timeout: 120,
 )
+endif
 
 # Probe forced off: the FSGSBASE instructions must be unreachable, so the
 # whole standard flow has to pass without them.
