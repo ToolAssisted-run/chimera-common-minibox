@@ -104,14 +104,24 @@ jobs:
   macos:
     # Apple silicon: 16 KiB pages, no TPIDR_EL0 or x18 for the guest, and no
     # page both writable and executable - everything the macOS PAL is for.
-    # Guests are built with Homebrew's aarch64-elf-gcc.
-    name: macos aarch64 (c-guests)
-    runs-on: macos-latest
+    # An Intel Mac: the guest's gs swapped at each boundary, and no
+    # rdfsbase/wrfsbase. Guests are built with Homebrew's bare-metal gcc for
+    # the CPU (aarch64-elf-gcc, x86_64-elf-gcc), as meson.build picks it.
+    name: macos ${{ matrix.arch }} (c-guests)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: brew install meson ninja aarch64-elf-gcc
+        run: brew install meson ninja ${{ matrix.arch }}-elf-gcc
 
       - name: Configure
         run: meson setup build/ci
@@ -126,7 +136,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: meson-logs-macos
+          name: meson-logs-macos-${{ matrix.arch }}
           path: build/ci/meson-logs/
 
   windows-cross:
