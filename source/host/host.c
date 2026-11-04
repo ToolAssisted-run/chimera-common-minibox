@@ -386,6 +386,13 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	 * (aarch64 has no direction flag.) */
 #if defined(__x86_64__)
 	__asm__ volatile("cld" ::: "memory");
+#ifdef __APPLE__
+	/* entered on the guest's gs block; everything below is host C and libc,
+	 * which find their thread through the OS's (minibox_internal.h). Inline
+	 * asm, nothing called before it. */
+	const uintptr_t gs_block = mb_gs_block_now();
+	mb_gs_set(mb_gs_host_now());
+#endif
 #endif
 #ifdef MB_HAVE_FSBASE
 	/* The guest trapped in here with %fs = its own thread pointer (a Rust guest
@@ -441,6 +448,9 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	/* the guest's back: whichever guest thread runs on from here, they share
 	 * one set, as every other register this boundary does not swap */
 	mb_fpu_set(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
+#ifdef __APPLE__
+	mb_gs_set(gs_block);
+#endif
 	return res;
 }
 
@@ -1310,8 +1320,12 @@ static void *sample_fn(void *arg) {
 		if (h && h->active) {
 			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
 			uint64_t words[12];
+#ifdef __APPLE__
+			const ssize_t got = -1;   /* no process_vm_readv */
+#else
 			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
 			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+#endif
 			fprintf(stderr, "[S] active=%u rsp=%lx stack:", mb_threads_active_tid(h->threads), (unsigned long)rsp);
 			if (got == (ssize_t)sizeof words)
 				for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)words[i]);

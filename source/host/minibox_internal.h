@@ -624,7 +624,11 @@ const char *mb_host_stop_reason(const mb_context *c);
 #ifdef _WIN32
 int  mb_tripguard_stop_thread(void *thread);
 #else
+#ifdef __APPLE__
+#define MB_STOP_SIGNAL SIGUSR2   /* macOS has no real-time signals */
+#else
 #define MB_STOP_SIGNAL (SIGRTMAX - 3)
+#endif
 void mb_tripguard_stop_signal_install(void);
 #endif
 
@@ -701,6 +705,63 @@ extern bool mb_fs_swap;
  * own. The one %fs mismatch that is not a symptom: musl swaps thread_area in
  * userspace, so %fs still holds this at the next host boundary. */
 extern uintptr_t mb_early_tp;
+#endif
+
+#ifdef __APPLE__
+/* ---- %gs on macOS ------------------------------------------------------
+ *
+ * The guest reaches its context through [gs:0x18] (and the blob keeps its
+ * stack bounds at gs:0x8 and gs:0x10). On Linux the host never uses %gs and
+ * points it at a per-thread block for good; on Windows it is the TEB. On
+ * macOS %gs is the OS's: libc finds the thread's data through it (gs:0 is the
+ * pthread_t, gs:0x18 the Mach thread port), and no userspace instruction
+ * can set it (rdgsbase and wrgsbase are SIGILL, Rosetta included).
+ *
+ * So the thread's gs base is SWAPPED at every boundary: the guest's block
+ * while guest code runs, the OS's whenever host C does. The one way to set it
+ * is the system call libsystem makes for _thread_set_tsd_base. Everything that
+ * runs between a swap to the guest and the swap back must avoid libc and
+ * thread locals; the places are the entry (guarded.S), the syscall
+ * dispatcher, the callback wrappers and the signal handlers.
+ *
+ * The block's word 0 holds MB_GS_MAGIC (the OS's holds a pthread_t, which can
+ * never be it), so any code can tell which it is running on; word 12 is the
+ * block's own address and word 13 is the OS's base for this thread. */
+#define MB_GS_MAGIC     0x4d4247534d414731ull
+#define MB_TIB_SELF     12
+#define MB_TIB_HOST_GS  13
+/* The thread's gs base. Inline asm, so it may be the first thing a function
+ * does; "memory" because it moves what thread locals and errno mean. */
+static inline void mb_gs_set(uintptr_t base) {
+	uintptr_t r;
+	__asm__ volatile("movl $0x3000003, %%eax\n\tsyscall"
+	                 : "=&a"(r), "+D"(base) :: "rcx", "r11", "memory", "cc");
+}
+static inline bool mb_gs_in_guest(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:0, %0" : "=r"(v));
+	return v == MB_GS_MAGIC;
+}
+/* guest block's [self], read through gs: valid only while mb_gs_in_guest() */
+static inline uintptr_t mb_gs_block_now(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:%c1, %0" : "=r"(v) : "i"(MB_TIB_SELF * 8));
+	return v;
+}
+static inline uintptr_t mb_gs_host_now(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:%c1, %0" : "=r"(v) : "i"(MB_TIB_HOST_GS * 8));
+	return v;
+}
+static inline uintptr_t mb_gs_context_now(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:0x18, %0" : "=r"(v));
+	return v;
+}
+/* guarded.S: swap this thread to its guest block / back to the OS's; each
+ * keeps every register and is a no-op when already there (the second) */
+void mb_gs_to_guest(void);
+void mb_gs_to_host(void);
 #endif
 
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);

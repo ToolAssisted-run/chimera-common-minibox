@@ -36,6 +36,8 @@ endif
 # both is also fine, but select the right one for clarity).
 if host_machine.system() == 'windows'
   minibox_host_sources += files('pal_win.c')
+elif host_machine.system() == 'darwin'
+  minibox_host_sources += files('pal_darwin.c')
 else
   minibox_host_sources += files('pal_linux.c')
 endif

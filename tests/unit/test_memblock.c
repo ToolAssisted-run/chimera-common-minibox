@@ -151,15 +151,15 @@ static void test_madvise_keeps_allocated(void) {
 /* munmap and MADV_DONTNEED give memory back (2026-10-18): a long run of
  * written pages is released and reads back zero in both views, and a range
  * nothing wrote is not written to by the freeing. On Linux the memfd's
- * allocated size says so; Windows cannot release (mb_pal_release), and there
- * only the zeros are checked. */
+ * allocated size says so; Windows and macOS cannot release (mb_pal_release),
+ * and there only the zeros are checked. */
 static void test_free_gives_memory_back(void) {
 	const uintptr_t size = 0x200000, half = 0x100000;   /* 512 pages */
 	mb_block *b = fresh(size);
 	mb_range whole = { b->addr.start, size };
 	CHECK_EQ(mb_block_mmap_fixed(b, whole, MB_PROT_RW, true), 0);
 	for (uintptr_t off = 0; off < half; off += 0x1000) gp(b, off)[17] = 0x5a;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 	struct stat st;
 	CHECK_EQ(fstat((int)b->handle.h, &st), 0);
 	const long long written = (long long)st.st_blocks;   /* 512-byte units */
@@ -172,7 +172,7 @@ static void test_free_gives_memory_back(void) {
 		mb_range piece = { b->addr.start + off, 0x8000 };
 		CHECK_EQ(mb_block_madvise_dontneed(b, piece), 0);
 	}
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 	CHECK_EQ(fstat((int)b->handle.h, &st), 0);
 	printf("test_memblock: the block's memory held %lld KiB written, %lld KiB after freeing it\n",
 	       written / 2, (long long)st.st_blocks / 2);

@@ -25,6 +25,21 @@
  * escape record is the frame below.
  */
 
+#ifdef __APPLE__
+/* Mach-O: C symbols carry a leading underscore, and there is no .hidden/.type */
+#define mb_guarded_call _mb_guarded_call
+#define mb_guarded_escape _mb_guarded_escape
+#define mb_guarded_escape_now _mb_guarded_escape_now
+#define mb_fs_swap _mb_fs_swap
+#define mb_xsave_size _mb_xsave_size
+#define mb_xsave_mask _mb_xsave_mask
+#define mb_fault_tramp_guest _mb_fault_tramp_guest
+#define mb_fault_tramp_host _mb_fault_tramp_host
+#define mb_gs_to_guest _mb_gs_to_guest
+#define mb_gs_to_host _mb_gs_to_host
+#define mb_gs_block_c _mb_gs_block_c
+#endif
+
 #define CTX_THREAD_AREA   0x000
 #define CTX_HOST_RSP      0x008
 #define CTX_GUEST_RSP     0x010
@@ -71,6 +86,10 @@
 	.type mb_guarded_call, @function
 	.type mb_guarded_escape, @function
 	.type mb_guarded_escape_now, @function
+#elif defined(__APPLE__)
+	.private_extern mb_guarded_call
+	.private_extern mb_guarded_escape
+	.private_extern mb_guarded_escape_now
 #endif
 
 /* Entered by a guest-entry thunk with r10 = the context and r11 = the guest
@@ -186,6 +205,11 @@ mb_guarded_call:
 	xorl %r13d, %r13d
 	xorl %r14d, %r14d
 	xorl %r15d, %r15d
+#ifdef __APPLE__
+	/* the guest's gs block for the length of the guest's run (minibox_internal.h);
+	 * keeps every register, the arguments among them */
+	callq mb_gs_to_guest
+#endif
 	movabsq $CALL_GUEST_IMPL, %rax
 	callq *%rax
 
@@ -195,6 +219,9 @@ mb_guarded_call:
 	 * returned with it set, would make the host's memcpy run backwards. */
 .Llanding:
 	cld
+#ifdef __APPLE__
+	callq mb_gs_to_host     /* keeps rax: the result */
+#endif
 	movq FRAME_CTX(%rsp), %r10
 	movq FRAME_PREV_ESC(%rsp), %r11
 	movq %r11, CTX_ESC_RSP(%r10)
@@ -259,6 +286,15 @@ mb_guarded_escape_now:
  * record and its rip here. Undoes what the blob's entry did, then leaves the
  * way a return would, with 0. */
 mb_guarded_escape:
+#ifdef __APPLE__
+	/* the undo below writes the thread's block through gs, whichever side
+	 * of the boundary was running when the guest died. The bounds it copies
+	 * back are in the 24 bytes just below this stack pointer, where a call
+	 * would put its return address, so the call is made further down */
+	leaq -256(%rsp), %rsp
+	callq mb_gs_to_guest
+	leaq 256(%rsp), %rsp
+#endif
 	movq FRAME_CTX(%rsp), %r10
 	/* the stack bounds the blob pushed on its way in, just below the return
 	 * address the call left: gs:0x8 first, then gs:0x10 */
@@ -279,6 +315,81 @@ mb_guarded_escape:
 	xorl %eax, %eax
 	jmp .Llanding
 
+#ifdef __APPLE__
+	.p2align 4
+/* mb_gs_to_guest / mb_gs_to_host: swap this thread's gs base between the OS's
+ * and the guest block, keeping every register (the arguments of an entry thunk
+ * and the result of a call are in flight) and the flags. The base is set the
+ * only way userspace can: the machine-dependent system call libsystem makes
+ * for _thread_set_tsd_base, number 3, rdi the new base.
+ *
+ * to_guest asks C for the block (this thread's, made at mb_prepare_thread)
+ * and so must run on the OS's gs; it does nothing when already on the guest's.
+ * to_host reads the OS's base out of the guest block and does nothing when it
+ * is not on one.
+ *
+ * Entry rsp % 16 == 8 as at any call; 10 words are saved, so the C call is
+ * made with rsp % 16 == 0. */
+	.globl mb_gs_to_guest
+	.private_extern mb_gs_to_guest
+mb_gs_to_guest:
+	pushfq
+	pushq %rax
+	pushq %r11
+	movq %gs:0, %rax
+	movabsq $0x4d4247534d414731, %r11   /* MB_GS_MAGIC */
+	cmpq %r11, %rax
+	je 1f
+	pushq %rdi
+	pushq %rsi
+	pushq %rdx
+	pushq %rcx
+	pushq %r8
+	pushq %r9
+	pushq %r10
+	subq $8, %rsp                        /* rsp % 16 == 0 at the call */
+	callq mb_gs_block_c
+	addq $8, %rsp
+	movq %rax, %rdi
+	movl $0x3000003, %eax
+	syscall
+	popq %r10
+	popq %r9
+	popq %r8
+	popq %rcx
+	popq %rdx
+	popq %rsi
+	popq %rdi
+1:	popq %r11
+	popq %rax
+	popfq
+	ret
+
+	.globl mb_gs_to_host
+	.private_extern mb_gs_to_host
+mb_gs_to_host:
+	pushfq
+	pushq %rax
+	pushq %rcx
+	pushq %rdx
+	pushq %rdi
+	pushq %r11
+	movq %gs:0, %rax
+	movabsq $0x4d4247534d414731, %rcx   /* MB_GS_MAGIC */
+	cmpq %rcx, %rax
+	jne 1f
+	movq %gs:0x68, %rdi                  /* MB_TIB_HOST_GS */
+	movl $0x3000003, %eax
+	syscall
+1:	popq %r11
+	popq %rdi
+	popq %rdx
+	popq %rcx
+	popq %rax
+	popfq
+	ret
+#endif
+
 #ifndef _WIN32
 /* Linux: the guest's fault handler, run on the faulting thread's own stack.
  *
@@ -296,10 +407,14 @@ mb_guarded_escape:
  * Two copies of one body: the guest's (a fault in guest code; runs with the
  * guest's %fs and counts as guest code to the fault handler) and the host's
  * (a fault in host code; calls the guest-entry thunk). */
-	.macro FAULT_TRAMP name
+	.macro FAULT_TRAMP name, host=0
 	.globl \name
+#ifdef __ELF__
 	.hidden \name
 	.type \name, @function
+#else
+	.private_extern \name
+#endif
 	.p2align 4
 \name:
 	pushq %gs:0x28          /* R-8: the faulting rip, where `ret` goes */
@@ -345,10 +460,27 @@ mb_guarded_escape:
 2:	movq %r12, %rdi
 	movq %r13, %rsi
 	cld
+#ifdef __APPLE__
+	.if \host
+	/* a fault in host code: the signal handler put the thread on the guest
+	 * block for the words above; the guest-entry thunk below is host code,
+	 * and leaves the thread where it found it, so go back to the OS's */
+	movq %gs:0x60, %r14     /* MB_TIB_SELF: the words below are written through it */
+	callq mb_gs_to_host
+	.endif
+#endif
 	callq *112(%rbx)
 	testl %eax, %eax
 	jnz 3f
+#ifdef __APPLE__
+	.if \host
+	movq %r12, 0x40(%r14)   /* not the guest's: the retry is an unhandled fault */
+	.else
+	movq %r12, %gs:0x40
+	.endif
+#else
 	movq %r12, %gs:0x40     /* not the guest's: the retry is an unhandled fault */
+#endif
 3:	movq mb_xsave_mask(%rip), %rax
 	testq %rax, %rax
 	jz 4f
@@ -377,13 +509,19 @@ mb_guarded_escape:
 	leaq 24(%rsp), %rsp
 	retq $128               /* to the faulting rip, rsp where it was */
 	.globl \name\()_end
+#ifdef __ELF__
 	.hidden \name\()_end
+#else
+	.private_extern \name\()_end
+#endif
 \name\()_end:
+#ifdef __ELF__
 	.size \name, \name\()_end - \name
+#endif
 	.endm
 
 	FAULT_TRAMP mb_fault_tramp_guest
-	FAULT_TRAMP mb_fault_tramp_host
+	FAULT_TRAMP mb_fault_tramp_host, 1
 #endif
 
 #ifdef __ELF__
