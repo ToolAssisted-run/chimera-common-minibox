@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 
@@ -54,22 +55,32 @@ static int remap(uintptr_t src, uintptr_t size, uintptr_t at, uintptr_t *out) {
 }
 
 /* Where each handle's owning view is, and how big: mb_handle carries one word,
- * so the size rides in a small header page before the view. */
+ * so the size rides in a header page before the view.
+ *
+ * The header is one of the OS's pages, not one of the machine's: on Apple
+ * silicon a page is 16 KiB, and with a 4 KiB header the view began inside a
+ * page. A view mapped from there (mb_pal_map_handle) starts where that page
+ * does, 4 KiB early, so the guest's first bytes were the header: a write at
+ * the block's start changed the size, and closing the handle then unmapped
+ * memory that was not its own - malloc's among it, which the kernel reads,
+ * and macOS killed the process for that (vm_reclaim, "copy I/O error"). */
+static uintptr_t header_size(void) { return (uintptr_t)getpagesize(); }
+
 int mb_pal_open_handle(uintptr_t size, mb_handle *out) {
 	/* the first page of the mapping holds the size; the pages follow it */
-	uint8_t *p = mmap(NULL, size + MB_PAGESIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	uint8_t *p = mmap(NULL, size + header_size(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (p == MAP_FAILED) return -1;
 	*(uintptr_t *)p = size;
-	out->h = (uintptr_t)(p + MB_PAGESIZE);
+	out->h = (uintptr_t)(p + header_size());
 	out->lazy = false;
 	out->pieces = false;
 	return 0;
 }
 
-static uintptr_t handle_size(mb_handle h) { return *(uintptr_t *)(h.h - MB_PAGESIZE); }
+static uintptr_t handle_size(mb_handle h) { return *(uintptr_t *)(h.h - header_size()); }
 
 void mb_pal_close_handle(mb_handle h) {
-	if (h.h) munmap((void *)(h.h - MB_PAGESIZE), handle_size(h) + MB_PAGESIZE);
+	if (h.h) munmap((void *)(h.h - header_size()), handle_size(h) + header_size());
 }
 
 int mb_pal_map_handle(mb_handle h, mb_range in, mb_range *out) {
