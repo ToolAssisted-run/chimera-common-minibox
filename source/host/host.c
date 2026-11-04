@@ -453,6 +453,9 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	 * one set, as every other register this boundary does not swap */
 	mb_fpu_set(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
 #if defined(__APPLE__) && defined(__x86_64__)
+	/* the thread pointer of the guest thread that runs on from here, where
+	 * its patched thread-pointer loads read it (MB_TIB_GUEST_TP) */
+	((uintptr_t *)gs_block)[MB_TIB_GUEST_TP] = fpu_ctx->thread_area;
 	mb_gs_set(gs_block);
 #endif
 	return res;
@@ -1166,6 +1169,10 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		snprintf(errbuf, errlen, "failed to load guest ELF");
 		return host_new_unwind(h);
 	}
+	if (mb_elf_refusal(h->elf) != NULL) {
+		snprintf(errbuf, errlen, "%s", mb_elf_refusal(h->elf));
+		return host_new_unwind(h);
+	}
 
 	/* Decided before the guest runs a single instruction: a guest carrying
 	 * PT_TLS uses %fs-relative thread locals (Rust) and needs the host to hand
@@ -1190,7 +1197,13 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
-#if defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
+#if defined(__APPLE__) && defined(__x86_64__)
+	if (mb_elf_has_tls(h->elf)) {
+		fprintf(stderr, "miniBox: guest declares TLS; its %zu thread-pointer loads read %%gs:0x48 "
+		                "(an Intel Mac has no %%fs to give it)\n", mb_elf_tp_patched(h->elf));
+		fflush(stderr);
+	}
+#elif defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
 	if (mb_elf_has_tls(h->elf)) {
 		fprintf(stderr, "miniBox: guest declares TLS; %%fs swap %s%s\n",
 		        h->context.fs_swap ? "ON" : "OFF",

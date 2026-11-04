@@ -740,6 +740,16 @@ extern uintptr_t mb_early_tp;
 #define MB_GS_MAGIC     0x4d4247534d414731ull
 #define MB_TIB_SELF     12
 #define MB_TIB_HOST_GS  13
+/* Word 9 is the guest's thread pointer, for a guest with thread locals.
+ * x86-64 compilers reach thread locals through %fs, which macOS gives a
+ * program no way to set. So each `mov %fs:0x0, reg` (the load of the thread
+ * pointer) that the guest toolchain lists (wbx-tp-rewrite.py, the section
+ * .wbx_fs_sites) is patched as the image loads into `mov %gs:0x48, reg`
+ * (elf.c), and this word holds what %fs:0 would have: the context's
+ * thread_area. It is copied in whenever the thread goes back to guest code:
+ * mb_gs_to_guest, and the way back from a system call (host.c), where the
+ * guest thread that runs on may be another one. */
+#define MB_TIB_GUEST_TP 9
 /* The thread's gs base. Inline asm, so it may be the first thing a function
  * does; "memory" because it moves what thread locals and errno mean. */
 static inline void mb_gs_set(uintptr_t base) {
@@ -818,6 +828,10 @@ int       mb_elf_load(const uint8_t *image, size_t image_len, const char *module
 void      mb_elf_free(mb_elf *e);
 uintptr_t mb_elf_entry(const mb_elf *e);
 bool      mb_elf_has_tls(const mb_elf *e); /* guest carries PT_TLS -> needs %fs swapping */
+/* why this host cannot run the image (an Intel Mac: thread locals it cannot
+ * reach), or NULL; and how many thread-pointer loads were patched (elf.c) */
+const char *mb_elf_refusal(const mb_elf *e);
+size_t    mb_elf_tp_patched(const mb_elf *e);
 uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name); /* 0 if absent */
 void      mb_elf_seal(mb_elf *e, mb_block *b);   /* mprotect RO sections */
 const uint8_t *mb_elf_hash(const mb_elf *e);     /* 32 bytes */

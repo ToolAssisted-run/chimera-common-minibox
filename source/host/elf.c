@@ -50,6 +50,8 @@ typedef struct { char *name; uintptr_t value, size; } export_info;
 struct mb_elf {
 	section_info *sections; size_t nsections;
 	export_info  *exports;  size_t nexports;
+	char refusal[256];       /* why this host cannot run the image, or "" */
+	size_t tp_patched;       /* thread-pointer loads patched (an Intel Mac) */
 	uintptr_t entry;
 	uint8_t hash[32];
 	/* Does this guest carry ELF thread-local storage (PT_TLS)? Only a guest
@@ -154,6 +156,23 @@ mb_range mb_elf_span(const uint8_t *image, size_t len) {
 	return r;
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+/* An Intel Mac: the guest's thread-pointer loads, `mov %fs:0x0, reg`, become
+ * `mov %gs:0x48, reg` as they load - %gs is the guest's block there, and its
+ * word 9 holds the thread pointer (MB_TIB_GUEST_TP, minibox_internal.h). The
+ * guest toolchain lists where they are (wbx-tp-rewrite.py): the section
+ * .wbx_fs_sites holds a format word (1), the number of the image's other %fs
+ * references (which nothing here can run), then each load's address. The
+ * bytes at each address are checked before they are changed. */
+static bool is_tp_load(const uint8_t *p) {
+	/* 64 (fs), REX.W with or without R, 8b (mov r64, r/m64), ModRM with mod 0
+	 * and a SIB byte, SIB 25 (no base, no index: disp32), disp32 0 */
+	return p[0] == 0x64 && (p[1] & 0xfb) == 0x48 && p[2] == 0x8b && (p[3] & 0xc7) == 0x04
+	    && p[4] == 0x25 && p[5] == 0 && p[6] == 0 && p[7] == 0 && p[8] == 0;
+}
+static uint64_t read64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+#endif
+
 int mb_elf_load(const uint8_t *image, size_t image_len, const char *module_name,
                 const mb_layout *layout, mb_block *b, mb_elf **out) {
 	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)image;
@@ -170,8 +189,22 @@ int mb_elf_load(const uint8_t *image, size_t image_len, const char *module_name,
 	const char *shstrtab = (const char *)(image + shstr->sh_offset);
 	e->sections = (section_info *)calloc(eh->e_shnum, sizeof(section_info));
 	const Elf64_Shdr *symtab = NULL, *strtab_sh = NULL;
+#if defined(__APPLE__) && defined(__x86_64__)
+	const uint8_t *fs_sites = NULL;   /* the listed loads, past the two header words */
+	size_t fs_nsites = 0;
+	uint64_t fs_other = 0;
+#endif
 	for (int i = 0; i < eh->e_shnum; i++) {
 		const char *name = shstrtab + sh[i].sh_name;
+#if defined(__APPLE__) && defined(__x86_64__)
+		if (strcmp(name, ".wbx_fs_sites") == 0 && sh[i].sh_size >= 16 && sh[i].sh_size % 8 == 0
+		    && within(sh[i].sh_offset, sh[i].sh_size, image_len)
+		    && read64(image + sh[i].sh_offset) == 1) {
+			fs_other = read64(image + sh[i].sh_offset + 8);
+			fs_sites = image + sh[i].sh_offset + 16;
+			fs_nsites = (sh[i].sh_size - 16) / 8;
+		}
+#endif
 		if (sh[i].sh_type != SHT_NOBITS && name[0] && sh[i].sh_addr != 0) {
 			e->sections[e->nsections].name = strdup(name);
 			e->sections[e->nsections].addr.start = sh[i].sh_addr;
@@ -236,8 +269,41 @@ int mb_elf_load(const uint8_t *image, size_t image_len, const char *module_name,
 		else prot = MB_PROT_NONE;
 		mb_block_mmap_fixed(b, pa, MB_PROT_RW, false);
 		if (ph->p_filesz) mb_block_copy_from_external(b, image + ph->p_offset, ph->p_vaddr, ph->p_filesz);
+#if defined(__APPLE__) && defined(__x86_64__)
+		for (size_t k = 0; x && k < fs_nsites; k++) {
+			const uint64_t at = read64(fs_sites + 8 * k);
+			if (at < ph->p_vaddr || at + 9 > ph->p_vaddr + ph->p_filesz) continue;
+			uint8_t insn[9];
+			memcpy(insn, image + ph->p_offset + (at - ph->p_vaddr), sizeof insn);
+			if (!is_tp_load(insn)) {
+				snprintf(e->refusal, sizeof e->refusal, "the core's list of thread-pointer loads names "
+				         "0x%llx, which is not one: it cannot run on an Intel Mac", (unsigned long long)at);
+				continue;
+			}
+			insn[0] = 0x65;                       /* gs */
+			insn[5] = MB_TIB_GUEST_TP * 8;        /* disp32 0x48 */
+			mb_block_copy_from_external(b, insn, at, sizeof insn);
+			e->tp_patched++;
+		}
+#endif
 		mb_block_mprotect(b, pa, prot);
 	}
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* what an Intel Mac cannot run, said rather than crashed on */
+	if (e->has_tls && e->refusal[0] == 0) {
+		if (fs_sites == NULL)
+			snprintf(e->refusal, sizeof e->refusal, "the core has thread-local variables and was built "
+			         "before an Intel Mac could run them: it needs building again with a newer miniBox "
+			         "guest toolchain");
+		else if (fs_other != 0)
+			snprintf(e->refusal, sizeof e->refusal, "the core reaches its thread-local variables in %llu "
+			         "places an Intel Mac cannot run (an %%fs-relative access other than loading the thread "
+			         "pointer): it needs building with -mno-tls-direct-seg-refs", (unsigned long long)fs_other);
+		else if (e->tp_patched != fs_nsites)
+			snprintf(e->refusal, sizeof e->refusal, "%zu of the core's listed thread-pointer loads are "
+			         "outside its code: it cannot run on an Intel Mac", fs_nsites - e->tp_patched);
+	}
+#endif
 
 	/* fill __wbxsysinfo */
 	if (info_area.start) {
@@ -272,6 +338,8 @@ void mb_elf_free(mb_elf *e) {
 
 uintptr_t mb_elf_entry(const mb_elf *e) { return e->entry; }
 bool mb_elf_has_tls(const mb_elf *e) { return e->has_tls; }
+const char *mb_elf_refusal(const mb_elf *e) { return e->refusal[0] ? e->refusal : NULL; }
+size_t mb_elf_tp_patched(const mb_elf *e) { return e->tp_patched; }
 
 uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name) {
 	for (size_t i = 0; i < e->nexports; i++)

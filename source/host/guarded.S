@@ -38,6 +38,7 @@
 #define mb_gs_to_guest _mb_gs_to_guest
 #define mb_gs_to_host _mb_gs_to_host
 #define mb_gs_block_c _mb_gs_block_c
+#define mb_guest_ctx _mb_guest_ctx
 #endif
 
 #define CTX_THREAD_AREA   0x000
@@ -324,7 +325,10 @@ mb_guarded_escape:
  * for _thread_set_tsd_base, number 3, rdi the new base.
  *
  * to_guest asks C for the block (this thread's, made at mb_prepare_thread)
- * and so must run on the OS's gs; it does nothing when already on the guest's.
+ * and so must run on the OS's gs; it swaps nothing when already on the
+ * guest's. Either way it then copies the running guest's thread pointer into
+ * the block's word 9 (MB_TIB_GUEST_TP), where a guest's patched thread-
+ * pointer loads read it.
  * to_host reads the OS's base out of the guest block and does nothing when it
  * is not on one.
  *
@@ -360,7 +364,12 @@ mb_gs_to_guest:
 	popq %rdx
 	popq %rsi
 	popq %rdi
-1:	popq %r11
+1:	movq mb_guest_ctx(%rip), %rax
+	testq %rax, %rax
+	jz 2f
+	movq CTX_THREAD_AREA(%rax), %rax
+	movq %rax, %gs:0x48                  /* MB_TIB_GUEST_TP */
+2:	popq %r11
 	popq %rax
 	popfq
 	ret

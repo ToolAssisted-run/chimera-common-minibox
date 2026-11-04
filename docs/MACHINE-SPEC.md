@@ -419,6 +419,27 @@ save/load require no writable files mounted and the identical readonly file set.
   The host installs a gs base (Windows: TEB SubSystemTib field; Linux:
   arch_prctl ARCH_SET_GS to a 4-word thread-local block, only if gs is
   currently 0).
+- Thread locals a compiler makes (C's `_Thread_local`, C++'s `thread_local`,
+  Rust's) are reached through %fs. On Linux and Windows the host gives a guest
+  with a PT_TLS segment its own %fs (Context.thread_area) while it runs. macOS
+  on Intel lets a program set no %fs at all, so there a guest's code may only
+  reach its thread locals through a load of the thread pointer, `mov %fs:0x0,
+  reg`, and never at an offset from %fs: the guest flags carry
+  `-mno-tls-direct-seg-refs` (meson.build, the musl-gcc specs).
+  - The guest kit lists those loads once the image is linked
+    (`wbx-tp-rewrite.py`, run by `waterbox_guest_link`): a section the guest
+    never loads, `.wbx_fs_sites`, of 64-bit words - the format (1), the number
+    of the image's other %fs references, then the address of each load. The
+    image itself is unchanged, so it runs the same on Linux and Windows.
+  - On an Intel Mac the host patches each listed load as it loads the image
+    into `mov %gs:0x48, reg` (the bytes are checked first), and keeps the
+    running guest thread's thread pointer in that word of the thread's gs
+    block (word 9), written on every entry into guest code and on every
+    return from a system call.
+  - An Intel Mac refuses, saying why, an image with a PT_TLS segment and no
+    `.wbx_fs_sites` (built before this), or one whose other %fs references
+    are not 0 (built without the flag, or hand-written assembly such as
+    Mesa's x86-64 GL dispatch, `glapi_x86-64.S`).
 
 ## 10. Determinism invariants a guest must uphold (documented, not enforced)
 

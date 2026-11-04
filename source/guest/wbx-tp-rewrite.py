@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Point an aarch64 guest's thread-pointer reads at the machine's slot.
+"""Point an aarch64 guest's thread-pointer reads at the machine's slot; list
+an x86-64 guest's, for a host that patches them.
 
 An aarch64 machine keeps the guest's thread pointer in the word at
 0x36ef0000000, not in TPIDR_EL0 (MACHINE-SPEC, "aarch64"): macOS writes the CPU
@@ -25,7 +26,20 @@ host (set_thread_area), and one written to the register would be lost.
 Code is told from data by the image's mapping symbols ($x, $d) where it has
 them, else every word of an executable section counts as code. An image
 already rewritten (it has .wbx_tp) is left alone, so a build may run this
-twice. An x86-64 image has nothing to rewrite.
+twice.
+
+x86-64: a guest with thread locals reaches them through %fs, which an Intel
+Mac gives a program no way to set. The image is not changed; it gains a
+section the guest never loads, .wbx_fs_sites, listing where its code loads
+the thread pointer (`mov %fs:0x0, reg`, 9 bytes), which miniBox on an Intel
+Mac patches as it loads the image (`mov %gs:0x48, reg`: MB_TIB_GUEST_TP). The
+section holds 64-bit words: the format (1), the number of the image's other
+%fs references (an access at an offset from %fs, which nothing can patch in
+place: the code must be built with -mno-tls-direct-seg-refs, as the guest
+toolchain's flags have it), then the address of each load. The code is read
+with the toolchain's objdump, so that each %fs reference is found where an
+instruction starts. An image with no thread locals, or with the section
+already, is left alone.
 
 usage: wbx-tp-rewrite.py <core.wbx> [<out.wbx>]   (in place without <out>)
        wbx-tp-rewrite.py -- <link command...>      (link, then rewrite its -o)
@@ -46,6 +60,8 @@ SHT_PROGBITS, SHT_SYMTAB = 1, 2
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
 SEGMENT_ALIGN = 0x10000          # the largest host page miniBox runs on
 SECTION = ".wbx_tp"
+SECTION_X86 = ".wbx_fs_sites"
+PT_TLS = 7
 
 MRS_TPIDR = 0xD53BD040           # mrs xN, tpidr_el0 (| N)
 MSR_TPIDR = 0xD51BD040           # msr tpidr_el0, xN (| N)
@@ -78,6 +94,83 @@ def branch(pc, target):                     # b target
     if off % 4 or not -(1 << 27) <= off < (1 << 27):
         return None
     return 0x14000000 | ((off >> 2) & 0x3FFFFFF)
+
+
+def objdump():
+    """The toolchain's objdump (any that reads an x86-64 ELF image)."""
+    import shutil
+    for tool in (os.environ.get("WBX_OBJDUMP"), "x86_64-elf-objdump", "x86_64-linux-gnu-objdump",
+                 "objdump", "llvm-objdump"):
+        if tool and shutil.which(tool):
+            return tool
+    fail("no objdump to read an x86-64 guest's code with (set WBX_OBJDUMP)")
+
+
+def is_tp_load(b):
+    """mov %fs:0x0, r64: 64, REX.W (R for r8-r15), 8b, ModRM (mod 0, a SIB),
+    SIB 25 (no base, no index: disp32), disp32 0 - the bytes miniBox's elf.c
+    checks before it patches them."""
+    return (len(b) == 9 and b[0] == 0x64 and (b[1] & 0xFB) == 0x48 and b[2] == 0x8B
+            and (b[3] & 0xC7) == 0x04 and b[4] == 0x25 and b[5:9] == b"\0\0\0\0")
+
+
+def list_x86_tp_loads(name, path, image, shdrs, phdrs, shstrtab, sec_name, ehdr, write_out):
+    """The x86-64 case (see the top): the .wbx_fs_sites section."""
+    import re
+    if not any(p[0] == PT_TLS and p[6] for p in phdrs):
+        write_out(image, None)
+        return
+    if any(sec_name(sh) == SECTION_X86 for sh in shdrs):
+        write_out(image, None)
+        return
+    code = [sh for sh in shdrs if sh[1] == SHT_PROGBITS and sh[2] & SHF_ALLOC and sh[2] & SHF_EXECINSTR]
+
+    def file_bytes(addr, n):
+        for sh in code:
+            if sh[3] <= addr and addr + n <= sh[3] + sh[5]:
+                return bytes(image[sh[4] + addr - sh[3]:sh[4] + addr - sh[3] + n])
+        return b""
+
+    listing = subprocess.run([objdump(), "-d", "--no-show-raw-insn", path],
+                             capture_output=True, text=True, errors="replace")
+    if listing.returncode != 0:
+        fail(f"{name}: objdump could not read it: {listing.stderr.strip()[:200]}")
+    sites, other = [], []
+    line_re = re.compile(r"^\s*([0-9a-f]+):\s+(.*)$")
+    for line in listing.stdout.splitlines():
+        m = line_re.match(line)
+        if not m or "%fs:" not in m.group(2):
+            continue
+        addr = int(m.group(1), 16)
+        (sites if is_tp_load(file_bytes(addr, 9)) else other).append(addr)
+
+    (ident, e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags,
+     e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = ehdr
+    shstr = shdrs[e_shstrndx]
+    # the section, then a section-name table that names it and the section
+    # headers, appended - nothing already in the file moves, and nothing the
+    # guest loads changes
+    while len(image) % 8:
+        image.append(0)
+    data_off = len(image)
+    image += struct.pack("<QQ", 1, len(other)) + b"".join(struct.pack("<Q", a) for a in sites)
+    new_shstr_off = len(image)
+    name_off = len(shstrtab)
+    image += shstrtab + SECTION_X86.encode() + b"\0"
+    shstr[4], shstr[5] = new_shstr_off, len(shstrtab) + len(SECTION_X86) + 1
+    while len(image) % 8:
+        image.append(0)
+    new_shoff = len(image)
+    shdrs.append([name_off, SHT_PROGBITS, 0, 0, data_off, 16 + 8 * len(sites), 0, 0, 8, 8])
+    for sh in shdrs:
+        image += SHDR.pack(*sh)
+    EHDR.pack_into(image, 0, ident, e_type, e_machine, e_version, e_entry, e_phoff, new_shoff, e_flags,
+                   e_ehsize, e_phentsize, e_phnum, e_shentsize, len(shdrs), e_shstrndx)
+    said = f"{len(sites)} thread-pointer load(s) listed for an Intel Mac to patch"
+    if other:
+        said += (f"; {len(other)} other %fs reference(s) (first at {other[0]:#x}), which an Intel Mac "
+                 "cannot run: build with -mno-tls-direct-seg-refs")
+    write_out(image, said)
 
 
 def link_then_rewrite(command):
@@ -120,10 +213,7 @@ def main(argv):
         if what:
             print(f"wbx-tp-rewrite: {name}: {what}")
 
-    if e_machine == EM_X86_64:
-        write_out(image, None)
-        return
-    if e_machine != EM_AARCH64:
+    if e_machine not in (EM_X86_64, EM_AARCH64):
         fail(f"{name}: machine {e_machine} is neither x86-64 nor aarch64")
     if e_shentsize != SHDR.size or e_phentsize != PHDR.size:
         fail(f"{name}: unexpected header sizes")
@@ -136,6 +226,11 @@ def main(argv):
     def sec_name(sh):
         end = shstrtab.index(b"\0", sh[0])
         return shstrtab[sh[0]:end].decode()
+
+    if e_machine == EM_X86_64:
+        list_x86_tp_loads(name, src, image, shdrs, phdrs, shstrtab, sec_name,
+                          EHDR.unpack_from(image, 0), write_out)
+        return
 
     code = [i for i, sh in enumerate(shdrs)
             if sh[1] == SHT_PROGBITS and sh[2] & SHF_ALLOC and sh[2] & SHF_EXECINSTR]

@@ -70,7 +70,10 @@ if build_guest_toolchain
   # x86-64 machine the spec describes, or the aarch64 one (arch/waterbox_aarch64
   # in musl). waterbox_cpu_flags are each CPU's frozen code-generation flags:
   #   x86-64   large code model (the guest sits above 2 GiB and the small model
-  #            cannot reach it), no red zone, no CET;
+  #            cannot reach it), no red zone, no CET, and thread locals reached
+  #            only through a load of the thread pointer (`mov %fs:0, reg`),
+  #            never at an offset from %fs: an Intel Mac, which cannot set %fs,
+  #            patches those loads as the image loads (wbx-tp-rewrite.py);
   #   aarch64  the default small model (addressing is pc-relative: any base
   #            works), no return-address signing (keyed per process - a signed
   #            pointer in a savestate is another pointer in the next process),
@@ -86,7 +89,7 @@ if build_guest_toolchain
   elif host_machine.cpu_family() == 'x86_64'
     waterbox_musl_target = 'waterbox'
     waterbox_guest_triplet = 'x86_64-linux-musl'
-    waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone']
+    waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone', '-mno-tls-direct-seg-refs']
   else
     error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
   endif
