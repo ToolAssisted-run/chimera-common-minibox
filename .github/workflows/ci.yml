@@ -366,3 +366,15 @@ jobs:
         run: |
           & ".\run_threads.exe" ".\guest_threads.wbx"
           if ($LASTEXITCODE -ne 0) { throw "threads guest run failed ($LASTEXITCODE)" }
+
+      # Windows on arm64 is new: when a guest run fails, the same run again with
+      # every system call it makes said, and miniBox's own log of the death
+      - name: On failure, the guest again with its system calls said
+        if: failure()
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          $env:MINIBOX_TRACE_SYSCALLS = "1"
+          & ".\run_guest.exe" ".\guest.wbx" 2>&1 | Select-Object -Last 80
+          Write-Host "exit: $LASTEXITCODE"
+          if (Test-Path minibox-diag.log) { Get-Content minibox-diag.log -Tail 120 }

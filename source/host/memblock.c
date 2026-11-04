@@ -796,14 +796,15 @@ static mb_prot group_native_prot(const mb_block *b, size_t first) {
 }
 
 /* What the OS is asked for, for the host page that starts at machine page
- * `first`. Everywhere but macOS, the group's protection as it is. macOS
+ * `first`. Everywhere but Apple silicon, the group's protection as it is
+ * (an Intel Mac maps RWX as asked). macOS on Apple silicon
  * refuses a page both writable and executable, so one the guest may write and
  * run is mapped for one of the two at a time - for whichever it last faulted
  * for (mb_block_wx_flip) - and a fault for the other flips it. Neither is
  * looser than RWX, so no write tracking depends on the choice: a held page is
  * never RWX in the first place. */
 static mb_prot os_prot(const mb_block *b, size_t first, mb_prot prot) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__aarch64__)
 	if (prot == MB_PROT_RWX) return b->pages[first].wx_exec ? MB_PROT_RX : MB_PROT_RW;
 #else
 	(void)b; (void)first;
@@ -838,7 +839,7 @@ int mb_block_protect_group(mb_block *b, size_t pi) {
 }
 
 bool mb_block_wx_flip(mb_block *b, uintptr_t addr, bool exec, bool write) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__aarch64__)
 	if (!b->swapped_in || !mb_range_contains(b->addr, addr) || (!exec && !write)) return false;
 	const size_t n = mb_group_pages();
 	const size_t first = ((addr - b->addr.start) >> MB_PAGESHIFT) & ~(n - 1);
