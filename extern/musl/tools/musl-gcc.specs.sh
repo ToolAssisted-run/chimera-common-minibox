@@ -3,7 +3,9 @@ libdir=$2
 ldso=$3
 arch=$4
 # The flags every compile for the machine carries, whatever builds it. x86-64:
-# no red zone (a dirty-tracking fault may land at any instruction). aarch64 has
+# no red zone (a dirty-tracking fault may land at any instruction), and thread
+# locals reached only through a load of the thread pointer, never at an offset
+# from %fs (an Intel Mac, which cannot set %fs, patches those loads). aarch64 has
 # no red zone to begin with; it needs no return-address signing (keyed per
 # process: a signed pointer in a savestate is a different pointer in the next
 # process), no outline atomics (they ask the CPU what it has), arithmetic
@@ -16,7 +18,7 @@ arch=$4
 case "$arch" in
 waterbox_aarch64) cc1_machine="-mbranch-protection=none -mno-outline-atomics -ffp-contract=off -fsigned-char -ffixed-x18"
 	libgcc_spec="-lgcc" ;;
-waterbox) cc1_machine="-mno-red-zone"
+waterbox) cc1_machine="-mno-red-zone -mno-tls-direct-seg-refs"
 	libgcc_spec="" ;;
 *) echo "musl-gcc.specs.sh: no machine for $arch: miniBox runs on x86-64 and aarch64 only" >&2
 	exit 1 ;;

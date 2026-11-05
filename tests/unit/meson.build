@@ -5,7 +5,15 @@ unit_tests = ['test_memblock', 'test_sha256', 'test_fs', 'test_errno', 'test_sav
 
 foreach t : unit_tests
   exe = executable(t, t + '.c', dependencies: minibox_host_static_dep)
-  test(t, exe, suite: 'unit', timeout: 60)
+  # a fault costs more on macOS (Mach's exception, then the signal): 1.8 us
+  # on GitHub's Apple silicon Mac and 26 to 44 us on its Intel one, against
+  # 2.3 us on Linux here, so the tests that take many have more time there
+  # (test_memblock took 29 seconds on the Intel Mac once and over 60 the next
+  # run). test_tripguard's 1500 rounds of 512 faults take 30 seconds on the
+  # first and eleven minutes on the second, which runs 300.
+  darwin = host_machine.system() == 'darwin'
+  test(t, exe, suite: 'unit', timeout: darwin ? 300 : 60,
+    env: darwin and t == 'test_tripguard' and host_machine.cpu_family() == 'x86_64' ? ['MB_TEST_FAULT_ROUNDS=300'] : [])
 endforeach
 
 # waterbox_slots.h is guest-kit C that compiles on the host too, which is how

@@ -24,6 +24,7 @@ static int mb_test_checks = 0;
 
 #define TEST_MAIN() \
 	int main(void) { \
+		setvbuf(stdout, NULL, _IONBF, 0);   /* a test killed for its time still says what it printed */ \
 		run_all(); \
 		if (mb_test_fails == 0) printf("%s: %d checks passed\n", __FILE__, mb_test_checks); \
 		else printf("%s: %d/%d checks FAILED\n", __FILE__, mb_test_fails, mb_test_checks); \

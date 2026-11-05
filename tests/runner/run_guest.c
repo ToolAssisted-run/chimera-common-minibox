@@ -30,9 +30,17 @@
  * change it. */
 static uintptr_t host_fs_base(void) {
 	uintptr_t v = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__APPLE__)
+	/* macOS: TPIDRRO_EL0, where libc keeps this thread's state (TPIDR_EL0
+	 * holds the CPU number, and changes as the thread moves) */
+	__asm__ volatile ("mrs %0, tpidrro_el0" : "=r" (v));
+#elif defined(__aarch64__)
 	/* aarch64: TPIDR_EL0, where glibc keeps this thread's state */
 	__asm__ volatile ("mrs %0, tpidr_el0" : "=r" (v));
+#elif defined(__x86_64__) && defined(__APPLE__)
+	/* macOS x86-64: libc's thread state is behind gs, and pthread_self is the
+	 * first word there (%fs is nobody's) */
+	v = (uintptr_t)pthread_self();
 #elif defined(__x86_64__)
 	syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &v);
 #else
@@ -608,7 +616,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 	const char *dir = getenv("TEMP");
 	if (dir == NULL || dir[0] == '\0') dir = ".";
 	char log[512], cmd[2048];
-	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld_%ld.log", dir, (long)getpid(), (long)time(NULL));
+	snprintf(log, sizeof log, "%s\\run_guest_recursion_%ld_%ld.log", dir, (long)GetCurrentProcessId(), (long)time(NULL));
 	remove(log);
 	_putenv_s("MINIBOX_LOG", log);
 	snprintf(cmd, sizeof cmd, "\"\"%s\" --handler-recursion-child \"%s\" >NUL 2>&1\"", self, guest);
@@ -631,7 +639,7 @@ static int handler_does_not_recurse(const char *self, const char *guest) {
 }
 #endif
 
-#if !defined(_WIN32) && defined(__x86_64__)   /* %fs repair: x86-64 only (aarch64 never loses TPIDR_EL0) */
+#if !defined(_WIN32) && !defined(__APPLE__) && defined(__x86_64__)   /* %fs repair: x86-64 Linux only (aarch64 never loses TPIDR_EL0; macOS has no rdfsbase) */
 /* Can this machine run a real guest-side drop (guest WRFSBASE(0))? Some
  * kernels (WSL2) kill it despite the CPU flag - and the base is already 0
  * when the fault arrives, so nothing libc may run until %fs is put back.
@@ -937,7 +945,7 @@ int main(int argc, char **argv) {
 	if (argc > 2 && strcmp(argv[1], "--stop") == 0) return stop_flow(argv[2]);
 #ifndef _WIN32
 	if (argc > 2 && strcmp(argv[1], "--host-fault-child") == 0) return host_fault_child(argv[2]);
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !defined(__APPLE__)
 	if (argc > 2 && strcmp(argv[1], "--fs-repair-child") == 0) return fs_repair_child(argv[2]);
 #endif
 #else
@@ -1006,6 +1014,16 @@ int main(int argc, char **argv) {
 		CHECK(at_entry == 0);
 		CHECK(after_syscall == 0);
 		CHECK(after_extcall == 0);
+#if defined(__aarch64__)
+		/* x18, the platform register: zeroed for the guest on Linux and macOS;
+		 * on Windows the thread's TEB, which must stay there */
+		const uint64_t x18 = ((u64_fn)proc(h, "EntryX18"))();
+#ifdef _WIN32
+		CHECK(x18 == (uint64_t)(uintptr_t)NtCurrentTeb());
+#else
+		CHECK(x18 == 0);
+#endif
+#endif
 	}
 	/* nor in its xmm0-15. Before the entry case this side fills xmm0-5 (scratch
 	 * in both host ABIs) with ones, so the check does not rest on whatever the

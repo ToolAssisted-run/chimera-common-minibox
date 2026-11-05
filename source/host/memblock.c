@@ -795,6 +795,23 @@ static mb_prot group_native_prot(const mb_block *b, size_t first) {
 	return r ? MB_PROT_R : MB_PROT_NONE;
 }
 
+/* What the OS is asked for, for the host page that starts at machine page
+ * `first`. Everywhere but Apple silicon, the group's protection as it is
+ * (an Intel Mac maps RWX as asked). macOS on Apple silicon
+ * refuses a page both writable and executable, so one the guest may write and
+ * run is mapped for one of the two at a time - for whichever it last faulted
+ * for (mb_block_wx_flip) - and a fault for the other flips it. Neither is
+ * looser than RWX, so no write tracking depends on the choice: a held page is
+ * never RWX in the first place. */
+static mb_prot os_prot(const mb_block *b, size_t first, mb_prot prot) {
+#if defined(__APPLE__) && defined(__aarch64__)
+	if (prot == MB_PROT_RWX) return b->pages[first].wx_exec ? MB_PROT_RX : MB_PROT_RW;
+#else
+	(void)b; (void)first;
+#endif
+	return prot;
+}
+
 /* The grouped refresh: every host page touching [pstart, pstart+pcount),
  * protected for its whole group and coalesced into runs. Linux only in
  * practice (Windows pages are 4 KiB), so a block here is never lazy. */
@@ -805,9 +822,9 @@ static void refresh_groups(mb_block *b, size_t pstart, size_t pcount) {
 	for (size_t k = pstart; k < pstart + pcount; k++) note_prot(b, k, mb_page_native_prot(&b->pages[k]));
 	size_t g = first;
 	while (g < end) {
-		const mb_prot prot = group_native_prot(b, g);
+		const mb_prot prot = os_prot(b, g, group_native_prot(b, g));
 		size_t h = g + n;
-		while (h < end && group_native_prot(b, h) == prot) h += n;
+		while (h < end && os_prot(b, h, group_native_prot(b, h)) == prot) h += n;
 		/* the block's last host page may run past its last machine page; the
 		 * OS mapped it whole, so protecting it whole is what it can do */
 		mb_pal_protect(group_range(b, g, h), prot);
@@ -818,7 +835,28 @@ static void refresh_groups(mb_block *b, size_t pstart, size_t pcount) {
 int mb_block_protect_group(mb_block *b, size_t pi) {
 	const size_t n = mb_group_pages();
 	const size_t first = pi & ~(n - 1);
-	return mb_pal_protect(group_range(b, first, first + n), group_native_prot(b, first));
+	return mb_pal_protect(group_range(b, first, first + n), os_prot(b, first, group_native_prot(b, first)));
+}
+
+bool mb_block_wx_flip(mb_block *b, uintptr_t addr, bool exec, bool write) {
+#if defined(__APPLE__) && defined(__aarch64__)
+	if (!b->swapped_in || !mb_range_contains(b->addr, addr) || (!exec && !write)) return false;
+	const size_t n = mb_group_pages();
+	const size_t first = ((addr - b->addr.start) >> MB_PAGESHIFT) & ~(n - 1);
+	mb_block_track_lock(b);
+	bool flipped = false;
+	/* only a page that is RWX right now, under the lock: the guest may have
+	 * changed it, and a held page is not RWX and is trip's to release */
+	if (group_native_prot(b, first) == MB_PROT_RWX && b->pages[first].wx_exec != exec) {
+		b->pages[first].wx_exec = exec;
+		flipped = mb_block_protect_group(b, first) == 0;
+	}
+	mb_block_track_unlock(b);
+	return flipped;
+#else
+	(void)b; (void)addr; (void)exec; (void)write;
+	return false;
+#endif
 }
 
 /* ---- protection refresh (coalesced) ---- */

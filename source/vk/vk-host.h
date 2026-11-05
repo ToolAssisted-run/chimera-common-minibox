@@ -21,6 +21,10 @@ extern "C" {
  * in err. Nothing is created until a guest asks for an instance. */
 int chimera_vk_host_init(char *err, int errlen);
 
+/* The machine's Vulkan loader, opened the way the bridge opens it (a handle
+ * for dlsym, or GetProcAddress on Windows), or NULL when there is none. */
+void *chimera_vk_host_open_loader(void);
+
 /* Hand this to wbx_get_callback_addr. */
 uintptr_t VKB_GUEST_ABI chimera_vk_host_dispatch(uintptr_t op, uintptr_t a, uintptr_t b,
                                                  uintptr_t c, uintptr_t d, uintptr_t e);

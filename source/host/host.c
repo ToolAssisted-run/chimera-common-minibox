@@ -19,6 +19,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 /* the spin sampler's host, and the lock that lets mb_host_destroy wait for it
  * (see sample_fn) */
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -386,6 +390,13 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	 * (aarch64 has no direction flag.) */
 #if defined(__x86_64__)
 	__asm__ volatile("cld" ::: "memory");
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* entered on the guest's gs block; everything below is host C and libc,
+	 * which find their thread through the OS's (minibox_internal.h). Inline
+	 * asm, nothing called before it. */
+	const uintptr_t gs_block = mb_gs_block_now();
+	mb_gs_set(mb_gs_host_now());
+#endif
 #endif
 #ifdef MB_HAVE_FSBASE
 	/* The guest trapped in here with %fs = its own thread pointer (a Rust guest
@@ -441,6 +452,12 @@ static uintptr_t MB_SYSV dispatch(uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
 	/* the guest's back: whichever guest thread runs on from here, they share
 	 * one set, as every other register this boundary does not swap */
 	mb_fpu_set(&fpu_ctx->guest_fcw, &fpu_ctx->guest_mxcsr);
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* the thread pointer of the guest thread that runs on from here, where
+	 * its patched thread-pointer loads read it (MB_TIB_GUEST_TP) */
+	((uintptr_t *)gs_block)[MB_TIB_GUEST_TP] = fpu_ctx->thread_area;
+	mb_gs_set(gs_block);
+#endif
 	return res;
 }
 
@@ -1152,6 +1169,10 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 		snprintf(errbuf, errlen, "failed to load guest ELF");
 		return host_new_unwind(h);
 	}
+	if (mb_elf_refusal(h->elf) != NULL) {
+		snprintf(errbuf, errlen, "%s", mb_elf_refusal(h->elf));
+		return host_new_unwind(h);
+	}
 
 	/* Decided before the guest runs a single instruction: a guest carrying
 	 * PT_TLS uses %fs-relative thread locals (Rust) and needs the host to hand
@@ -1176,7 +1197,13 @@ mb_host *mb_host_new(const uint8_t *image, size_t image_len, const char *module_
 	/* Said once, unprompted, because it decides whether a guest carrying its own
 	 * thread locals can work at all - and when it is wrong the failure is a
 	 * crash with nothing to connect it to. A guest with no TLS says nothing. */
-#if defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
+#if defined(__APPLE__) && defined(__x86_64__)
+	if (mb_elf_has_tls(h->elf)) {
+		fprintf(stderr, "miniBox: guest declares TLS; its %zu thread-pointer loads read %%gs:0x48 "
+		                "(an Intel Mac has no %%fs to give it)\n", mb_elf_tp_patched(h->elf));
+		fflush(stderr);
+	}
+#elif defined(__x86_64__)   /* (aarch64: always on, nothing to say) */
 	if (mb_elf_has_tls(h->elf)) {
 		fprintf(stderr, "miniBox: guest declares TLS; %%fs swap %s%s\n",
 		        h->context.fs_swap ? "ON" : "OFF",
@@ -1310,8 +1337,15 @@ static void *sample_fn(void *arg) {
 		if (h && h->active) {
 			const uintptr_t rsp = h->context.guest_rsp;   /* racy by design: a snapshot */
 			uint64_t words[12];
+#if defined(__APPLE__)
+			/* Mach's equivalent: an unmapped page is an error, not a fault */
+			mach_vm_size_t read = 0;
+			const ssize_t got = mach_vm_read_overwrite(mach_task_self(), rsp, sizeof words,
+				(mach_vm_address_t)(uintptr_t)words, &read) == KERN_SUCCESS ? (ssize_t)read : -1;
+#else
 			struct iovec local = { words, sizeof words }, remote = { (void *)rsp, sizeof words };
 			const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+#endif
 			fprintf(stderr, "[S] active=%u rsp=%lx stack:", mb_threads_active_tid(h->threads), (unsigned long)rsp);
 			if (got == (ssize_t)sizeof words)
 				for (int i = 0; i < 12; i++) fprintf(stderr, " %lx", (unsigned long)words[i]);

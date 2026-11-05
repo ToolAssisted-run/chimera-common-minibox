@@ -147,10 +147,25 @@ static void test_concurrent_faults_are_all_counted(void) {
 	const int rounds = rounds_wanted();
 	int short_rounds = 0, first_short = -1;
 	size_t least_count = NPAGES, least_bits = NPAGES;
+	const double start = now_ns();
 	for (int r = 0; r < rounds; r++) {
 		CHECK_EQ(mb_block_epoch_begin(b), 0);   /* re-holds every page written last round */
 		__atomic_add_fetch(&round, 1, __ATOMIC_ACQ_REL);
-		while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) < NTHREADS * (r + 1)) cpu_relax();
+		/* A round that never ends is a fault never served: said, with where
+		 * each writer is, rather than left to the test's time limit */
+		const double round_start = now_ns();
+		for (unsigned spins = 0; __atomic_load_n(&done, __ATOMIC_ACQUIRE) < NTHREADS * (r + 1); spins++) {
+			cpu_relax();
+			if ((spins & 0xFFFFF) == 0 && now_ns() - round_start > 60e9) {
+				printf("test_tripguard: round %d has not ended after 60 s: %d of %d writers done; rounds seen:",
+				       r, __atomic_load_n(&done, __ATOMIC_ACQUIRE) - NTHREADS * r, NTHREADS);
+				for (int i = 0; i < NTHREADS; i++) printf(" %d", ws[i].rounds_seen);
+				printf("\n");
+				exit(1);
+			}
+		}
+		if (r % 250 == 249)
+			printf("test_tripguard: %d of %d rounds after %.1f s\n", r + 1, rounds, (now_ns() - start) / 1e9);
 
 		const size_t counted = mb_block_epoch_page_count(b);
 		const size_t bits = popcount_words(b->epoch_bits, b->nwords);
@@ -197,7 +212,40 @@ static void measure_fault_cost(void) {
 	mb_block_free(b);
 }
 
+#if defined(__aarch64__)
+/* A page the guest may write and run, on a host that maps nothing both at
+ * once (macOS): code written there runs, code written over it runs as the new
+ * code, and the writes are tracked as any other. On Linux the page is plain
+ * RWX and the same must hold. */
+static void test_rwx_page_can_be_written_and_run(void) {
+	const uintptr_t size = 0x10000;   /* one 64 KiB host page at most */
+	mb_range a = { 0x36f00000000ull, size };
+	mb_block *b = mb_block_new(a);
+	mb_block_activate(b);
+	mb_range r = { b->addr.start, size };
+	CHECK_EQ(mb_block_mmap_fixed(b, r, MB_PROT_RWX, true), 0);
+	mb_block_seal(b);
+	static const uint32_t ret42[] = { 0xd2800540u, 0xd65f03c0u };   /* mov x0, #42; ret */
+	static const uint32_t ret7[] = { 0xd28000e0u, 0xd65f03c0u };    /* mov x0, #7; ret */
+	typedef int (*fn)(void);
+	volatile uint32_t *code = (volatile uint32_t *)gp(b, 0x100);
+	for (int round = 0; round < 3; round++) {
+		code[0] = ret42[0]; code[1] = ret42[1];
+		__builtin___clear_cache((char *)code, (char *)(code + 2));
+		CHECK_EQ(((fn)(uintptr_t)code)(), 42);
+		code[0] = ret7[0]; code[1] = ret7[1];
+		__builtin___clear_cache((char *)code, (char *)(code + 2));
+		CHECK_EQ(((fn)(uintptr_t)code)(), 7);
+	}
+	CHECK(b->pages[0x100 >> MB_PAGESHIFT].dirty);
+	mb_block_free(b);
+}
+#endif
+
 static void run_all(void) {
+#if defined(__aarch64__)
+	RUN(test_rwx_page_can_be_written_and_run);
+#endif
 	RUN(measure_fault_cost);
 	RUN(test_concurrent_faults_are_all_counted);
 }

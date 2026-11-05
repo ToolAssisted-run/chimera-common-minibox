@@ -84,12 +84,12 @@ jobs:
       # OS-INDEPENDENT: the same binary a Linux job builds is what the Windows
       # jobs run. That is what makes guest coverage on Windows possible at all,
       # since the guest toolchain is Linux-only. It is NOT CPU-independent:
-      # the Windows jobs are x86-64, so theirs is the x86-64 build's.
+      # each Windows job takes the guest of its CPU (x86-64 or arm64).
       - name: Upload the guest for the Windows jobs
-        if: matrix.name == 'c-guests' && matrix.arch == 'x86_64'
+        if: matrix.name == 'c-guests'
         uses: actions/upload-artifact@v4
         with:
-          name: guest-wbx
+          name: guest-wbx-${{ matrix.arch }}
           path: build/ci/tests/conformance/guest.wbx
 
       # The threads guest, whose fault handler runs inside the host's own on
@@ -98,8 +98,46 @@ jobs:
         if: matrix.name == 'c-guests'
         uses: actions/upload-artifact@v4
         with:
-          name: guest-threads-wbx
+          name: guest-threads-wbx-${{ matrix.arch }}
           path: build/ci/tests/threads/guest_threads.wbx
+
+  macos:
+    # Apple silicon: 16 KiB pages, no TPIDR_EL0 or x18 for the guest, and no
+    # page both writable and executable - everything the macOS PAL is for.
+    # An Intel Mac: the guest's gs swapped at each boundary, and no
+    # rdfsbase/wrfsbase. Guests are built with Homebrew's bare-metal gcc for
+    # the CPU (aarch64-elf-gcc, x86_64-elf-gcc), as meson.build picks it.
+    name: macos ${{ matrix.arch }} (c-guests)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install meson ninja ${{ matrix.arch }}-elf-gcc
+
+      - name: Configure
+        run: meson setup build/ci
+
+      - name: Build
+        run: meson compile -C build/ci
+
+      - name: Test
+        run: meson test -C build/ci --print-errorlogs
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-logs-macos-${{ matrix.arch }}
+          path: build/ci/meson-logs/
 
   windows-cross:
     name: windows build (mingw-w64 cross)
@@ -196,13 +234,13 @@ jobs:
       - name: Fetch the Linux-built guest
         uses: actions/download-artifact@v4
         with:
-          name: guest-wbx
+          name: guest-wbx-x86_64
           path: artifacts
 
       - name: Fetch the Linux-built threads guest
         uses: actions/download-artifact@v4
         with:
-          name: guest-threads-wbx
+          name: guest-threads-wbx-x86_64
           path: artifacts
 
       - name: Run unit tests
@@ -237,3 +275,106 @@ jobs:
         run: |
           & ".\run_threads.exe" ".\guest_threads.wbx"
           if ($LASTEXITCODE -ne 0) { throw "threads guest run failed ($LASTEXITCODE)" }
+
+  windows-arm64-cross:
+    # Windows on arm64: the host cross-built with llvm-mingw (mingw-w64's GCC
+    # has no arm64 Windows target), a pinned release checked by its SHA256.
+    # As for x86-64, the guests are the Linux arm64 job's.
+    name: windows arm64 build (llvm-mingw cross)
+    runs-on: ubuntu-latest
+    env:
+      LLVM_MINGW: llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64
+      LLVM_MINGW_SHA256: 55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build
+
+      - name: llvm-mingw
+        run: |
+          curl -sSL --fail --retry 3 -o "$RUNNER_TEMP/$LLVM_MINGW.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/$LLVM_MINGW.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/$LLVM_MINGW.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+
+      - name: Configure (llvm-mingw cross)
+        run: meson setup build/ci-win-arm64 --cross-file source/host/mingw-w64-aarch64.ini
+
+      - name: Build
+        run: meson compile -C build/ci-win-arm64
+
+      - name: Stage Windows arm64 artifacts
+        run: |
+          mkdir -p artifacts
+          cp build/ci-win-arm64/source/host/libminiboxhost.dll artifacts/
+          cp build/ci-win-arm64/tests/unit/*.exe artifacts/
+          cp build/ci-win-arm64/tests/runner/run_guest.exe artifacts/
+          cp build/ci-win-arm64/tests/runner/run_threads.exe artifacts/
+          # llvm-mingw's own runtime, for whatever links it dynamically
+          cp "$RUNNER_TEMP/$LLVM_MINGW"/aarch64-w64-mingw32/bin/*.dll artifacts/ 2>/dev/null || true
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-build
+          path: artifacts/
+
+  windows-arm64-test:
+    # The cross-built host, its unit tests and the guests, on Windows on arm64
+    name: windows arm64 unit tests (native run)
+    needs: [windows-arm64-cross, linux]
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64-build
+          path: artifacts
+
+      - name: Fetch the Linux-built guests (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: guest-*-aarch64
+          path: artifacts
+          merge-multiple: true
+
+      - name: Run unit tests
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          $failed = 0
+          Get-ChildItem -Filter *.exe | Where-Object { $_.Name -ne "run_guest.exe" -and $_.Name -ne "run_threads.exe" } | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            & ".\$($_.Name)"
+            if ($LASTEXITCODE -ne 0) { Write-Host "   FAILED ($LASTEXITCODE)"; $failed = 1 }
+          }
+          exit $failed
+
+      - name: Run a guest
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          & ".\run_guest.exe" ".\guest.wbx"
+          if ($LASTEXITCODE -ne 0) { throw "guest run failed ($LASTEXITCODE)" }
+
+      - name: Run the threads guest
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          & ".\run_threads.exe" ".\guest_threads.wbx"
+          if ($LASTEXITCODE -ne 0) { throw "threads guest run failed ($LASTEXITCODE)" }
+
+      # Windows on arm64 is new: when a guest run fails, the same run again with
+      # every system call it makes said, and miniBox's own log of the death
+      - name: On failure, the guest again with its system calls said
+        if: failure()
+        shell: pwsh
+        working-directory: artifacts
+        run: |
+          $env:MINIBOX_TRACE_SYSCALLS = "1"
+          & ".\run_guest.exe" ".\guest.wbx" 2>&1 | Select-Object -Last 80
+          Write-Host "exit: $LASTEXITCODE"
+          if (Test-Path minibox-diag.log) { Get-Content minibox-diag.log -Tail 120 }

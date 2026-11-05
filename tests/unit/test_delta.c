@@ -1162,35 +1162,35 @@ static void test_held_is_never_true_on_a_writable_page(void) {
 }
 
 static void run_all(void) {
-	test_epoch_tracks_what_changed();
-	test_forward_delta_reproduces();
-	test_delta_applied_to_a_clean_page_keeps_the_baseline();
-	test_delta_apply_leaves_its_pages_watched();
-	test_hot_page_still_reports_every_change();
-	test_hot_page_cools_and_is_exact();
-	test_hot_page_survives_a_load();
-	test_stack_page_survives_a_load();
-	test_stack_page_after_an_anchor();
-	test_a_truncated_delta_leaves_pages_watched();
-	test_a_truncated_delta_dirties_what_it_wrote();
-	test_a_truncated_state_leaves_pages_watched();
-	test_reverse_delta_is_refused();
-	test_delta_chain_equals_the_run();
-	test_delta_carries_allocation();
-	test_delta_carries_remapped_contents();
-	test_delta_carries_freshly_mapped_contents();
-	test_delta_zeroes_a_page_the_guest_gave_back();
-	test_delta_refusals();
-	test_delta_needs_an_epoch();
-	test_full_state_after_delta();
-	test_compose_equals_applying_both();
-	test_composing_a_chain_down_to_one();
-	test_compose_carries_allocation();
-	test_compose_refuses_a_foreign_delta();
-	test_compose_in_memory_matches_streaming();
-	test_a_hold_outlives_its_epoch();
-	test_a_hold_survives_a_planned_state();
-	test_held_is_never_true_on_a_writable_page();
+	RUN(test_epoch_tracks_what_changed);
+	RUN(test_forward_delta_reproduces);
+	RUN(test_delta_applied_to_a_clean_page_keeps_the_baseline);
+	RUN(test_delta_apply_leaves_its_pages_watched);
+	RUN(test_hot_page_still_reports_every_change);
+	RUN(test_hot_page_cools_and_is_exact);
+	RUN(test_hot_page_survives_a_load);
+	RUN(test_stack_page_survives_a_load);
+	RUN(test_stack_page_after_an_anchor);
+	RUN(test_a_truncated_delta_leaves_pages_watched);
+	RUN(test_a_truncated_delta_dirties_what_it_wrote);
+	RUN(test_a_truncated_state_leaves_pages_watched);
+	RUN(test_reverse_delta_is_refused);
+	RUN(test_delta_chain_equals_the_run);
+	RUN(test_delta_carries_allocation);
+	RUN(test_delta_carries_remapped_contents);
+	RUN(test_delta_carries_freshly_mapped_contents);
+	RUN(test_delta_zeroes_a_page_the_guest_gave_back);
+	RUN(test_delta_refusals);
+	RUN(test_delta_needs_an_epoch);
+	RUN(test_full_state_after_delta);
+	RUN(test_compose_equals_applying_both);
+	RUN(test_composing_a_chain_down_to_one);
+	RUN(test_compose_carries_allocation);
+	RUN(test_compose_refuses_a_foreign_delta);
+	RUN(test_compose_in_memory_matches_streaming);
+	RUN(test_a_hold_outlives_its_epoch);
+	RUN(test_a_hold_survives_a_planned_state);
+	RUN(test_held_is_never_true_on_a_writable_page);
 }
 
 TEST_MAIN()

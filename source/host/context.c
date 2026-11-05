@@ -13,7 +13,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <stddef.h>
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -84,9 +86,11 @@ static void init_interop_area(void) {
 	/* aarch64 does not keep its instruction cache coherent with stores: code
 	 * written as data has to be published before it is run (x86-64: nothing) */
 	__builtin___clear_cache((char *)MB_ORG, (char *)(MB_ORG + mb_interop_bin_len));
-#ifdef _WIN32
+#if defined(_WIN32) && defined(__x86_64__)
 	/* register the hand-written unwind info so host SEH can unwind across the
-	 * guest stack-switch (the table lives at RUNTIME_TABLE_ADDR in interop.bin) */
+	 * guest stack-switch (the table lives at RUNTIME_TABLE_ADDR in interop.bin;
+	 * x86-64's: the aarch64 blob has none yet, so on Windows on arm64 an
+	 * exception cannot be unwound through a guest call) */
 	if (!RtlAddFunctionTable((PRUNTIME_FUNCTION)RUNTIME_TABLE_ADDR, 2, MB_ORG)) {
 		fprintf(stderr, "miniBox: RtlAddFunctionTable failed\n");
 		abort();
@@ -108,9 +112,53 @@ uintptr_t *mb_thread_block(void) { return g_tib; }
 #endif
 
 
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <pthread.h>
+/* This thread's gs base as the OS has it: &pthread_self()->tsd[0]. Nothing
+ * reads it directly, so it is found the way it is laid out - a pthread key's
+ * slot is base + 8 * key, and a value stored under a key is found in the
+ * thread's struct (the pthread_t sits at gs:0, 224 bytes before the base on
+ * macOS 27, but that is not relied on). */
+static pthread_key_t gs_key;
+static void make_gs_key(void) { pthread_key_create(&gs_key, NULL); }
+static uintptr_t os_gs_base(void) {
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, make_gs_key);
+	const pthread_key_t key = gs_key;
+	const uintptr_t magic = 0x6d625f6773626173ull;
+	pthread_setspecific(key, (void *)magic);
+	const uintptr_t *p = (const uintptr_t *)pthread_self();
+	uintptr_t base = 0;
+	for (int i = 0; i < 4096 && base == 0; i++)
+		if (p[i] == magic) base = (uintptr_t)&p[i] - (uintptr_t)key * 8;
+	pthread_setspecific(key, NULL);
+	return base;
+}
+
+/* This thread's block, made if it has not been. */
+static void make_thread_block(void) {
+	if (g_tib[0] == MB_GS_MAGIC) return;
+	g_tib[MB_TIB_SELF] = (uintptr_t)g_tib;
+	g_tib[MB_TIB_HOST_GS] = os_gs_base();
+	if (g_tib[MB_TIB_HOST_GS] == 0) {
+		fprintf(stderr, "miniBox: cannot find this thread's gs base\n");
+		abort();
+	}
+	g_tib[0] = MB_GS_MAGIC;   /* last: it is what says the rest is there */
+}
+
+/* for guarded.S, on the OS's gs: the block this thread's guest runs on. A thread
+ * that enters a guest without having been prepared is made one here, since the
+ * swap back to the OS's gs is told by the block's magic, and a thread left on a
+ * block that has none would run host code on it. */
+MB_HIDDEN uintptr_t mb_gs_block_c(void) { make_thread_block(); return (uintptr_t)g_tib; }
+#endif
+
 void mb_prepare_thread(void) {
 	init_interop_area();
-#if !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(__amd64__))
+	make_thread_block();
+#elif !defined(_WIN32) && (defined(__x86_64__) || defined(__amd64__))
 	uintptr_t gs = 0;
 	if (syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs) == 0 && gs == 0) {
 		syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, (uintptr_t)&g_tib[0]);
@@ -176,7 +224,14 @@ mb_context *mb_guest_ctx = NULL;
  * documents: Linux advertises it in AT_HWCAP2, Windows answers
  * IsProcessorFeaturePresent. A fault probe would be at the mercy of whatever
  * debugger happens to intercept the signal first. */
-#ifdef _WIN32
+#if defined(__aarch64__)
+/* The thread pointer is a word of memory (MB_TP_SLOT): always there, on
+ * every OS. */
+bool mb_fsbase_ok(void) {
+	mb_fs_swap = true;
+	return true;
+}
+#elif defined(_WIN32)
 #ifndef PF_RDWRFSGSBASE_AVAILABLE
 #define PF_RDWRFSGSBASE_AVAILABLE 22
 #endif
@@ -189,12 +244,6 @@ bool mb_fsbase_ok(void) {
 	mb_fs_swap = cached != 0;
 	return cached != 0;
 }
-#elif defined(__aarch64__)
-/* The thread pointer is a word of memory (MB_TP_SLOT): always there. */
-bool mb_fsbase_ok(void) {
-	mb_fs_swap = true;
-	return true;
-}
 #elif defined(__x86_64__)
 #ifndef HWCAP2_FSGSBASE
 #define HWCAP2_FSGSBASE (1u << 1)
@@ -202,8 +251,14 @@ bool mb_fsbase_ok(void) {
 bool mb_fsbase_ok(void) {
 	static int cached = -1;
 	if (cached >= 0) return cached != 0;
+#ifdef __APPLE__
+	/* macOS gives userspace no rdfsbase/wrfsbase (they are SIGILL, Rosetta
+	 * included), so a guest with %fs-direct TLS cannot be hosted here. */
+	cached = 0;
+#else
 	cached = (getauxval(AT_HWCAP2) & HWCAP2_FSGSBASE) != 0;
 	if (!cached && getenv("MB_FORCE_FS_SWAP")) cached = 1;  /* testing only */
+#endif
 	if (getenv("MB_NO_FSGSBASE")) cached = 0;   /* testing only: probe off */
 	mb_fs_swap = cached != 0;
 	return cached != 0;
@@ -241,6 +296,14 @@ static uintptr_t call_guest_simple_fs(uintptr_t entry, mb_context *c) {
 	/* the context the fault handlers judge a fault against is the one running
 	 * now - for every guest, as the entry thunks set it */
 	mb_guest_ctx = c;
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* the guest runs on its own gs (minibox_internal.h): in for the call,
+	 * and the OS's back before any host code */
+	mb_gs_to_guest();
+	const uintptr_t gs_result = f(entry, c);
+	mb_gs_to_host();
+	return gs_result;
+#endif
 #ifdef MB_HAVE_FSBASE
 	/* Guest code may use %fs-direct TLS (Rust does); give it its own thread
 	 * pointer and put the host's %fs back afterwards. On the very first entry
@@ -287,7 +350,10 @@ uintptr_t mb_get_callback_ptr(uintptr_t slot) {
 #define THUNK_ARENA (16u * MB_PAGESIZE)
 #define THUNK_CAP (THUNK_ARENA / THUNK_SIZE)
 struct mb_thunks {
-	mb_range mem;
+	mb_range mem;      /* where the thunks run */
+	mb_range wmem;     /* where they are written: mem itself, or (macOS, which
+	                      maps nothing writable and executable at once) a
+	                      writable view of the same pages */
 	uintptr_t entries[THUNK_CAP];
 	uintptr_t ptrs[THUNK_CAP];
 	size_t count;
@@ -299,14 +365,13 @@ struct mb_thunks {
 
 mb_thunks *mb_thunks_new(void) {
 	mb_thunks *t = (mb_thunks *)calloc(1, sizeof(mb_thunks));
-	mb_range in = { 0, THUNK_ARENA };
-	if (mb_pal_map_anon(in, MB_PROT_RWX, &t->mem) != 0) { free(t); return NULL; }
+	if (mb_pal_map_code(THUNK_ARENA, &t->mem, &t->wmem) != 0) { free(t); return NULL; }
 	return t;
 }
 
 void mb_thunks_free(mb_thunks *t) {
 	if (!t) return;
-	mb_pal_unmap_anon(t->mem);
+	mb_pal_unmap_code(t->mem, t->wmem);
 	free(t);
 }
 
@@ -338,7 +403,8 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->count * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
+	uint8_t *const wbase = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	uint8_t *p = wbase;
 	/* The thunk only says which call this is. Everything a call needs - the %fs
 	 * swap a Rust guest wants, the escape record a guest that dies returns
 	 * through - is one routine in guarded.S, entered with r10 = context and
@@ -367,14 +433,14 @@ uintptr_t mb_thunks_get(mb_thunks *t, uintptr_t guest_entry, mb_context *c) {
 #else
 #error "miniBox runs on x86-64 and aarch64 only"
 #endif
-	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) {
+	if ((size_t)(p - wbase) > THUNK_SIZE) {
 		/* Silent overflow here writes over the NEXT thunk, which shows up much
 		 * later as a call into the middle of an instruction. */
 		fprintf(stderr, "miniBox: thunk of %zu bytes does not fit THUNK_SIZE %d\n",
-		        (size_t)(p - (uint8_t *)addr), THUNK_SIZE);
+		        (size_t)(p - wbase), THUNK_SIZE);
 		abort();
 	}
-	__builtin___clear_cache((char *)addr, (char *)p);   /* aarch64: publish the code */
+	__builtin___clear_cache((char *)addr, (char *)addr + (p - wbase));   /* aarch64: publish the code */
 	t->entries[t->count] = guest_entry;
 	t->ptrs[t->count] = addr;
 	t->count++;
@@ -426,7 +492,9 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		return 0;
 	}
 	uintptr_t addr = t->mem.start + t->mem.size - (t->ext_count + 1) * THUNK_SIZE;
-	uint8_t *p = (uint8_t *)addr;
+	/* written through the thunks' writable view (mb_pal_map_code) */
+	uint8_t *const w = (uint8_t *)(addr - t->mem.start + t->wmem.start);
+	uint8_t *p = w;
 	/* Every guest's callbacks are wrapped for the floating-point control
 	 * words (see mb_context): the guest's are kept in the context and the
 	 * host's loaded for the callback, then the guest's loaded again - a host
@@ -447,6 +515,12 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 	const bool swap_fs = mb_fs_swap && c->fs_swap;
 	emit8(&p, 0x49); emit8(&p, 0xba); emit64(&p, (uintptr_t)c);        /* mov r10, ctx */
 	emit8(&p, 0x41); emit8(&p, 0x52);                                  /* push r10 */
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* the callback runs on the OS's gs (minibox_internal.h); mb_gs_to_host
+	 * keeps every register, the arguments among them */
+	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_host); /* mov r11, mb_gs_to_host */
+	emit8(&p, 0x41); emit8(&p, 0xff); emit8(&p, 0xd3);                 /* call r11 */
+#endif
 	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xba); emit32(&p, guest_fcw);   /* fnstcw [r10+guest_fcw] */
 	emit8(&p, 0x41); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0x9a); emit32(&p, guest_mxcsr); /* stmxcsr [r10+guest_mxcsr] */
 	emit8(&p, 0x41); emit8(&p, 0xd9); emit8(&p, 0xaa); emit32(&p, host_fcw);    /* fldcw [r10+host_fcw] */
@@ -466,9 +540,17 @@ uintptr_t mb_thunks_get_extcall(mb_thunks *t, uintptr_t cb, mb_context *c) {
 		emit8(&p, 0x49); emit8(&p, 0x8b); emit8(&p, 0x02);             /* mov rax, [r10] (thread_area, live) */
 		emit8(&p, 0xf3); emit8(&p, 0x48); emit8(&p, 0x0f); emit8(&p, 0xae); emit8(&p, 0xd0); /* wrfsbase rax */
 	}
+#if defined(__APPLE__) && defined(__x86_64__)
+	/* back on the guest's gs, with the callback's result (r11) kept */
+	emit8(&p, 0x41); emit8(&p, 0x53);                                  /* push r11: the result, across the call */
+	emit8(&p, 0x49); emit8(&p, 0xbb); emit64(&p, (uintptr_t)&mb_gs_to_guest); /* mov r11, mb_gs_to_guest */
+	emit8(&p, 0x41); emit8(&p, 0xff); emit8(&p, 0xd3);                 /* call r11 */
+	emit8(&p, 0x58);                                                   /* pop rax */
+#else
 	emit8(&p, 0x4c); emit8(&p, 0x89); emit8(&p, 0xd8);                 /* mov rax, r11 */
+#endif
 	emit8(&p, 0xc3);                                                   /* ret */
-	if ((size_t)(p - (uint8_t *)addr) > THUNK_SIZE) abort();           /* the size was checked above for THUNK_SIZE */
+	if ((size_t)(p - w) > THUNK_SIZE) abort();                         /* the size was checked above for THUNK_SIZE */
 	t->ext_entries[t->ext_count] = cb;
 	t->ext_ptrs[t->ext_count] = addr;
 	t->ext_count++;

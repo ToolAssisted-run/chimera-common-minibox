@@ -36,6 +36,8 @@ endif
 # both is also fine, but select the right one for clarity).
 if host_machine.system() == 'windows'
   minibox_host_sources += files('pal_win.c')
+elif host_machine.system() == 'darwin'
+  minibox_host_sources += files('pal_darwin.c')
 else
   minibox_host_sources += files('pal_linux.c')
 endif
@@ -52,7 +54,7 @@ if minibox_git_commit == ''
   minibox_git_commit = 'unknown'
 endif
 minibox_build_os = run_command(
-  'sh', '-c', '[ -r /etc/os-release ] && . /etc/os-release && printf "%s %s" "$ID" "$VERSION_ID" || uname -s',
+  'sh', '-c', '[ -r /etc/os-release ] && . /etc/os-release && printf "%s %s" "$ID" "$VERSION_ID" || { [ "$(uname -s)" = Darwin ] && printf "macos %s" "$(sw_vers -productVersion)"; } || uname -s',
   check: false).stdout().strip()
 
 minibox_host_c_args = [

@@ -103,6 +103,12 @@ void     mb_pal_unmap_handle(mb_handle h, mb_range addr);
 int      mb_pal_map_anon(mb_range in, mb_prot prot, mb_range *out);
 void     mb_pal_unmap_anon(mb_range addr);
 int      mb_pal_protect(mb_range addr, mb_prot prot);          /* 0 ok */
+/* Memory for code the host writes at run time (the thunks): `exec` runs it,
+ * `write` is where it is written. One RWX mapping on Linux and Windows
+ * (write == exec); on macOS, which refuses a page both writable and
+ * executable, two views of the same pages, RX and RW. */
+int      mb_pal_map_code(uintptr_t size, mb_range *exec, mb_range *write); /* 0 ok */
+void     mb_pal_unmap_code(mb_range exec, mb_range write);
 /* Lazy blocks (handle.lazy): back a range of a reserved section with the given
  * protection. On Linux nothing is ever lazy and this is mprotect. */
 int      mb_pal_commit(mb_handle h, mb_range addr, mb_prot prot);   /* 0 ok */
@@ -136,6 +142,10 @@ typedef struct {
 	mb_snap_kind snap_kind;
 	uint8_t *snap_data;  /* MB_PAGESIZE bytes when snap_kind==DATA, else NULL */
 	bool uncommitted;    /* lazy blocks only: neither view is backed yet (reads as zero) */
+	/* macOS only, and read for the first page of a host page: a host page
+	 * the guest may both write and run is mapped RX when set, RW when not -
+	 * whichever access it last faulted for (mb_block_wx_flip). */
+	bool wx_exec;
 	/* ---- epochs (see mb_block_epoch_begin) ----
 	 * dirty says "changed since the baseline", which only ever grows.
 	 * epoch_dirty says "changed since a MOMENT", so a caller can ask what one
@@ -624,7 +634,11 @@ const char *mb_host_stop_reason(const mb_context *c);
 #ifdef _WIN32
 int  mb_tripguard_stop_thread(void *thread);
 #else
+#ifdef __APPLE__
+#define MB_STOP_SIGNAL SIGUSR2   /* macOS has no real-time signals */
+#else
 #define MB_STOP_SIGNAL (SIGRTMAX - 3)
+#endif
 void mb_tripguard_stop_signal_install(void);
 #endif
 
@@ -703,6 +717,68 @@ extern bool mb_fs_swap;
 extern uintptr_t mb_early_tp;
 #endif
 
+#if defined(__APPLE__) && defined(__x86_64__)
+/* ---- %gs on macOS ------------------------------------------------------
+ *
+ * The guest reaches its context through [gs:0x18] (and the blob keeps its
+ * stack bounds at gs:0x8 and gs:0x10). On Linux the host never uses %gs and
+ * points it at a per-thread block for good; on Windows it is the TEB. On
+ * macOS %gs is the OS's: libc finds the thread's data through it (gs:0 is the
+ * pthread_t, gs:0x18 the Mach thread port), and no userspace instruction
+ * can set it (rdgsbase and wrgsbase are SIGILL, Rosetta included).
+ *
+ * So the thread's gs base is SWAPPED at every boundary: the guest's block
+ * while guest code runs, the OS's whenever host C does. The one way to set it
+ * is the system call libsystem makes for _thread_set_tsd_base. Everything that
+ * runs between a swap to the guest and the swap back must avoid libc and
+ * thread locals; the places are the entry (guarded.S), the syscall
+ * dispatcher, the callback wrappers and the signal handlers.
+ *
+ * The block's word 0 holds MB_GS_MAGIC (the OS's holds a pthread_t, which can
+ * never be it), so any code can tell which it is running on; word 12 is the
+ * block's own address and word 13 is the OS's base for this thread. */
+#define MB_GS_MAGIC     0x4d4247534d414731ull
+#define MB_TIB_SELF     12
+#define MB_TIB_HOST_GS  13
+/* Word 9 is the guest's thread pointer, for a guest with thread locals.
+ * x86-64 compilers reach thread locals through %fs, which macOS gives a
+ * program no way to set. So each `mov %fs:0x0, reg` (the load of the thread
+ * pointer) that the guest toolchain lists (wbx-tp-rewrite.py, the section
+ * .wbx_fs_sites) is patched as the image loads into `mov %gs:0x48, reg`
+ * (elf.c), and this word holds what %fs:0 would have: the context's
+ * thread_area. It is copied in whenever the thread goes back to guest code:
+ * mb_gs_to_guest, and the way back from a system call (host.c), where the
+ * guest thread that runs on may be another one. */
+#define MB_TIB_GUEST_TP 9
+/* The thread's gs base. Inline asm, so it may be the first thing a function
+ * does; "memory" because it moves what thread locals and errno mean. */
+static inline void mb_gs_set(uintptr_t base) {
+	uintptr_t r;
+	__asm__ volatile("movl $0x3000003, %%eax\n\tsyscall"
+	                 : "=&a"(r), "+D"(base) :: "rcx", "r11", "memory", "cc");
+}
+static inline bool mb_gs_in_guest(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:0, %0" : "=r"(v));
+	return v == MB_GS_MAGIC;
+}
+/* guest block's [self], read through gs: valid only while mb_gs_in_guest() */
+static inline uintptr_t mb_gs_block_now(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:%c1, %0" : "=r"(v) : "i"(MB_TIB_SELF * 8));
+	return v;
+}
+static inline uintptr_t mb_gs_host_now(void) {
+	uintptr_t v;
+	__asm__ volatile("movq %%gs:%c1, %0" : "=r"(v) : "i"(MB_TIB_HOST_GS * 8));
+	return v;
+}
+/* guarded.S: swap this thread to its guest block / back to the OS's; each
+ * keeps every register and is a no-op when already there (the second) */
+void mb_gs_to_guest(void);
+void mb_gs_to_host(void);
+#endif
+
 void      mb_context_init(mb_context *c, uintptr_t guest_rsp, uintptr_t guest_rsp_alt, mb_syscall_cb dispatch);
 void      mb_prepare_thread(void);              /* install gs base once per host thread */
 #ifndef _WIN32
@@ -752,6 +828,10 @@ int       mb_elf_load(const uint8_t *image, size_t image_len, const char *module
 void      mb_elf_free(mb_elf *e);
 uintptr_t mb_elf_entry(const mb_elf *e);
 bool      mb_elf_has_tls(const mb_elf *e); /* guest carries PT_TLS -> needs %fs swapping */
+/* why this host cannot run the image (an Intel Mac: thread locals it cannot
+ * reach), or NULL; and how many thread-pointer loads were patched (elf.c) */
+const char *mb_elf_refusal(const mb_elf *e);
+size_t    mb_elf_tp_patched(const mb_elf *e);
 uintptr_t mb_elf_proc_addr(const mb_elf *e, const char *name); /* 0 if absent */
 void      mb_elf_seal(mb_elf *e, mb_block *b);   /* mprotect RO sections */
 const uint8_t *mb_elf_hash(const mb_elf *e);     /* 32 bytes */
@@ -863,6 +943,11 @@ static inline size_t mb_group_pages(void) { return (size_t)1 << (mb_host_page_sh
 /* Give the host page holding machine page pi the protection its whole group
  * calls for. What the fault handler does after letting a write through. 0 ok. */
 int     mb_block_protect_group(mb_block *b, size_t pi);
+/* macOS, which maps nothing writable and executable at once: a fault on a
+ * host page the guest may both write and run, for the access its mapping
+ * does not allow right now. Remaps it for that access and answers true; false
+ * for every other fault. Elsewhere always false. From the fault handler. */
+bool    mb_block_wx_flip(mb_block *b, uintptr_t addr, bool exec, bool write);
 
 /* ---- diagnostics (diag.c) ----
  * For the last words of a dying sandbox. Goes to stderr AND to a file, because a

@@ -1,5 +1,5 @@
 /* asm_aarch64.h - what the aarch64 assembly needs said differently for ELF
- * (Linux) and Mach-O (macOS). One directive per macro: Darwin's assembler
+ * (Linux), Mach-O (macOS) and COFF (Windows). One directive per macro: Darwin's assembler
  * reads ';' as a comment, so nothing here may join two statements. */
 #ifndef MB_ASM_AARCH64_H
 #define MB_ASM_AARCH64_H
@@ -10,6 +10,15 @@
 #define MB_TYPE_FUNCTION(x)
 #define MB_SIZE(x)
 #define MB_RODATA_SECTION    .section __TEXT,__const
+#define MB_NOTE_GNU_STACK
+#elif defined(_WIN32)
+/* COFF (Windows on arm64, llvm-mingw): no symbol prefix, no ELF types or
+ * sizes, and a DLL exports only what it is told to, so nothing to hide */
+#define MB_SYM(x)            x
+#define MB_HIDDEN(x)
+#define MB_TYPE_FUNCTION(x)
+#define MB_SIZE(x)
+#define MB_RODATA_SECTION    .section .rdata,"dr"
 #define MB_NOTE_GNU_STACK
 #else
 #define MB_SYM(x)            x

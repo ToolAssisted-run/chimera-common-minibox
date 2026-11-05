@@ -79,6 +79,9 @@ or a group of devices, and every extension nobody has asked for.
 
 - **One instance, one physical device, one device** per context. The device is
   the first discrete one, or the one whose name contains `CHIMERA_VK_DEVICE`.
+  On macOS, where MoltenVK and Mesa's KosmicKrisp can both list the same
+  GPU, a driver that implements all of Vulkan comes before one that is a
+  portability subset (`VK_KHR_portability_subset`).
 - **Extensions are an allow-list** (`kDeviceExtensions`): an extension is
   commands and structures this bridge would have to know.
 - **A command answers to every name it has.** A command that came through an

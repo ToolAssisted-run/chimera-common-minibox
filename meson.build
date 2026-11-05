@@ -32,15 +32,21 @@ subdir('source/host')
 build_guest_toolchain = not meson.is_cross_build()
 
 # The compiler guests are built with: one that makes ELF for the machine's CPU,
-# whatever the host's own objects are. By default the host's gcc; -Dguest_cc
-# names another (a cross gcc, for a host whose own compiler does not make ELF).
+# whatever the host's own objects are. On Linux that is the host's gcc. On
+# macOS the host's compiler makes Mach-O, so it is a cross gcc - Homebrew's
+# aarch64-elf-gcc (bare metal: the guest brings its own libc, musl, and needs
+# only gcc's libgcc). -Dguest_cc names another.
 waterbox_guest_cc = get_option('guest_cc')
 if build_guest_toolchain and waterbox_guest_cc == ''
-  waterbox_guest_cc = 'gcc'
+  if host_machine.system() == 'darwin'
+    waterbox_guest_cc = host_machine.cpu_family() + '-elf-gcc'
+  else
+    waterbox_guest_cc = 'gcc'
+  endif
 endif
 if build_guest_toolchain and not find_program(waterbox_guest_cc, required: false).found()
-  # the host still builds and its unit tests still run; a guest built
-  # elsewhere runs through it (tests/runner)
+  # (macOS: brew install aarch64-elf-gcc) - the host still builds and its unit
+  # tests still run; a guest built on Linux runs through it (tests/runner)
   warning('no guest compiler (' + waterbox_guest_cc + '): the guest toolchain, the guests and their tests are skipped')
   build_guest_toolchain = false
 endif
@@ -64,7 +70,10 @@ if build_guest_toolchain
   # x86-64 machine the spec describes, or the aarch64 one (arch/waterbox_aarch64
   # in musl). waterbox_cpu_flags are each CPU's frozen code-generation flags:
   #   x86-64   large code model (the guest sits above 2 GiB and the small model
-  #            cannot reach it), no red zone, no CET;
+  #            cannot reach it), no red zone, no CET, and thread locals reached
+  #            only through a load of the thread pointer (`mov %fs:0, reg`),
+  #            never at an offset from %fs: an Intel Mac, which cannot set %fs,
+  #            patches those loads as the image loads (wbx-tp-rewrite.py);
   #   aarch64  the default small model (addressing is pc-relative: any base
   #            works), no return-address signing (keyed per process - a signed
   #            pointer in a savestate is another pointer in the next process),
@@ -80,7 +89,7 @@ if build_guest_toolchain
   elif host_machine.cpu_family() == 'x86_64'
     waterbox_musl_target = 'waterbox'
     waterbox_guest_triplet = 'x86_64-linux-musl'
-    waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone']
+    waterbox_cpu_flags = ['-mcmodel=large', '-mno-red-zone', '-mno-tls-direct-seg-refs']
   else
     error('miniBox runs on x86-64 and aarch64 only, not ' + host_machine.cpu_family())
   endif
