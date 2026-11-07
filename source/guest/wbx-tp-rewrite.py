@@ -17,8 +17,10 @@ of its own,
 
 which leaves xN holding exactly what the mrs would have - and changes nothing
 else: no other register, no flags, no stack. The trampolines go in a segment
-of their own appended to the image (section .wbx_tp), so nothing already
-linked moves. An `mrs xzr, tpidr_el0` reads nothing and becomes a nop.
+of their own (section .wbx_tp), so nothing already linked moves: just below
+the image's first segment, where the code begins. A branch reaches 128 MiB,
+so the code only has to be that near them; the image's zeroed data (.bss),
+which can be hundreds of MiB, lies the other way, after the code. An `mrs xzr, tpidr_el0` reads nothing and becomes a nop.
 
 `msr tpidr_el0, xN` is refused: the guest sets its thread pointer through the
 host (set_thread_area), and one written to the register would be lost.
@@ -290,13 +292,18 @@ def main(argv):
         write_out(image, "reads no thread pointer; unchanged")
         return
 
-    # The trampolines' segment: after everything the image loads, on its own
-    # 64 KiB page, file offset congruent to the address as a loader wants.
-    loads = [p for p in phdrs if p[0] == PT_LOAD]
-    top_addr = max(p[3] + p[6] for p in loads)   # vaddr + memsz: past the .bss
-    seg_addr = (top_addr + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1)
-    for p in loads:   # (a segment laid over the .bss would be zeroed by it, or zero it)
-        if p[3] < seg_addr + 12 * len(sites) and seg_addr < p[3] + p[6]:
+    # The trampolines' segment: just below the image's first segment (the
+    # code follows it; the .bss, however large, comes after the code), on
+    # 64 KiB pages of its own, file offset congruent to the address as a
+    # loader wants.
+    loads = [p for p in phdrs if p[0] == PT_LOAD and p[3]]
+    low_addr = min(p[3] for p in loads)
+    size = 12 * sum(1 for _, _, reg in sites if reg != 31)
+    seg_addr = (low_addr - size) & ~(SEGMENT_ALIGN - 1)
+    if seg_addr < TP_SLOT + 8:
+        fail(f"{name}: {size} bytes of trampolines below {low_addr:#x} would reach the thread-pointer slot")
+    for p in loads:   # (a segment laid over another would replace it, or be replaced)
+        if p[3] < seg_addr + size and seg_addr < p[3] + p[6]:
             fail(f"{name}: the trampolines at {seg_addr:#x} would overlap the segment at {p[3]:#x}")
 
     tramp = bytearray()

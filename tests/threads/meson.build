@@ -33,6 +33,23 @@ test('threads-no-fault-handler', run_threads,
   timeout: 120,
 )
 
+# The same guest with 200 MiB of .bss after its code, past the 128 MiB an
+# aarch64 branch reaches: its thread-pointer reads still reach their
+# trampolines, which wbx-tp-rewrite.py puts below the image.
+guest_threads_large_wbx = custom_target('guest_threads_large.wbx',
+  input: 'guest_threads.c',
+  output: 'guest_threads_large.wbx',
+  command: [
+    waterbox_guest_link + [waterbox_musl_gcc], waterbox_guest_cflags, waterbox_guest_ldflags,
+    '-std=c11', '-DNO_GUEST_FAULT_HANDLER', '-DBALLAST_MIB=200', '-o', '@OUTPUT@', '@INPUT@', waterbox_emulibc_obj, '-lgcc',
+  ],
+)
+test('threads-large-image', run_threads,
+  args: ['--no-fault-handler', guest_threads_large_wbx],
+  suite: 'system',
+  timeout: 120,
+)
+
 # A host whose page is larger than the machine's (forced here, so any host runs
 # it) cannot deliver the faults GuestFaultHandler waits for, and must refuse a
 # guest that exports it, saying why (MACHINE-SPEC, guest fault forwarding).
