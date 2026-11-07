@@ -792,9 +792,14 @@ Windows), so the aarch64 machine keeps clear of what those OSes disagree on:
   - Compiled code knows only `mrs xN, tpidr_el0`, so the guest kit rewrites
     every one of those once the image is linked (`wbx-tp-rewrite.py`, run by
     `waterbox_guest_link`): each becomes a branch to a three-instruction
-    trampoline (`adrp xN, 0x36ef0000000; ldr xN, [xN]; b back`) in a segment
-    of its own (section `.wbx_tp`) after everything else the image loads. An
-    `msr tpidr_el0` in guest code is refused.
+    trampoline (`adrp xN, 0x36ef0000000; ldr xN, [xN]; b back`). The
+    trampolines go in a room emulibc keeps in the code for them (a 16-byte
+    header, `WBX_TP_ROOM` and the room's size, then 4 KiB of zero words: 341
+    trampolines), where every branch from the code reaches them - a branch
+    reaches 128 MiB, and an image's zeroed data after its code may be larger.
+    An image without the room, or needing more, has them in a segment of
+    their own after everything else it loads. Section `.wbx_tp` says where
+    they are. An `msr tpidr_el0` in guest code is refused.
   - So a rewritten aarch64 image contains no TPIDR_EL0 access at all, and runs
     the same on every OS.
 - **Exported calls, system calls and callbacks** follow AAPCS64: the guest
