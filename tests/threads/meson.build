@@ -35,7 +35,8 @@ test('threads-no-fault-handler', run_threads,
 
 # The same guest with 200 MiB of .bss after its code, past the 128 MiB an
 # aarch64 branch reaches: its thread-pointer reads still reach their
-# trampolines, which wbx-tp-rewrite.py puts below the image.
+# trampolines, which wbx-tp-rewrite.py puts in the room emulibc keeps in the
+# code.
 guest_threads_large_wbx = custom_target('guest_threads_large.wbx',
   input: 'guest_threads.c',
   output: 'guest_threads_large.wbx',
