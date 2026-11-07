@@ -67,11 +67,16 @@ ECL_EXPORT uint64_t RunCondvar(uint64_t value) {
 	return (uint64_t)(uintptr_t)r;   /* must equal value*2+1 */
 }
 
-/* Ballast: a .bss larger than any page rounding, so that the image's thread-
- * pointer trampolines (wbx-tp-rewrite.py, aarch64) must go after the .bss and
- * not merely after the file's bytes - placed over the .bss they would be
- * zeroed by it, which only an image with a real .bss shows. */
-static volatile uint8_t g_ballast[8u << 20];
+/* Ballast: a .bss larger than any page rounding, so that an image's thread-
+ * pointer trampolines (wbx-tp-rewrite.py, aarch64) placed over it would be
+ * zeroed by it, which only an image with a real .bss shows. Built with
+ * BALLAST_MIB=200 it is more than an aarch64 branch reaches (128 MiB): the
+ * trampolines must still be within reach of the code, as they are below it
+ * (the 86Box core's image is 188 MiB, most of it .bss). */
+#ifndef BALLAST_MIB
+#define BALLAST_MIB 8
+#endif
+static volatile uint8_t g_ballast[(size_t)BALLAST_MIB << 20];
 
 ECL_EXPORT int Init(void) { g_ballast[sizeof g_ballast - 1] = 1; return 1; }
 int main(void) { return 0; }

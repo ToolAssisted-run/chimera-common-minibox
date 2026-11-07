@@ -793,7 +793,10 @@ Windows), so the aarch64 machine keeps clear of what those OSes disagree on:
     every one of those once the image is linked (`wbx-tp-rewrite.py`, run by
     `waterbox_guest_link`): each becomes a branch to a three-instruction
     trampoline (`adrp xN, 0x36ef0000000; ldr xN, [xN]; b back`) in a segment
-    of its own (section `.wbx_tp`) after everything else the image loads. An
+    of its own (section `.wbx_tp`) just below the image's first segment, on
+    64 KiB pages of its own: there every branch from the code reaches it (a
+    branch reaches 128 MiB), however large the zeroed data after the code
+    is. The image's span (section 1, "elf") starts at that segment. An
     `msr tpidr_el0` in guest code is refused.
   - So a rewritten aarch64 image contains no TPIDR_EL0 access at all, and runs
     the same on every OS.
