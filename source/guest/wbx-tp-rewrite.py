@@ -16,11 +16,14 @@ of its own,
     b    <the instruction after the mrs>
 
 which leaves xN holding exactly what the mrs would have - and changes nothing
-else: no other register, no flags, no stack. The trampolines go in a segment
-of their own (section .wbx_tp), so nothing already linked moves: just below
-the image's first segment, where the code begins. A branch reaches 128 MiB,
-so the code only has to be that near them; the image's zeroed data (.bss),
-which can be hundreds of MiB, lies the other way, after the code. An `mrs xzr, tpidr_el0` reads nothing and becomes a nop.
+else: no other register, no flags, no stack. Nothing already linked moves.
+The trampolines go in the room emulibc keeps for them inside the code (a
+16-byte header, "WBX_TP_ROOM" and the room's size, then zero words), where
+every branch reaches them: a branch reaches 128 MiB, and an image's zeroed
+data after its code can be larger than that. An image without the room, or
+that needs more trampolines than it holds, has them in a segment of their own
+after everything it loads, as before. Either way section .wbx_tp says where
+they are. An `mrs xzr, tpidr_el0` reads nothing and becomes a nop.
 
 `msr tpidr_el0, xN` is refused: the guest sets its thread pointer through the
 host (set_thread_area), and one written to the register would be lost.
@@ -62,6 +65,7 @@ SHT_PROGBITS, SHT_SYMTAB = 1, 2
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
 SEGMENT_ALIGN = 0x10000          # the largest host page miniBox runs on
 SECTION = ".wbx_tp"
+ROOM_MAGIC = b"WBX_TP_ROOM\0"   # emulibc.c: then the room's size (u32), then the room
 SECTION_X86 = ".wbx_fs_sites"
 PT_TLS = 7
 
@@ -292,19 +296,35 @@ def main(argv):
         write_out(image, "reads no thread pointer; unchanged")
         return
 
-    # The trampolines' segment: just below the image's first segment (the
-    # code follows it; the .bss, however large, comes after the code), on
-    # 64 KiB pages of its own, file offset congruent to the address as a
-    # loader wants.
-    loads = [p for p in phdrs if p[0] == PT_LOAD and p[3]]
-    low_addr = min(p[3] for p in loads)
-    size = 12 * sum(1 for _, _, reg in sites if reg != 31)
-    seg_addr = (low_addr - size) & ~(SEGMENT_ALIGN - 1)
-    if seg_addr < TP_SLOT + 8:
-        fail(f"{name}: {size} bytes of trampolines below {low_addr:#x} would reach the thread-pointer slot")
-    for p in loads:   # (a segment laid over another would replace it, or be replaced)
-        if p[3] < seg_addr + size and seg_addr < p[3] + p[6]:
-            fail(f"{name}: the trampolines at {seg_addr:#x} would overlap the segment at {p[3]:#x}")
+    loads = [p for p in phdrs if p[0] == PT_LOAD]
+    need = 12 * sum(1 for _, _, reg in sites if reg != 31)
+
+    # The room emulibc keeps in the code: its header on a 16-byte boundary of
+    # an executable segment, the room after it still all zero (unused).
+    room = None
+    for p in loads:
+        if room or not p[1] & PF_X:
+            continue
+        at = image.find(ROOM_MAGIC, p[2], p[2] + p[5])
+        while at >= 0 and not room:
+            size = struct.unpack_from("<I", image, at + len(ROOM_MAGIC))[0]
+            if (p[3] + at - p[2]) % 16 == 0 and at + 16 + size <= p[2] + p[5] \
+                    and not any(image[at + 16:at + 16 + size]):
+                room = (p[3] + at - p[2] + 16, at + 16, size)   # address, file offset, size
+            at = image.find(ROOM_MAGIC, at + 1, p[2] + p[5])
+    in_room = room is not None and need <= room[2]
+    if in_room:
+        seg_addr = room[0]
+    else:
+        # A segment of their own: after everything the image loads, on its own
+        # 64 KiB page, file offset congruent to the address as a loader wants.
+        top_addr = max(p[3] + p[6] for p in loads)   # vaddr + memsz: past the .bss
+        seg_addr = (top_addr + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1)
+        for p in loads:   # (a segment laid over the .bss would be zeroed by it, or zero it)
+            if p[3] < seg_addr + need and seg_addr < p[3] + p[6]:
+                fail(f"{name}: the trampolines at {seg_addr:#x} would overlap the segment at {p[3]:#x}")
+    where = ("" if in_room else "; the image has no room for them in its code (emulibc)" if room is None
+             else f"; the room in its code holds {room[2] // 12}, and it needs {need // 12}")
 
     tramp = bytearray()
     for pc, foff, reg in sites:
@@ -317,14 +337,18 @@ def main(argv):
         there = branch(pc, t)
         if a is None or back is None or there is None:
             fail(f"{name}: the read at {pc:#x} is too far from the trampolines at {t:#x} "
-                 f"(a branch reaches 128 MiB) or they from the slot (adrp reaches 4 GiB)")
+                 f"(a branch reaches 128 MiB) or they from the slot (adrp reaches 4 GiB){where}")
         tramp += struct.pack("<III", a, ldr_x(reg, reg), back)
         struct.pack_into("<I", image, foff, there)
     if not tramp:
         write_out(image, f"{len(sites)} empty thread-pointer read(s) made nops")
         return
 
-    # The program headers stay where they are and gain one entry: the guest
+    if in_room:
+        image[room[1]:room[1] + len(tramp)] = tramp
+
+    # A new segment's program header: the headers stay where they are and gain
+    # one entry. (In the room, the trampolines are in a segment already.) The guest
     # reads them from memory (musl finds its PT_TLS at __ehdr_start + e_phoff,
     # cxxglue its PT_LOADs and PT_GNU_EH_FRAME), so they must stay inside the
     # first segment. Where the linker left the rest of that page empty the
@@ -333,19 +357,20 @@ def main(argv):
     # PT_GNU_PROPERTY entry gives up its slot: it repeats the PT_NOTE entry
     # beside it for a kernel's sake, and nothing loads a guest but miniBox,
     # which reads neither.
-    ph_end = e_phoff + (e_phnum + 1) * PHDR.size
-    first = min(p for p in loads if p[2] == 0) if any(p[2] == 0 for p in loads) else None
-    if first is None or ph_end > first[2] + first[5]:   # offset + filesz
-        fail(f"{name}: its program headers are not inside its first segment")
-    room = not any(image[e_phoff + e_phnum * PHDR.size:ph_end])
-    for i, sh in enumerate(shdrs):
-        if i and sh[1] != 8 and sh[5] and sh[4] < ph_end and e_phoff + e_phnum * PHDR.size < sh[4] + sh[5]:
-            room = False
-    if not room:
-        spare = [i for i, p in enumerate(phdrs) if p[0] == PT_GNU_PROPERTY]
-        if not spare:
-            fail(f"{name}: no room after its program headers for one more, and no PT_GNU_PROPERTY to give way")
-        del phdrs[spare[0]]
+    if not in_room:
+        ph_end = e_phoff + (e_phnum + 1) * PHDR.size
+        first = min(p for p in loads if p[2] == 0) if any(p[2] == 0 for p in loads) else None
+        if first is None or ph_end > first[2] + first[5]:   # offset + filesz
+            fail(f"{name}: its program headers are not inside its first segment")
+        ph_room = not any(image[e_phoff + e_phnum * PHDR.size:ph_end])
+        for i, sh in enumerate(shdrs):
+            if i and sh[1] != 8 and sh[5] and sh[4] < ph_end and e_phoff + e_phnum * PHDR.size < sh[4] + sh[5]:
+                ph_room = False
+        if not ph_room:
+            spare = [i for i, p in enumerate(phdrs) if p[0] == PT_GNU_PROPERTY]
+            if not spare:
+                fail(f"{name}: no room after its program headers for one more, and no PT_GNU_PROPERTY to give way")
+            del phdrs[spare[0]]
 
     # Append the trampolines, then a section-name table that names them and
     # the section headers - those two moved to the end whole, so nothing
@@ -354,9 +379,12 @@ def main(argv):
         while len(image) % align != congruent % align:
             image.append(0)
 
-    pad_to(SEGMENT_ALIGN, seg_addr)
-    seg_off = len(image)
-    image += tramp
+    if in_room:
+        seg_off = room[1]
+    else:
+        pad_to(SEGMENT_ALIGN, seg_addr)
+        seg_off = len(image)
+        image += tramp
 
     pad_to(1)
     new_shstr_off = len(image)
@@ -370,14 +398,16 @@ def main(argv):
     for sh in shdrs:
         image += SHDR.pack(*sh)
 
-    phdrs.append([PT_LOAD, PF_R | PF_X, seg_off, seg_addr, seg_addr, len(tramp), len(tramp), SEGMENT_ALIGN])
+    if not in_room:
+        phdrs.append([PT_LOAD, PF_R | PF_X, seg_off, seg_addr, seg_addr, len(tramp), len(tramp), SEGMENT_ALIGN])
     for i, ph in enumerate(phdrs):
         PHDR.pack_into(image, e_phoff + i * PHDR.size, *ph)
 
     EHDR.pack_into(image, 0, ident, e_type, e_machine, e_version, e_entry, e_phoff, new_shoff, e_flags,
                    e_ehsize, e_phentsize, len(phdrs), e_shentsize, len(shdrs), e_shstrndx)
     write_out(image, f"{len(sites)} thread-pointer read(s) now read {TP_SLOT:#x} "
-                     f"({len(tramp)} bytes of trampolines at {seg_addr:#x})")
+                     f"({len(tramp)} bytes of trampolines at {seg_addr:#x}, "
+                     f"{'in the room in the code' if in_room else 'in a segment of their own'})")
 
 
 if __name__ == "__main__":

@@ -106,3 +106,20 @@ ECL_EXPORT void ecl_seal()
 #endif
 	}
 }
+
+#if defined(__aarch64__)
+/* Room for the image's thread-pointer trampolines (wbx-tp-rewrite.py,
+ * MACHINE-SPEC "aarch64"), inside the code: a branch reaches 128 MiB, and the
+ * code is always that near itself, however large the zeroed data after it.
+ * A 16-byte header (the name, then the room's size in bytes) and 4 KiB of
+ * zero words, which are udf: room for 341 trampolines, where an image
+ * usually needs a handful (musl reads the thread pointer itself). An image
+ * that needs more has them put after everything it loads, as before. */
+__asm__(
+	".text\n"
+	".balign 16\n"
+	"__wbx_tp_room:\n"
+	".ascii \"WBX_TP_ROOM\\0\"\n"
+	".word 4096\n"
+	".fill 1024, 4, 0\n");
+#endif

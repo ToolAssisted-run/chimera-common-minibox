@@ -71,7 +71,8 @@ ECL_EXPORT uint64_t RunCondvar(uint64_t value) {
  * pointer trampolines (wbx-tp-rewrite.py, aarch64) placed over it would be
  * zeroed by it, which only an image with a real .bss shows. Built with
  * BALLAST_MIB=200 it is more than an aarch64 branch reaches (128 MiB): the
- * trampolines must still be within reach of the code, as they are below it
+ * trampolines must still be within reach of the code, as they are in the
+ * room emulibc keeps for them inside it
  * (the 86Box core's image is 188 MiB, most of it .bss). */
 #ifndef BALLAST_MIB
 #define BALLAST_MIB 8
