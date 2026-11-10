@@ -118,6 +118,13 @@ void wbx_compose_delta(mb_read_callback a, uintptr_t a_userdata,
 /* pages the open epoch has touched: what a delta would cost, before writing one */
 void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret);
 void wbx_set_always_evict_blocks(bool val);
+/* For hosts created from now on, in this process: on Windows, find the guest's
+ * writes by comparing its pages instead of by write faults, because a fault
+ * there leaves the kernel's exception frame in the guest's dead stack, and a
+ * guest that reads its dead stack (a conservative garbage collector) then runs
+ * differently depending on where the faults fell. Costs a comparison of every
+ * writable page per captured frame and a copy of each. No effect elsewhere. */
+void wbx_set_compare_writes(bool on);
 /* The core log: copy everything any guest writes to stdout/stderr into this
  * file (UTF-8 path, appended, flushed per write) until called with NULL. */
 void wbx_set_output_file(const char *path, mb_return *ret);

@@ -257,6 +257,7 @@ void wbx_compose_delta_mem(const uint8_t *a, uintptr_t a_len, const uint8_t *b, 
 void wbx_get_epoch_page_count(mb_host *obj, mb_return *ret) { ok(ret, mb_host_epoch_page_count(obj)); }
 
 void wbx_set_always_evict_blocks(bool val) { g_always_evict = val; (void)g_always_evict; }
+void wbx_set_compare_writes(bool on) { mb_block_set_compare_writes(on); }
 
 /* The core log: everything any guest writes to stdout/stderr is also appended
  * to this file (a UTF-8 path) until it is called again with NULL or "". It

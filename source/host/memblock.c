@@ -121,6 +121,10 @@ mb_prot mb_page_native_prot(const mb_page *p) {
 	/* An open epoch holds a page read-only until it is written, exactly as the
 	 * baseline tracking does - so one page can be held for either reason, and
 	 * the fault that lifts the hold serves both. */
+#ifdef _WIN32
+	/* a page whose writes are found by comparing it is mapped as asked */
+	if (p->compared) return status_prot(p->status);
+#endif
 	bool clean = !p->dirty || p->held;
 	if (p->status == MB_ST_RW && clean) return MB_PROT_R;
 	if (p->status == MB_ST_RWX && clean) return MB_PROT_RX;
@@ -316,7 +320,7 @@ static void note_prot(mb_block *b, size_t i, mb_prot prot) {
 	/* a hot page is writable and is never to be held, so it is not "unheld";
 	 * nor is an invisible one, which no epoch holds - noted, it was given the
 	 * protection it already had at every epoch (both guest stacks, always) */
-	if (writable && !b->pages[i].hot && !b->pages[i].invisible) bits_set(b->unheld_bits, i);
+	if (writable && !b->pages[i].hot && !b->pages[i].invisible && !b->pages[i].compared) bits_set(b->unheld_bits, i);
 	else bits_clr(b->unheld_bits, i);
 	/* and a page that is writable is by definition not held: `held` says
 	 * "mapped read-only although dirty" (minibox_internal.h), and this is the
@@ -348,9 +352,15 @@ static void note_status(mb_block *b, size_t i, uint8_t status) {
 	b->pages[i].status = status;
 	b->status_map[i] = status;
 #ifdef _WIN32
-	if (status == MB_ST_RWSTACK) { bits_set(b->stack_bits, i); return; }
+	/* a stack, and with compare_writes any page the guest may write */
+	if (status == MB_ST_RWSTACK || (b->compare_writes && (status == MB_ST_RW || status == MB_ST_RWX))) {
+		bits_set(b->stack_bits, i);
+		b->pages[i].compared = true;
+		return;
+	}
 	if (bits_get(b->stack_bits, i)) {
 		bits_clr(b->stack_bits, i);
+		b->pages[i].compared = false;
 		mb_snap_release(b->pages[i].shadow);
 		b->pages[i].shadow = NULL;
 	}
@@ -381,7 +391,7 @@ bool mb_block_maps_consistent(const mb_block *b) {
 		 * cannot be true of a page that is writable: a hot one, or one in
 		 * unheld_bits */
 		if (p->held && (p->hot || bits_get(b->unheld_bits, i))) return false;
-		if (!p->hot && p->shadow != NULL && p->status != MB_ST_RWSTACK) return false;
+		if (!p->hot && p->shadow != NULL && !p->compared) return false;
 		hot += p->hot;
 	}
 	return hot == b->nhot;
@@ -438,7 +448,7 @@ static void page_cool(mb_block *b, size_t i) {
  * and not a stack. */
 static void page_heat(mb_block *b, size_t i) {
 	mb_page *p = &b->pages[i];
-	if (p->hot || p->invisible || p->uncommitted || !p->dirty) return;
+	if (p->hot || p->invisible || p->uncommitted || !p->dirty || p->compared) return;
 	if (p->status != MB_ST_RW && p->status != MB_ST_RWX) return;
 	if (!bits_get(b->unheld_bits, i) || b->nhot >= HOT_MOST) return;
 	uint8_t *shadow = mb_snap_alloc();
@@ -513,6 +523,40 @@ void mb_block_epoch_capture(mb_block *b, size_t pi, uintptr_t maddr) {
 
 /* ---- construction ---- */
 
+/* ---- Windows: writes found by comparing, for a guest that reads its dead stack
+ *
+ * A fault on Windows is delivered on the faulting thread's own stack: before
+ * any handler runs, the kernel writes an exception record, the guest's
+ * registers and ntdll's frames below the guest's stack pointer - some two
+ * kilobytes of its dead stack. Linux delivers on the alternate signal stack and
+ * leaves the guest's memory alone. Dead stack is dead to the ABI, but a guest
+ * still reads it: an uninitialised local, a frame's padding, a conservative
+ * garbage collector scanning its stack. Where the faults fall depends on when
+ * the frontend opens epochs and holds pages for a background state - its
+ * greenzone settings, and the timing of its helper threads - so such a guest
+ * ran differently on Windows with different settings (Chimera issue 555, where
+ * a saved register pinned an object in one run's collector and not the
+ * other's).
+ *
+ * A block made with this on finds every writable page's writes the way it
+ * finds a Windows stack's: by comparing the page with its baseline and its
+ * epoch shadow (get_stack_dirty, get_stack_epoch). Nothing in it faults to say
+ * it was written, so the guest's memory is what Linux makes it. It costs a
+ * comparison of every writable page per captured frame, a baseline and a
+ * shadow copy of each, and planned states that copy those pages at once
+ * instead of in the background - a core asks for it, it is not the default. */
+#ifdef _WIN32
+static bool g_compare_writes;
+#endif
+
+void mb_block_set_compare_writes(bool on) {
+#ifdef _WIN32
+	g_compare_writes = on;
+#else
+	(void)on;
+#endif
+}
+
 mb_block *mb_block_new(mb_range addr) {
 	if (addr.start != mb_align_down(addr.start) || addr.size != mb_align_down(addr.size)) {
 		fprintf(stderr, "miniBox: addresses and sizes must be aligned\n");
@@ -526,6 +570,9 @@ mb_block *mb_block_new(mb_range addr) {
 	mb_block *b = (mb_block *)calloc(1, sizeof(mb_block));
 	if (!b) return NULL;
 	b->npages = addr.size >> MB_PAGESHIFT;
+#ifdef _WIN32
+	b->compare_writes = g_compare_writes;
+#endif
 	b->pages = (mb_page *)calloc(b->npages, sizeof(mb_page));
 	b->nwords = (b->npages + 63) / 64;
 	b->epoch_bits = (uint64_t *)calloc(b->nwords, sizeof(uint64_t));
@@ -1071,8 +1118,8 @@ static void set_protections(mb_block *b, size_t pstart, size_t pcount, uint8_t s
 	/* A Windows stack reports nothing, so what it did is found by comparing it
 	 * with what it held - and that has to be kept now, while the content still
 	 * IS the baseline. See get_stack_dirty. */
-	if (status == MB_ST_RWSTACK)
-		for (size_t i = pstart; i < pstart + pcount; i++)
+	for (size_t i = pstart; i < pstart + pcount; i++)
+		if (b->pages[i].compared)
 			mb_page_maybe_snapshot(&b->pages[i], mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
 #endif
 }
@@ -1732,7 +1779,7 @@ static int seal_impl(mb_block *b) {
 			/* except a Windows stack, which keeps a baseline of its own: nothing
 			 * will report its writes, so they are found by comparing against it
 			 * (as in set_protections) */
-			if (b->pages[i].status == MB_ST_RWSTACK)
+			if (b->pages[i].compared)
 				mb_page_maybe_snapshot(&b->pages[i], mirror_addr(b, b->addr.start + (i << MB_PAGESHIFT)));
 #endif
 			/* A baseline that reads back as zeros IS a zero page, and saying so is
@@ -1770,7 +1817,7 @@ static int seal_impl(mb_block *b) {
 				 * different in every process - and hashing it made a state saved
 				 * in one session refused in the next (issue #80). Such a page is
 				 * hashed as the live-baseline page it is on every other host. */
-				if (b->pages[i].status == MB_ST_RWSTACK) {
+				if (b->pages[i].compared) {
 					tag = 1; mb_sha256_update(&sh, &tag, sizeof(tag));
 				} else {
 					mb_sha256_update(&sh, b->pages[i].snap_data, MB_PAGESIZE);
@@ -1919,7 +1966,9 @@ int mb_block_save_state(mb_block *b, mb_write_cb w, uintptr_t ud) {
  * a few hundred of them against tens of thousands that can wait. */
 static bool plan_can_hold(const mb_page *p) {
 #ifdef _WIN32
-	if (p->status == MB_ST_RWSTACK) return false;
+	/* nor any page whose writes are compared: held, its next write would fault
+	 * after all, with its frame on the guest's stack (Chimera issue 555) */
+	if (p->compared) return false;
 #endif
 	return p->status == MB_ST_RW || p->status == MB_ST_RWX || p->status == MB_ST_RWSTACK;
 }
