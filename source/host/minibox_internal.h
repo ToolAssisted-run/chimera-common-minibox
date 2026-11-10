@@ -191,6 +191,11 @@ typedef struct {
 	 * mb_page_native_prot). What it did is discovered by comparing bytes. NULL
 	 * for everything else. */
 	uint8_t *shadow;
+	/* Windows only: this page's writes are found by comparing it, never by a
+	 * fault - a stack, always (mb_page_native_prot), and every writable page
+	 * of a block that compares writes (mb_block.compare_writes). Such a page
+	 * is in stack_bits, is never held, never hot and never planned. */
+	bool compared;
 	/* ---- a planned whole-machine save (see mb_block_state_plan) ----
 	 *
 	 * hold says this page is part of a state being filled in the background
@@ -248,7 +253,11 @@ typedef struct mb_block {
 	uint64_t *epoch_bits;   /* pages written during this epoch */
 	uint64_t *stat_bits;    /* pages whose status changed during this epoch */
 	uint64_t *unheld_bits;  /* pages mapped writable now: what an epoch must hold */
-	uint64_t *stack_bits;   /* pages that are stacks: Windows compares these by hand */
+	uint64_t *stack_bits;   /* pages Windows compares by hand: stacks, and with compare_writes every writable page */
+	/* Windows only: no page of this block faults to report a write; every
+	 * writable one is compared, as a stack is (issue 555 of Chimera). Set at
+	 * creation from wbx_set_compare_writes. */
+	bool compare_writes;
 	uint64_t *hot_bits;     /* pages that are hot: compared every frame, never held */
 	size_t nhot;            /* set bits in hot_bits */
 	uint16_t epoch_no;      /* counts epochs opened, for mb_page.seen */
@@ -311,6 +320,9 @@ typedef struct mb_block {
 } mb_block;
 
 mb_block *mb_block_new(mb_range addr);
+/* Whether blocks made from now on compare writes instead of faulting for
+ * them (mb_block.compare_writes); Windows only, a no-op elsewhere. */
+void mb_block_set_compare_writes(bool on);
 void      mb_block_free(mb_block *b);
 void      mb_block_activate(mb_block *b);
 void      mb_block_deactivate(mb_block *b);

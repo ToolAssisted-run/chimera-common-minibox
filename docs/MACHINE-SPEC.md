@@ -151,6 +151,27 @@ saved point bit-exactly. How:
   RWStack is just R-until-written and goes through the normal handler.
 - A guest therefore has to SAY where its stacks are, with MAP_STACK. One that
   runs on memory it merely allocated dies on Windows on its first push.
+- **Compared writes** (`wbx_set_compare_writes`, Windows only; Chimera issue
+  555). A write fault on Windows is delivered on the faulting thread's own
+  stack: before any handler runs, the kernel writes an exception record, the
+  guest's registers and ntdll's frames below the guest's stack pointer, about
+  two kilobytes of its dead stack (238 of 2016 words in `test_fault_stack`).
+  Linux writes nothing there. A guest that reads dead stack (an uninitialised
+  local, a conservative garbage collector) can then run differently depending
+  on where faults fell, which depends on when the frontend opens epochs and
+  holds pages for a planned state. A host made after `wbx_set_compare_writes(true)`
+  treats every RW and RWX page as Windows treats an RWStack page: mapped
+  writable, never held by an epoch or a planned state, never hot, its writes
+  found by comparison against its baseline and its shadow. Nothing in it faults
+  to report a write, so the guest's memory is what Linux makes it. Two
+  differences from a fault bit follow: a page written with the bytes it held,
+  or put back, is clean, so such a host's states can carry fewer pages than
+  Linux's for the same machine; and the seal hash names each compared page by
+  a tag, as it does a Windows stack. The cost is a comparison of every
+  writable page when an epoch opens and when its delta is saved, a baseline
+  and a shadow copy of each, and planned states that copy those pages at
+  once: measured on Windows with Mesen, 644 frames a second capturing every
+  frame became 140. A core asks for it; it is not the default.
 
 A `Snapshot` is a page's pre-change baseline content: None (the live memory IS
 the baseline - a later write triggers snapshotting the pre-write bytes),
